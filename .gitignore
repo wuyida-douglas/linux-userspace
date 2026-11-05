@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+.env
+.env.*
+runtime/
+results/
+logs/
+# Local, regenerable vulnerability metadata and downloaded third-party trees.
+# Only lightweight sample selections belong in git; large data stays local/S3.
+data/
+.venv/
+venv/
+harbor_jobs/
+harbor_export/
+work/
+samples/*/tasks/
+samples/*/download-report.json
+samples/*/.staging-*/

@@ -1,0 +1,12 @@
+{
+  "seed": 20261103,
+  "count": 100,
+  "source": "/nvme/wuyida/新管线开发/data/remaining-38901.instances.jsonl",
+  "original_sample": "samples/pilot100-20261103",
+  "original_complete": 80,
+  "rounds": 0,
+  "strategy": "exclude-original-failures-then-seeded-top-up",
+  "completed_at": "2026-11-03T13:09:14Z",
+  "recovered_reserve": 31,
+  "trimmed_at": "2026-11-03T13:10:11Z"
+}

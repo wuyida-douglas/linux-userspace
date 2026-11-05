@@ -1,0 +1,10 @@
+{
+  "seed": 20261103,
+  "count": 100,
+  "source": "data/recall-v3/candidates.jsonl",
+  "original_sample": "samples/recall-v3-random100-complete",
+  "original_complete": 0,
+  "rounds": 0,
+  "strategy": "exclude-original-failures-then-seeded-top-up",
+  "completed_at": "2026-11-03T14:09:33Z"
+}
