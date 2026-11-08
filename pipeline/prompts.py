@@ -13,6 +13,10 @@ Never modify the immutable input/ directory; keep recovered material in your wor
 or delivery directory. Read NETWORK.md before package installation or image pulls.
 Keep model credentials out of files, logs, images, Compose, and shell command arguments.
 All your work belongs in the current workspace.
+Never run sparse-checkout or worktree configuration commands against the factory
+repository or any ancestor of its root. If you clone an upstream project, keep it
+inside this task workspace and scope any sparse checkout to that clone only.
+Do not remove, hide or reconfigure factory source files to recover a dependency.
 """
 
 ROUTE = SHARED + """
@@ -67,6 +71,20 @@ Choose exactly one route, in this priority order:
    For a client-only vulnerability triggered by a malicious server, do not reverse
    the roles and call the victim client a service; reject that specific contract or
    use another genuinely applicable input path.
+A sanitizer finding, ASan/UBSan abort, ordinary parser error, or target crash is
+NOT by itself an SVC unauthorized effect. If the only demonstrated effect is a
+memory fault, choose FILE-POV (if a genuine file runner exists) or reject.
+For a pure library DoS choose FILE-POV whenever its real CLI can measure the exact
+vulnerable behavior. A one-off 500 response or changed exception class is not a
+service DoS: require concrete disruption to persistent workers, existing sessions,
+or resource availability, with equal-budget controls. Do not use a synthetic host
+to manufacture this distinction when a genuine FILE route exists.
+A browser-dependent CORS/XSS/CSRF observation alone is also not a server exploit:
+a normal client seeing ACAO headers does not establish unauthorized data access.
+Do not relabel these cases as native_service just because the product is a daemon.
+Do not manufacture stack contents, uninitialized bytes, or a custom harness merely
+to turn a probabilistic memory bug into a network exploit; genuine reachability
+and deterministic target-side effects must be shown in synthesis.
 2. FILE-EXPLOIT: one attacker-controlled file to a real release runner with an
    unauthorized code-execution or protected-data effect; never crash-only.
 3. FILE-POV: one file to a real fixed runner with a vulnerability-specific
@@ -125,9 +143,16 @@ Do not leave route.json anywhere else and do not create a placeholder answer.
 SYNTHESIZE = SHARED + """
 Read route.json and create the selected task under delivery/. If it is absent,
 stop and report the missing validated route instead of doing routing yourself.
-Do not switch branches
-or create multiple tasks. Preserve the actual vulnerable source and the real entry.
-Tool command timeouts are in seconds (normally 120, at most 900). Do not pass
+route.json is the authoritative validated route, including recovery_required and
+its explicitly recorded evidence gaps. Never rewrite it or contradict it in
+source-recovery.json; distinguish immutable supplied input/ from separately
+recovered authoritative source. An upstream full source archive is not proof that
+a tests-only supplied input/src or a test-only fix.diff contained that code.
+Do not switch branches or create multiple tasks. Preserve the actual vulnerable
+source and the real entry. Never fabricate provenance to make a recovery appear
+unnecessary: record the original mismatch, the actual recovered commits, and
+why the resulting genuine vulnerable/fixed pair still implements this route.
+Tool command timeouts are in seconds (normally 120, at most 3600). Do not pass
 millisecond values. Do not print manifest.json or vulnerability affected-version
 arrays; select only the needed revisions and description with Python json.
 When inspecting host locales or library behavior, use installed tools rather than
@@ -149,7 +174,9 @@ Your tools are only ordinary shell, text editing and Docker; no factory MCP or
 private synthesis functions are available. Choose the simplest project-specific
 implementation that makes the vulnerability reproducible and the task instructive.
 When route.json has recovery_required=false, use the supplied fix.diff to build an
-independent fixed image, not a runtime bypass. When recovery_required=true, first
+independent fixed comparison during development (and optionally a fixed image for
+that comparison), not a runtime bypass. Final scoring starts a fresh vulnerable
+target and applies delivery/private/solution.sh; it does not export a fixed image. When recovery_required=true, first
 recover genuine source/patch evidence before building. Search official upstream
 commits/tags/releases and advisory-linked patches, and consider alternate candidates
 in input/alternate-candidates.json and other authoritative references. It is explicitly allowed and
@@ -160,78 +187,172 @@ on the CVE. Preserve the original input/ unchanged and write recovered material 
 delivery/project/. Before finalizing, save delivery/project/source-recovery.json with
 source URLs, vulnerable_revision, fixed_revision, patch/source checksums, the original
 candidate's mismatch, and how the recovered patch addresses this exact CVE. Use the
-recovered patch to build the independent fixed image. If the actual fix cannot be found,
+recovered patch to build an independent fixed comparison and implement solution.sh.
+If the actual fix cannot be found,
 record that bounded recovery failure with the endpoints/commits tried rather than
 inventing a patch, weakening verification, or using a version-only differential.
 Do not inject a new vulnerability, patch the vulnerable baseline, or weaken the
-fixed image. The factory build may use the documented apt/PyPI mirrors and
+fixed comparison. The official solution must change the actual vulnerable
+component in the clean target, rebuild/replace and restart it when necessary,
+then prove normal functionality. A source-only patch or successful make command
+without the actual running binary/library changing is insufficient. The factory build may use the documented apt/PyPI mirrors and
 official revision archives; use them instead of spending turns on unavailable
 Docker Hub or npm endpoints. Vendor large/source dependencies into delivery
 when useful, but do not vendor or export an Ubuntu base-image tarball. The
 factory supplies ubuntu:22.04 locally. A packaged player task must run offline
 from its prebuilt images, without source retrieval, model service or host state.
 
-Required synthesis layout:
-  delivery/project/       complete declarative vulnerable+fixed build contexts
-  delivery/private/gold/  reproducible attack input or script and benign control
-  delivery/private/solve.sh places or invokes the gold in the public environment
-  delivery/private/verify.sh  private differential; never mounted for the player
-  delivery/instruction.md public player entry and success criteria only
-  delivery/public_tests/test.sh runs INSIDE the Harbor verifier/main container,
-    not on the factory host. It reads /work/pov.bin (or the documented public
-    target effect) directly; never require host docker, docker cp, /var/run/docker.sock
-    or factory paths. It scores the player's actual public result without
-    private gold/fixed material; it writes /logs/verifier/reward.json containing
-    exactly {"reward": 0.0 or 1.0}. Save detailed evidence in a separate JSON file:
-    Harbor parses every key in reward.json as a numeric reward.
-  delivery/verification.json  evidence from your own clean verification run
+Required synthesis layout (the only accepted contract; no legacy fallback):
+  delivery/task.json          branch, exact prebuilt images, submission and oracle contract
+  delivery/project/           source recovery and reproducible build contexts, not exported
+  delivery/environment/docker-compose.yaml
+                             public main analysis workstation + independent client target;
+                             optional real sidecars, no runner and no private bind mounts
+  delivery/private/gold/exploit.py  SVC-EXPLOIT and FILE-EXPLOIT reference submission
+  delivery/private/gold/input.bin   FILE-POV reference submission
+  delivery/private/healthcheck.sh   normal functionality check on the target, exit 0 iff healthy
+  delivery/private/oracle.sh        target-side vulnerability oracle, exit 0 iff the exact effect exists
+  delivery/private/solution.sh      applies the official patch inside a clean vulnerable target
+  delivery/private/patch.diff       private genuine patch, if used by solution.sh
+  delivery/private/rebuild.sh       offline rebuild if the vulnerable component is compiled
+  delivery/instruction.md    public endpoint/runner and required /workspace artifact only
+  delivery/verification.json honest evidence from development, not a self-awarded score
 
-The verifier contract is strict. It is run as:
-  bash delivery/private/verify.sh /absolute/path/to/delivery /absolute/path/to/workdir
-It must build any needed vulnerable and fixed images itself from delivery/project,
-start clean isolated Compose projects, execute the same benign and gold inputs,
-and write /absolute/path/to/workdir/report.json. report.json must contain:
-schema_version=1, branch, host_type, success, and these integer return codes:
-build_returncode, vuln_exploit_returncode, fixed_exploit_returncode,
-fixed_health_returncode, benign_returncode. Each of build, benign_control,
-vuln_exploit, fixed_exploit, fixed_health must be an object with boolean passed
-and string command/output recording actual execution evidence. fixed_exploit.passed
-means the exploit still works on the fixed image, so it must be false on success.
-success=true only when build.passed && benign_control.passed && vuln_exploit.passed
-&& !fixed_exploit.passed && fixed_health.passed && build_returncode==0.
-Exit zero iff success is true. Give every Compose project and
-container a unique name derived from workdir, clean up only your own resources,
-and leave logs in workdir. Builds must be reproducible and bounded by timeouts.
-Validate the fix by rebuilding from pristine vulnerable source plus the supplied
-or recovered genuine security patch documented in source-recovery.json;
-do not modify source to force a pass. The public solve.sh runs inside the Harbor
-main container with gold mounted at /solution/gold. For a file task it normally
-copies the one gold file to /work/pov.bin; for a service task it invokes the real
-public client/exploit against the target, without accessing factory-private paths.
-Keep private/gold, private verification, fix.diff and fixed source out of the
-player's public environment and out of public_tests: Harbor uploads all of tests/
-to the player container after the agent runs. The public main service is the actual player
-workstation: give it a shell, necessary development tools, a bounded keepalive
-command, and only the intended vulnerable service or file runner. Give main an
-explicit enabled healthcheck such as `test: ["CMD", "kill", "-0", "1"]`;
-`healthcheck: {disable: true}` is rejected by Harbor's `compose --wait`.
-Keep ASAN logs
-and target source paths factory-private when they reveal the expected attack.
-Create a public environment/docker-compose.yaml for
-the player from the same vulnerable image, with no private mounts and an explicit
-'main' agent service with the same image specified in environment.docker_image.
-Harbor runs from prebuilt images: public Compose services must not contain
-'build', 'privileged', or 'pid' keys, including pid: service:<name>. Build and
-tag the public images during synthesis; leave their Dockerfiles in project/ for
-reproducibility. If a service needs a shared PID namespace, colocate the real daemon and client
-in the main container with an entrypoint that preserves their identity semantics;
-do not try to evade this restriction with container-scoped PID references.
-Explain the
-actual public interface and effect in instruction.md, without internal factory
-paths or a solution. Test your own task as useful during development, then record real results.
-The orchestrator will not run a separate intermediate acceptance stage. Final
-Harbor acceptance executes the frozen private differential and packaged reference
-and null submissions after your independent review.
+All three branches require separate main and client containers/images. host_type changes
+only SVC target behavior. main is a shell/analysis workstation, not a target and not a
+scorer. main has no Docker socket, private tests, gold, patch, expected flag, target
+filesystem, or a ready-built vulnerable runtime that can be scored without the isolated
+target. Source and analysis/build tools are allowed; the vulnerable program/library
+must be installed only in client. Build and tag the final target image AFTER every necessary modification;
+exporter uses docker save of that exact image, never a Dockerfile rebuild. main and
+target may share a base but must have different final images and running containers.
+Every public Compose service needs a prebuilt image and an enabled healthcheck.
+The main image must contain /bin/bash, python3 and /usr/bin/env; the exporter
+overrides main.command with a python3 blocking process and main.working_dir with
+/workspace. Keep main.image distinct from client.image. Never publish host ports:
+DO NOT add `ports:` (including short "8080" or "127.0.0.1:8080:8080"). Reach the
+target from main/runner only as client:PORT through Compose networks. `expose`
+does not replace a working target listener and is not needed for inter-container
+access. Never use host/external/shared networks, container_name, static
+ipv4_address/ipv6_address or application-pinned IPAM in the delivered Compose;
+the factory and Harbor inject separate per-project /24 IPAM overrides. These
+temporary overrides are not delivery files and must not be edited or copied.
+Do not use sudo, setuid, chmod/chown the host socket or daemon config, or bypass
+the supplied docker wrapper to skip isolation. Direct /usr/bin/docker calls are
+redirected through the same wrapper so they cannot bypass task IPAM.
+Do not create runner in public Compose; sidecar_services lists only genuine
+additional target dependencies, never main/client/runner. Optional
+runner_network_aliases contains at most eight distinct DNS names, excluding
+main/client/runner/localhost. Use it only for a reviewed protocol peer.
+'build', 'privileged', 'pid', 'network_mode', 'cap_add', 'cap_drop', 'devices',
+'security_opt', 'cgroup_parent', 'ipc', 'uts' are forbidden. Public bind mounts
+must use `./` paths that exist inside environment/, be regular files/directories
+(not symlinks) and resolve beneath environment/. No absolute/host paths, `..`,
+private/gold/fixed/docker.sock path tokens or cross-service shared writable
+binds. Prefer public assets baked into prebuilt images. Named volumes are allowed
+only in verifier-generated private topology, not arbitrary public sharing.
+The submission must be a regular non-symlink file, nonempty and <=16 MiB.
+All public healthchecks must reach the real service normally. The exploit health
+script is mounted only on runner at the declared /opt/healthcheck/... path;
+FILE-POV instead executes its healthcheck on client as /private/healthcheck.sh.
+The oracle MUST exit exactly 0 when the vulnerability effect is present and 1
+when it is absent. Any other exit code is a verifier error, not a patched pass.
+Use a plain
+blocking command ["sleep", "infinity"] (or a real service command). Do not set a
+shell -c image entrypoint: Harbor replaces main.command with a Python blocking
+process. Only main's launch entrypoint is normalized to /usr/bin/env; explicitly
+declared target/sidecar entrypoints and image-owned startup are preserved.
+The main image must provide /bin/bash because Harbor executes oracle and agent
+commands through bash -c. Keep /solution and /workspace accessible under rootless Docker.
+Never leave root-owned writable runner logs or fixture files: healthchecks run as root
+but submissions run as the declared uid. Exercise the public runner as that exact uid,
+with a readable input, both before and after solution.sh. Keep per-uid transcripts or
+use a fresh run directory; a permission error before reaching the target is not a PoV.
+For SVC/FILE-EXPLOIT the runner has a read-only root filesystem and read-only `/workspace`
+working directory: write transcripts and scratch only to `/work`, `/output`, or `/tmp`.
+The public task working directory remains `/workspace`; do not put a required transcript at
+`/workspace/transcript.log` unless the contract explicitly mounts a writable path there.
+The reference gold must complete its protocol exchange normally (exit 0) on both vulnerable
+and fixed targets; an expected fixed-version rejection must be handled cleanly, not raised as
+an exploit traceback. Only the target-side oracle decides whether the vulnerability effect is
+present. An exploit traceback after a successful request is still a delivery defect requiring
+repair.
+Use `umask 022` when creating delivery directories and scripts. Every directory
+leading to a runner-mounted healthcheck or submission must be traversable by
+uid/gid 65534 (normally 0755). Public runner scripts must be 0755 and inputs
+0644. Do not chmod private oracle/solution/gold to world-writable or copy them
+into main/runner; the private verifier installs them root-only on client.
+Always test the exact final mounted healthcheck as uid/gid 65534, not merely a
+root-only docker exec or a readable copy at another path. Keep package build
+metadata, __pycache__, .egg-info, downloads and scratch under TASK_TMP, outside
+the reviewed delivery. Do not generate or copy package metadata into delivery
+unless it is a genuinely required, readable public runtime asset.
+Before finishing, verify `docker compose -f delivery/environment/docker-compose.yaml config`
+and the real vulnerable/fixed behavior; the final verifier is authoritative.
+
+In task.json use schema_version=1, exact route branch/host_type as the top-level
+"branch" and "host_type" fields (never nested under a "route" object),
+target_service="client", images={"agent": "prebuilt-analysis:tag", "target": "prebuilt-target:tag"},
+interaction="protocol" for SVC, "interactive_file" for FILE-EXPLOIT, "file_pov" for FILE-POV.
+The submission_mode is exploit.py for both exploit branches and input.bin for FILE-POV.
+runner contains image=null (use agent), workdir="/workspace", user="65534:65534",
+timeout_sec and health_timeout_sec in 1..3600, and command=[] (default python3 submission).
+Do not add Linux capabilities, file capabilities, setuid binaries, privileged
+containers or Docker sockets. The runner uses uid/gid 65534 with no-new-privileges.
+If a protocol requires raw AF_PACKET injection, first try ordinary UDP/TCP sockets;
+if no unprivileged network path can trigger the real vulnerability, record the
+blocker instead of weakening runner isolation or manufacturing a new service.
+file_capability_inheritance is unsupported: never declare it, file capabilities,
+NET_RAW, setuid helpers, privileged containers or runner uid/gid 0.
+The runner uses numeric nonzero uid/gid (normally 65534:65534), workdir=/workspace,
+timeouts 1..3600 and no-new-privileges. For SVC/FILE-EXPLOIT runner.command is
+normally [] (python3 exploit.py). FILE-POV has no runner.command and requires
+public_runner.argv with a literal {input} placeholder; other branches forbid
+public_runner. Images must be lowercase tag references (not digests), target and
+agent differ, runner.image is null or a declared non-target image.
+task.json schema_version=1; branch and host_type are top-level, never a nested
+route object. healthcheck/oracle/solution are nonempty string argv arrays.
+For SVC/FILE-EXPLOIT set healthcheck={"argv": ["/opt/healthcheck/check.sh", ...]}
+to perform a normal public-protocol request from the isolated runner. The verifier
+mounts delivery/private/healthcheck.sh at that runner-only entry, never at client.
+For FILE-POV set healthcheck={"argv": ["/private/healthcheck.sh"]}; it executes
+on client. Set oracle/solution to {"argv": ["/private/<name>.sh"]}. Use restart_command=[]
+or an explicit target command when a patched daemon must restart. sidecar_services=[]
+unless public Compose has genuine extra target dependencies.
+
+The orchestrator supplies the actual separate differential verifier; do NOT write your own
+private/verify.sh or public_tests. For exploit.py, it runs in a separate unprivileged runner
+on the target network with only the read-only submission and public configuration. It never
+gets /private, oracle, solution, patch, expected flag or Docker socket. oracle.sh executes
+in client only AFTER submission ends and must inspect a real target-side effect, not trust
+stdout, exit status, a port, a claimed flag or a generic HTTP 200. It may read the private
+expected flag created statically in the target image; main/runner never receive it.
+FILE-POV uses input.bin, not an exploit script. Only this branch declares
+public_runner={"argv": ["<actual runner>", "{input}"]}; omit public_runner entirely
+from SVC-EXPLOIT and FILE-EXPLOIT, which use the isolated runner with exploit.py.
+The verifier copies input.bin read-only into a fresh client and
+executes that real fixed runner there. oracle.sh checks the precise sanitizer/runtime/resource
+effect and implicated target, not any nonzero exit. A benign control must remain healthy.
+FILE-EXPLOIT can use an interactive parser endpoint (for example length-prefixed socat to
+the actual parser) but must demonstrate unauthorized code execution/reading, never crash-only.
+
+At every scoring round, the verifier creates fresh containers, checks health, runs the same
+submission, checks oracle, destroys everything, then repeats after solution.sh. A missing
+submission scores 0; vulnerable success + patched failure + patched health gives reward 1.
+The fixed phase executes solution.sh, then optional restart_command, then health and the
+SAME submission. If you manually restart a daemon during development, you MUST encode an
+equivalent safe target-local restart_command in task.json (or restart it in solution.sh),
+and repeat the self-check through the actual verifier without an extra manual restart.
+Patching source without replacing the running process is an incomplete solution.
+solution.sh must apply the genuine security fix, not bypass the oracle or change unrelated
+mitigations. For binary vulnerabilities it must invoke rebuild.sh offline, verify the actual
+ELF/library replacement, architecture/dependencies/mitigations and real loading path; a
+source edit or successful make without replacing the live binary is not a fix. Include all
+source/toolchain dependencies in the target or private material; scoring must not download.
+Use a unique TASK_TMP for development containers and logs, clean only your resources.
+Explain the public interface honestly without factory paths, answers or private files.
+Final acceptance uses the exported bundle, a real Harbor gold submission (1.0), null (0.0),
+and the same pass2fail verifier; the independent review happens before that acceptance.
 Budget discipline: once the vulnerable/fixed/benign differential is established,
 finish every required delivery file, run one complete bounded self-check, and stop.
 Do not spend dozens of turns repeating equivalent experiments, reading the entire
@@ -259,6 +380,12 @@ Implement the exact route.json host_type; all three host types are valid:
   caller/security boundary in project documentation. The adapter must forward the
   same attack input to the same affected code on vulnerable and fixed builds.
 For any host type, keep the protocol and semantics faithful to the chosen role:
+If the routed effect is only a memory fault or one-off parser exception, do not
+manufacture a synthetic service around it. Call request_reroute with branch
+FILE-POV and the concrete runner/oracle evidence; this ends the current attempt
+without producing an invalid SVC delivery. A synthetic service is never mandatory
+after route acceptance and cannot replace a valid file PoV just to preserve SVC
+status. Do not spend dozens of turns trying to turn a FILE-POV into a network bug.
 use a native protocol/client when one exists rather than gratuitous HTTP; a small
 protocol adapter is acceptable when justified for synthetic_host. If the intended
 host cannot provide a real reachable path or meaningful security boundary, record
@@ -267,7 +394,19 @@ Use separate attacker/target roles when useful. First demonstrate a normal reque
 then the target-side unauthorized effect: a canary command/file, protected secret,
 privileged write/auth bypass, SSRF observed by a controlled client, or a
 vulnerability-specific service DoS with equal-budget health controls.
-An open port, HTTP 500, a connection, or a client crash is not an exploit.
+An open port, HTTP 500, a connection, a client crash, or an ASan/UBSan-only abort
+is not an exploit. Do not use an ASan oracle for SVC-EXPLOIT unless it is additional
+diagnostic evidence alongside an actual target-side unauthorized effect. A DoS
+must use a specific resource/state oracle with equal-budget normal controls.
+Never hard-code the reference exploit's marker filename, token, command output,
+or exact payload bytes into an oracle unless the public task explicitly requires
+that exact value. Judge the unauthorized effect that the public contract permits:
+a reasonable exploit choosing a different canary, token, command or file path
+must still score. A target-created marker must be attributable to the submitted
+payload and tied to the affected component, but must not disclose or compare the
+gold's secret string. Keep gold, missing submission and benign controls distinct.
+If the evidence supports only a memory error or parser crash, stop: this branch
+must not disguise a FILE-POV as a network service, even after route acceptance.
 The private differential repeats the same interaction against vuln and fixed;
 the fixed target must still serve normal requests. The public scorer independently
 checks the player's actual target-side effect, not a claimed log line. A player
@@ -312,11 +451,14 @@ Inspect the actual source, patch, Dockerfile, public
 entry, gold and verifier. If route.json recovery_required=true, read
 project/source-recovery.json and verify the authoritative source, recovered
 vulnerable/fixed revisions and checksums. An initially mismatched supplied patch
-is not a finding when the recovered genuine security fix is documented and the
-executed differential proves its effect. Look for fabricated vulnerabilities,
+is not grounds to discard a valid recovered pair, but false claims that the
+supplied input contained the recovered source/fix or that recovery_required was
+false are major provenance findings requiring correction. The final recovery
+record must agree with route.json and the immutable input. Look for fabricated vulnerabilities,
 unrelated projects, unjustified recovery revisions, modified vulnerable/fixed
 behavior, meaningless service wrappers,
-crash-only EXPLOIT, arbitrary exceptions as POV, oracle shortcuts, leaked gold or
+crash-only EXPLOIT, ASan-only SVC oracle, browser-only CORS/XSS/CSRF claims,
+arbitrary exceptions as POV, oracle shortcuts, leaked gold or
 fixed images, private paths, missing benign controls, and unreproducible builds.
 For SVC, verify that delivery implements route.json host_type. native_service must
 use the real listener, real_host must use the genuine application call chain, and
@@ -325,23 +467,68 @@ reject merely because the original repository is a library or the factory suppli
 the host: instead audit the network-to-public-API path, normal validation and
 permissions, unchanged vulnerable component, meaningful security boundary, and
 whether host code itself fabricates the unauthorized effect or gives the answer.
+The vulnerable and fixed targets must use the same host/runner/oracle code. Any
+shared patch hunk to host, runner, HTTP error handling, or oracle code unrelated
+to the vulnerable component is a blocker. A single 500, connection abort, or
+exception-class change is not SVC DoS; a persistent service/resource impact with
+controls is required. The target-side oracle must judge the effect actually
+observed by the public protocol client, not redefine a route's promised HTTP 500
+as a connection abort or audit-log entry after the fact. Any mismatch between
+route, public instruction, client-visible effect, and oracle is a blocker.
+If the delivery establishes only a valid FILE-POV rather than the routed SVC,
+record a blocker and identify request_reroute evidence; do not bless it as SVC.
 A mislabeled host type, meaningless HTTP wrapper around a one-shot parser, or
 reversed client/server attack role is a blocker. A well-justified synthetic_host
 is not. It must receive the same attack through the same adapter on vuln and fixed.
-The public scorer runs inside the player/verifier container with no Docker socket.
-An absent or disabled main healthcheck is also a blocker: Harbor uses compose --wait.
-Any public service with a 'build', 'privileged', or 'pid' key, or without an
-explicit prebuilt image, is a blocker: Harbor rejects that Compose structure.
-If shared PID namespaces are required, colocate the real daemon and client in
-one workstation container and prove the real identity path; do not evade the ban.
-Any docker run/cp/exec dependency in public_tests is a blocker, even when it
-works on the factory host. Exercise that script against a real public target,
-not just its shell syntax.
+The public main is only an analysis workstation; declare working_dir=/workspace
+so Harbor can deliver and collect the submission. An absent or disabled main/client
+healthcheck is a blocker. A client healthcheck that invokes /private is also a blocker:
+public Compose never receives private material; bake a public healthcheck and benign
+control into the target image. All three branches require an independent prebuilt client
+image/container. A same-container main+target, a target image used as main, or a main
+image with a ready-built vulnerable program/plugin/runtime (rather than only source
+and analysis/build tools) is a blocker. Exercise main's public healthcheck and inspect
+the actual image for this isolation, not just its service name.
+Any public service with a host port mapping (`ports:`), `build`, `privileged`,
+`pid`, `network_mode`, capabilities/devices/security_opt overrides, any bind
+outside a real non-symlink `./` asset beneath environment/, a private path,
+container_name, static IP/IPAM, or without an explicit prebuilt image is a blocker.
+`ports: ["8080"]` is also a forbidden host publication, not a container-only
+listener. main/runner must use Compose service DNS and client:PORT instead.
+No fixed/development IPAM override may enter the exported Compose.
+All public services need enabled healthchecks. main must provide bash, python3
+and /usr/bin/env; its image and client.image must be distinct. The submission is
+a regular, nonempty, non-symlink file <=16 MiB. Public Compose must not expose a runner service;
+the private verifier creates it. Any public_tests/private verify.sh is legacy and a blocker.
+Check task.json against route and actual images. The submission runner must be unprivileged
+and have no private mounts or Docker socket; oracle/solution may run only on the target.
+Oracle must exit 0 iff the effect exists and exactly 1 for a definite absence;
+any other code is verifier infrastructure failure, never patched success.
+An oracle keyed to the gold's hard-coded marker filename, token, command output
+or payload bytes is a blocker when the public contract permits another canary
+or equivalent unauthorized effect. Score attacker-controlled effects within
+the task's stated security boundary, not agreement with the reference string.
+The oracle must not trust the runner's stdout or expose its private secret.
+Runner uid and gid must be numeric and nonzero (normally 65534:65534), timeouts
+1..3600, runner.workdir=/workspace. Runner capabilities/file capabilities and
+NET_RAW are unsupported. Sidecars and optional runner_network_aliases must obey
+the exact task contract; sidecars exclude main/client/runner, aliases are at most
+eight unique non-service names. Bind-mounted healthchecks must be executable by
+the unprivileged runner, including every parent directory (normally 0755);
+test that exact mount as uid 65534 rather than a root-only invocation.
+For FILE-POV require public_runner with {input}; for exploit branches require exploit.py
+and a meaningful effect. Missing offline binary rebuild/replacement is a blocker.
 Judge task quality as well as correctness: it should exercise meaningful analysis
 or interaction with the real vulnerability, not be impossible due to unrelated
 environment trivia or trivialized by an artificial wrapper/oracle shortcut.
 Do not edit delivery. Review the supplied evidence; do not launch the full private
 differential here. The next and only orchestrator acceptance stage is Harbor.
+This is a bounded review, not another synthesis session. By turn 50, stop repeating
+already successful checks, finish only the remaining necessary verification, and commit
+a decision by turn 70. Read targeted files rather than repeatedly dumping the full tree.
+If repair-request.json exists, focus on its concrete findings and regression checks.
+You must call submit_review even when the verdict is false or evidence remains limited;
+never spend the entire budget without producing review.json.
 Finish by calling submit_review with this exact object; the tool atomically
 writes review.json. Never use a bash redirection for this file:
   "passed": true or false,

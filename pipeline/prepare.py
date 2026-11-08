@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
 """Sample instances and download only their vulnerable prefix and fix.diff.
 
-The original sample retains every availability failure. An explicit top-up
-sample excludes those instances and continues the seeded random stream until
-it has the requested number of complete inputs. Both histories are preserved.
+The original sample retains every availability failure. A cached source with a
+subsequently recovered genuine fix.diff is recorded as recovered_late_patch;
+it does not change the selected instance or claim first-download completeness.
+An explicit top-up sample excludes those instances and continues the seeded
+random stream until it has the requested number of complete inputs. Both
+histories are preserved; top-up is never the default for a fixed production
+sample.
 """
 from __future__ import annotations
 
 import argparse
+import base64
 import concurrent.futures
+import email.utils
+import hashlib
+import hmac
 import json
 import os
 import random
@@ -16,12 +24,17 @@ import re
 import shutil
 import subprocess
 import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any
 
-from .common import ID_RE, inventory, read_jsonl, repository_key, task_id, timestamp, write_json, write_jsonl
+from .common import ID_RE, inventory, read_jsonl, repository_key, sha256, task_id, timestamp, write_json, write_jsonl
 
-DEFAULT_INPUT = Path(__file__).resolve().parents[1] / "data/remaining-38901.instances.jsonl"
+DEFAULT_INPUT = Path(__file__).resolve().parents[1] / "results/label-production-v1/candidates-kept.jsonl"
+APPROVED_POOL_SHA256 = "1d9bdbd09a55a84fee01bd5ccf19027e0db2b8e1da37c91eaa653565c2c36142"
+APPROVED_POOL_SIZE = 23873
 DEFAULT_REMOTE = "p_huawei_hdd1:private-data-3/DataWheel/en-code-osv-nvd/file"
 
 
@@ -75,8 +88,8 @@ def safe_prepare(row: dict[str, Any], destination: Path, remote: str) -> dict[st
 
 
 def top_up(source: Path, original: Path, destination: Path, count: int,
-           seed: int, workers: int, remote: str) -> int:
-    """Continue a random stream until count usable inputs, not count attempts."""
+           seed: int, workers: int, remote: str, *, retain_original: bool = True) -> int:
+    """Top up complete inputs, or explicitly sample only disjoint new instances."""
     if count < 1 or workers < 1:
         raise ValueError("top-up count and workers must be positive")
     destination.mkdir(parents=True, exist_ok=True)
@@ -107,15 +120,16 @@ def top_up(source: Path, original: Path, destination: Path, count: int,
         write_jsonl(selection, rows)
     else:
         rows = [row for row in read_jsonl(original / "selection.jsonl")
-                if original_rows.get(row["instance_id"], {}).get("status") == "complete"]
+                if retain_original and original_rows.get(row["instance_id"], {}).get("status") == "complete"]
         write_jsonl(selection, rows)
     # With a sample-only source, statuses in the original selection are just
     # placeholders. The retained, manifest-backed rows are the real baseline.
     original_complete = sum(row["instance_id"] in original_rows for row in rows)
     write_json(destination / "sample.json", {
         "seed": seed, "count": count, "source": str(source), "original_sample": str(original),
-        "original_complete": original_complete,
-        "strategy": "exclude-original-failures-then-seeded-top-up",
+        "original_complete": original_complete, "retain_original": retain_original,
+        "excluded_original_instances": len(original_rows),
+        "strategy": "retain-complete-originals" if retain_original else "disjoint-new-instances-only",
         "created_at": timestamp()})
     excluded = set(original_rows)
     history_path = destination / "download-history.jsonl"
@@ -249,31 +263,109 @@ def top_up(source: Path, original: Path, destination: Path, count: int,
                 break
     write_json(destination / "sample.json", {
         "seed": seed, "count": len(rows), "source": str(source), "original_sample": str(original),
-        "original_complete": original_complete,
-        "rounds": round_number, "strategy": "exclude-original-failures-then-seeded-top-up",
+        "original_complete": original_complete, "retain_original": retain_original,
+        "excluded_original_instances": len(original_rows),
+        "rounds": round_number,
+        "strategy": "retain-complete-originals" if retain_original else "disjoint-new-instances-only",
         "completed_at": timestamp()})
     print(json.dumps({"complete": len(rows), "rounds": round_number}))
     return 0
 
 
+def remote_object_sizes(remote: str) -> dict[str, int]:
+    """Record every remote file size before trusting a bulk-copy exit code."""
+    listing = subprocess.run(["rclone", "lsf", remote, "--recursive", "--files-only",
+                              "--format", "ps", "--separator", "\t"],
+                             capture_output=True, text=True, check=True, timeout=180)
+    result = {}
+    for line in listing.stdout.splitlines():
+        name, size = line.rsplit("\t", 1)
+        if name and not any(part == ".git" for part in Path(name).parts):
+            result[name] = int(size)
+    return result
+
+
+def direct_object_copy(remote: str, destination: Path, expected_size: int | None = None) -> None:
+    """Use a small S3 GET when this rclone build stops after HEAD.
+
+    Credentials are read by rclone and never placed on argv. Object names are
+    quoted from the already validated rclone key, and the exact Content-Length
+    is checked before an atomic local rename.
+    """
+    name, key = remote.split(":", 1)
+    if not name or not key or key.startswith("/"):
+        raise ValueError("direct object fallback requires an S3 remote and object key")
+    config = json.loads(subprocess.run(["rclone", "config", "dump"],
+                                       check=True, capture_output=True, text=True,
+                                       timeout=30).stdout)[name]
+    if config.get("type") != "s3" or not config.get("endpoint"):
+        raise RuntimeError("direct object fallback is only implemented for configured S3 remotes")
+    if expected_size is None:
+        metadata = json.loads(subprocess.run(["rclone", "lsjson", remote, "--stat"],
+                                             check=True, capture_output=True, text=True,
+                                             timeout=120).stdout)
+        if metadata.get("IsDir") is not False:
+            raise ValueError("direct object fallback requires a regular remote object")
+        expected_size = int(metadata["Size"])
+    date = email.utils.formatdate(usegmt=True)
+    signature = base64.b64encode(hmac.new(
+        config["secret_access_key"].encode(),
+        f"GET\n\n\n{date}\n/{key}".encode(), hashlib.sha1).digest()).decode()
+    url = config["endpoint"].rstrip("/") + "/" + urllib.parse.quote(key, safe="/")
+    request = urllib.request.Request(url, headers={
+        "Date": date, "Authorization": "AWS " + config["access_key_id"] + ":" + signature})
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + ".download")
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response, temporary.open("wb") as output:
+            length = response.headers.get("Content-Length")
+            if length is not None and int(length) != expected_size:
+                raise RuntimeError(f"S3 Content-Length mismatch for {remote}: {length} != {expected_size}")
+            written = 0
+            while chunk := response.read(1024 * 1024):
+                output.write(chunk)
+                written += len(chunk)
+            if written != expected_size:
+                raise RuntimeError(f"S3 object size mismatch for {remote}: {written} != {expected_size}")
+        os.replace(temporary, destination)
+    except (OSError, urllib.error.URLError) as exc:
+        raise RuntimeError(f"S3 direct object copy failed for {remote}: {exc}") from exc
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def copy(remote: str, destination: Path, *, directory: bool = False) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    command = ["rclone", "copy" if directory else "copyto", remote, str(destination),
-               "--contimeout", "20s", "--timeout", "120s", "--retries", "2"]
+    if directory:
+        command = ["rclone", "copy", remote, str(destination)]
+    else:
+        if "/" not in remote:
+            raise ValueError("a single remote object must include its parent")
+        # This rclone/S3 combination can return success from copyto without
+        # creating the local file. Copy the exact object by its basename and
+        # verify the resulting file instead of trusting that exit status.
+        parent, name = remote.rsplit("/", 1)
+        if not name or any(part in {".", ".."} for part in Path(name).parts):
+            raise ValueError("unsafe remote object name")
+        probe = subprocess.run(["rclone", "lsf", remote, "--max-depth", "1"],
+                               capture_output=True, text=True, timeout=120)
+        if probe.returncode != 0 or name not in probe.stdout.splitlines():
+            raise RuntimeError(f"remote object is unavailable: {remote}; "
+                               f"{(probe.stderr or probe.stdout).strip()[-800:]}")
+        command = ["rclone", "copy", parent, str(destination.parent), "--include", name]
+    command += ["--contimeout", "20s", "--timeout", "120s", "--retries", "2"]
     if directory:
         # S3 rejects some valid repository filenames (e.g. a trailing dot) during
         # rclone's server-side directory recursion. List first, then exact copyto.
-        listing = subprocess.run(["rclone", "lsf", remote, "--recursive", "--files-only"],
-                                 capture_output=True, text=True, check=True, timeout=90)
-        names = [name for name in listing.stdout.splitlines()
-                 if name and not any(part == ".git" for part in Path(name).parts)]
+        sizes = remote_object_sizes(remote)
+        names = list(sizes)
         special = [name for name in names if any(part.endswith(".") for part in Path(name).parts)]
         special_names = set(special)
         names = [name for name in names if name not in special_names]
         # Recursive copy rejects these valid object names. Exact copyto does
         # not enumerate their parent, so preserve the revision byte-for-byte.
         for name in special:
-            copy(f"{remote}/{name}", destination / name)
+            direct_object_copy(f"{remote}/{name}", destination / name, sizes[name])
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix="rclone-files-") as manifest:
             manifest.write("\n".join(names) + "\n")
             manifest.flush()
@@ -284,18 +376,15 @@ def copy(remote: str, destination: Path, *, directory: bool = False) -> None:
                             "--transfers", "8", "--checkers", "8", "--stats", "60s",
                             "--contimeout", "20s", "--timeout", "120s", "--retries", "2"],
                            check=True, timeout=600)
+        mismatches = []
+        for name, size in sizes.items():
+            local = destination / name
+            if not local.is_file() or local.is_symlink() or local.stat().st_size != size:
+                mismatches.append(name)
+        if mismatches:
+            raise RuntimeError(f"rclone omitted or truncated {len(mismatches)} objects: {mismatches[:8]}")
         return
-    try:
-        subprocess.run(command, check=True, stdout=subprocess.DEVNULL,
-                       stderr=subprocess.PIPE, text=True, timeout=3600)
-    except subprocess.CalledProcessError as exc:
-        probe = subprocess.run(["rclone", "lsf", remote, "--max-depth", "1"],
-                               capture_output=True, text=True, timeout=120)
-        if probe.returncode == 0:
-            detail = "remote prefix exists but copy failed"
-        else:
-            detail = (probe.stderr or probe.stdout).strip()[-1000:]
-        raise RuntimeError(f"rclone copy failed for {remote}: {detail}; {(exc.stderr or '')[-800:]}") from exc
+    direct_object_copy(remote, destination)
 
 
 def prepare_one(row: dict[str, Any], destination: Path, remote: str) -> dict[str, Any]:
@@ -350,6 +439,7 @@ def prepare_one(row: dict[str, Any], destination: Path, remote: str) -> dict[str
             record.update(status="complete", repaired=True, cached=False,
                           file_count=updated["file_count"], total_bytes=updated["total_bytes"])
         return record
+    destination.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=destination))
     errors: list[str] = []
     try:
@@ -397,8 +487,13 @@ def prepare_one(row: dict[str, Any], destination: Path, remote: str) -> dict[str
             raise ValueError("empty prefix source")
         try:
             copy(base + "/fix.diff", staging / "fix.diff")
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError):
-            errors.append("fix.diff is missing")
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError) as exc:
+            # A missing object and a corrupt/truncated read are different
+            # availability evidence. Never collapse both into a fake absence.
+            if "remote object is unavailable:" in str(exc) or "not found" in str(exc).lower():
+                errors.append("fix.diff is missing")
+            else:
+                raise RuntimeError(f"fix.diff download failed for {base}: {exc}") from exc
         source_files = 0
         for path in prefix.rglob("*"):
             if path.is_symlink():
@@ -422,8 +517,11 @@ def prepare_one(row: dict[str, Any], destination: Path, remote: str) -> dict[str
                                              encoding="utf-8")
         if (staging / "fix.diff").is_file():
             os.replace(staging / "fix.diff", input_dir / "fix.diff")
-        if not (staging / "fix.diff").is_file():
+        patch = input_dir / "fix.diff"
+        if not patch.is_file():
             errors.append("fix.diff is missing")
+        elif not re.search(rb"^diff --git a/.+ b/.+$", patch.read_bytes(), re.MULTILINE):
+            raise ValueError("downloaded fix.diff is not a Git diff with source paths")
         status = "partial" if errors else "complete"
         manifest = {"schema_version": 1, "instance_id": row["instance_id"], "status": status,
                     "source_file_count": source_files, "errors": errors,
@@ -455,16 +553,26 @@ def main() -> int:
     parser.add_argument("--sample-only", action="store_true")
     parser.add_argument("--remote", default=DEFAULT_REMOTE)
     parser.add_argument("--only", nargs="+")
+    parser.add_argument("--exclude-original", action="store_true",
+                        help="top up entirely from new instances; exclude every original task")
     parser.add_argument("--top-up-from", type=Path,
                         help="preserve complete inputs from this sample and top up to --count")
     args = parser.parse_args()
+    # The 23,873-label pool is a frozen provenance boundary, not a filename
+    # hint. Historical 7,761-row regex subsets must fail before any S3 call.
+    if sha256(args.input) != APPROVED_POOL_SHA256:
+        parser.error("input is not the approved 23,873 kept-candidate pool")
+    pool_rows = list(read_jsonl(args.input))
+    if len(pool_rows) != APPROVED_POOL_SIZE or len({row["instance_id"] for row in pool_rows}) != APPROVED_POOL_SIZE \
+            or any((row.get("metadata_label") or {}).get("label") != "keep" for row in pool_rows):
+        parser.error("candidate pool must contain exactly 23,873 unique keep labels")
     if args.top_up_from:
         if args.only or args.sample_only:
             parser.error("--top-up-from cannot be combined with --only or --sample-only")
-        if not 1 <= args.workers <= 20:
-            parser.error("workers must be 1..20")
+        if not 1 <= args.workers <= 30:
+            parser.error("workers must be 1..30")
         return top_up(args.input, args.top_up_from, args.output, args.count,
-                      args.seed, args.workers, args.remote)
+                      args.seed, args.workers, args.remote, retain_original=not args.exclude_original)
     args.output.mkdir(parents=True, exist_ok=True)
     selection = args.output / "selection.jsonl"
     if selection.exists():
@@ -477,15 +585,19 @@ def main() -> int:
         rows = sample(args.input, args.count, args.seed)
         write_jsonl(selection, rows)
         write_json(args.output / "sample.json", {"seed": args.seed, "count": len(rows),
-                                                 "input": str(args.input), "created_at": timestamp()})
+                                                 "input": str(args.input), "input_sha256": APPROVED_POOL_SHA256,
+                                                 "input_count": APPROVED_POOL_SIZE,
+                                                 "label_policy": "metadata_label.label == keep; no additional filters",
+                                                 "sampling_policy": "random.Random(seed).sample(frozen_pool_order, count)",
+                                                 "created_at": timestamp()})
     if args.only:
         wanted = set(args.only)
         rows = [row for row in rows if row["task_id"] in wanted or row["canonical_id"] in wanted]
     if args.sample_only:
         print(json.dumps({"sampled": len(rows), "selection": str(selection)}))
         return 0
-    if not 1 <= args.workers <= 20:
-        parser.error("workers must be 1..20")
+    if not 1 <= args.workers <= 30:
+        parser.error("workers must be 1..30")
     (args.output / "tasks").mkdir(exist_ok=True)
     def prepare_record(row: dict[str, Any]) -> dict[str, Any]:
         try:

@@ -79,6 +79,13 @@ DECISION_TOOLS = [
                                          "evidence": {"type": "string"}}, "required": ["severity", "evidence"]}},
                                      "reason": {"type": "string"}, "execution_checked": {"type": "boolean"}},
                       "required": ["passed", "findings", "reason", "execution_checked"]}},
+    {"name": "request_reroute", "description": "Stop this branch when experiments establish a genuine FILE-POV route instead.",
+     "input_schema": {"type": "object", "additionalProperties": False,
+                      "properties": {"branch": {"type": "string", "enum": ["FILE-POV"]},
+                                     "reason": {"type": "string"}, "entry": {"type": "string"},
+                                     "oracle": {"type": "string"}, "normal_input": {"type": "string"},
+                                     "fixed_revision": {"type": "string"}, "evidence": {"type": "string"}},
+                      "required": ["branch", "reason", "entry", "oracle", "normal_input", "fixed_revision", "evidence"]}},
 ]
 
 
@@ -116,6 +123,18 @@ def validate_decision(name: str, value: Any, workspace: Path) -> None:
             raise ValueError("rejected route must have null branch and host_type")
         if not str(value.get("reason", "")).strip():
             raise ValueError("route reason cannot be empty")
+    elif name == "request_reroute":
+        original = json.loads((workspace / "route.json").read_text(encoding="utf-8"))
+        if original.get("branch") not in {"SVC-EXPLOIT", "FILE-EXPLOIT"}:
+            raise ValueError("only SVC/FILE-EXPLOIT may be narrowed to FILE-POV")
+        if value.get("branch") != "FILE-POV":
+            raise ValueError("reroute must preserve quality by narrowing to FILE-POV")
+        for key in ("reason", "entry", "oracle", "normal_input", "fixed_revision", "evidence"):
+            if not isinstance(value.get(key), str) or not value[key].strip():
+                raise ValueError(f"reroute needs concrete {key}")
+        revision = value["fixed_revision"].lower()
+        if revision != "unresolved" and not re.fullmatch(r"[0-9a-f]{40}", revision):
+            raise ValueError("fixed_revision must be 40 hex or UNRESOLVED")
     elif name == "submit_review":
         if not isinstance(value.get("passed"), bool) or not isinstance(value.get("execution_checked"), bool):
             raise ValueError("review passed and execution_checked must be boolean")
@@ -132,7 +151,7 @@ TOOLS = [
     {"name": "bash", "description": "Run a shell command in the workspace. Use for builds, tests and inspection. Avoid interactive commands.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"},
                                                        "timeout": {"type": "integer", "default": 120,
-                                                                   "description": "Timeout in seconds, not milliseconds; maximum 900"}},
+                                                                   "description": "Timeout in seconds, not milliseconds; maximum 3600"}},
                       "required": ["command"]}},
     {"name": "read_file", "description": "Read a UTF-8 text file in the workspace, with optional line bounds.",
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"},
@@ -160,7 +179,9 @@ def run_bounded(command: str, workspace: Path, timeout: int) -> subprocess.Compl
     """A timeout must stop compilers/builds, not leave an orphaned child."""
     # Wrap in a private process group even when a tool needs `sg docker`.
     # Otherwise `sg` can spawn children outside the group we later terminate.
-    wrapper = "trap 'exit 143' TERM; eval " + shlex.quote(command)
+    # Newly copied delivery files must remain traversable/readable by the
+    # unprivileged runner even when the controller has a restrictive umask.
+    wrapper = "umask 022\ntrap 'exit 143' TERM; eval " + shlex.quote(command)
     env = dict(os.environ)
     config = Path(__file__).resolve().parents[1] / "config"
     # The PT proxy credential stays in the user's 0600 config file. Source it
@@ -171,6 +192,20 @@ def run_bounded(command: str, workspace: Path, timeout: int) -> subprocess.Compl
         command = ". " + shlex.quote(str(proxy)) + "\n" + command
     docker_bin = config / "bin"
     env["PATH"] = str(docker_bin) + os.pathsep + env.get("PATH", "")
+    # Compose defaults to the delivery directory basename, which is identical
+    # for all tasks. Give every model-driven project a unique, auditable name.
+    import hashlib
+    project = "lup" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()[:16]
+    env.setdefault("COMPOSE_PROJECT_NAME", project)
+    env.setdefault("PIPELINE_IPAM_ROLE", "factory")
+    env.setdefault("PIPELINE_IPAM_WORK_DIR", str(workspace / ".compose-ipam"))
+    if "docker" in command:
+        # Explicit host paths would otherwise bypass IPAM and unique projects.
+        # The wrapper refreshes only the user's existing docker group and then
+        # invokes the real CLI with the same arguments.
+        docker_cli = str(docker_bin / "docker")
+        command = command.replace("/usr/bin/docker", docker_cli)
+        command = command.replace("docker.io", docker_cli)
     # A host/container locale mismatch must not make harmless commands such as
     # `locale` fail. The agent can still select an explicit locale in Docker.
     env.setdefault("LC_ALL", "C.UTF-8")
@@ -218,10 +253,18 @@ def run_bounded(command: str, workspace: Path, timeout: int) -> subprocess.Compl
 
 def execute(name: str, args: dict[str, Any], workspace: Path, docker_wrap: bool = True) -> str:
     try:
-        if name in {"submit_route", "submit_review"}:
+        if name in {"submit_route", "submit_review", "request_reroute"}:
             value = dict(args)
             validate_decision(name, value, workspace)
-            filename = "route.json" if name == "submit_route" else "review.json"
+            if name == "request_reroute":
+                original = json.loads((workspace / "route.json").read_text(encoding="utf-8"))
+                value = {"instance_id": original["instance_id"], "accepted": True,
+                         "branch": "FILE-POV", "host_type": None,
+                         "recovery_required": original.get("recovery_required", True)
+                         or value["fixed_revision"].upper() == "UNRESOLVED", **value}
+                filename = "reroute-request.json"
+            else:
+                filename = "route.json" if name == "submit_route" else "review.json"
             temporary = workspace / ("." + filename + ".tmp")
             temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             temporary.replace(workspace / filename)
@@ -268,46 +311,73 @@ def execute(name: str, args: dict[str, Any], workspace: Path, docker_wrap: bool 
             path.write_text(text.replace(old, str(args["new_string"])), encoding="utf-8")
             return f"edited {path.relative_to(workspace)}"
         return f"Error: unsupported tool {name}"
-    except (OSError, KeyError, TypeError, ValueError, subprocess.SubprocessError) as exc:
-        # A malformed tool call is evidence for the model to correct, not a
-        # reason to kill the whole synthesis worker and lose its live session.
+    except Exception as exc:
+        # Preserve an exact operation and stack for reproducibility. In
+        # particular, a bare 'Permission denied: PKG-INFO' is not a task verdict.
+        import traceback
+        detail = traceback.format_exc()[-16000:]
         missing = f"; missing argument: {exc.args[0]}" if isinstance(exc, KeyError) and exc.args else ""
-        return f"Error: {type(exc).__name__}{missing}: {exc}"
+        return (f"Error: {type(exc).__name__}{missing}: {exc}\n"
+                f"tool={name} arguments={json.dumps(args, ensure_ascii=False, default=str)[:8000]}\n{detail}")
 
 
-def model_context(messages: list[dict[str, Any]], budget: int) -> list[dict[str, Any]]:
-    """Drop whole old tool turns; never orphan tool_use/tool_result pairs."""
+def _request_bytes(messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> int:
+    """Measure the complete Anthropic request, not just conversation characters."""
+    return len(json.dumps({"messages": messages, "tools": tools,
+                           "tool_choice": {"type": "auto"}, "max_tokens": 32768},
+                          ensure_ascii=False, default=str).encode("utf-8"))
+
+
+def _compact_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep tool_use/tool_result IDs paired while eliding bulky historical data."""
+    compact = []
+    for message in messages:
+        value = dict(message)
+        if isinstance(message.get("content"), list):
+            value["content"] = []
+            for original in message["content"]:
+                block = dict(original)
+                if block.get("type") == "tool_result" and len(str(block.get("content", ""))) > 8000:
+                    block["content"] = str(block["content"])[:8000] + \
+                        "\n[truncated in model context; full evidence is in trajectory.jsonl]"
+                elif block.get("type") == "text" and len(str(block.get("text", ""))) > 8000:
+                    block["text"] = str(block["text"])[:8000] + "\n[historical reasoning truncated]"
+                elif block.get("type") == "tool_use":
+                    encoded = json.dumps(block.get("input"), ensure_ascii=False, default=str)
+                    if len(encoded.encode("utf-8")) > 8000:
+                        # This call already executed and its result follows. Do
+                        # not resend a huge historical source file or patch as
+                        # a tool argument; the durable trace retains it fully.
+                        block["input"] = {"historical_arguments_truncated": True}
+                value["content"].append(block)
+        compact.append(value)
+    return compact
+
+
+def model_context(messages: list[dict[str, Any]], budget: int,
+                  tools: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    """Bound the full UTF-8 request while preserving complete tool turn pairs."""
     if len(messages) < 2:
         return messages
+    tools = TOOLS + DECISION_TOOLS if tools is None else tools
     first, rest = messages[0], messages[1:]
     turns = [rest[index:index + 2] for index in range(0, len(rest), 2)]
-    # Keep the original task and newest turns, with a bounded message count.
     turns = turns[-40:]
     while turns:
         selected = [first, *(message for turn in turns for message in turn)]
-        if sum(len(json.dumps(message, ensure_ascii=False, default=str))
-               for message in selected) <= budget:
+        if _request_bytes(selected, tools) <= budget:
             return selected
         turns.pop(0)
-    # A single latest turn may be too large. Keep its protocol pairing intact
-    # and compact only large tool outputs; durable traces remain untouched.
-    selected = []
-    for message in [first, *turns[-1]] if turns else messages[-2:]:
-        compact = dict(message)
-        if isinstance(message.get("content"), list):
-            compact["content"] = []
-            for block in message["content"]:
-                if block.get("type") == "tool_result" and len(block.get("content", "")) > 12000:
-                    block = dict(block, content=block["content"][:8000] +
-                                 "\n[truncated in model context; complete result is in trajectory.jsonl]")
-                compact["content"].append(block)
-        selected.append(compact)
+    # The latest turn can be large even after older history is removed.
+    selected = _compact_history([first, *(turns[-1] if turns else messages[-2:])])
+    if _request_bytes(selected, tools) > budget:
+        raise ValueError("single compacted model turn exceeds the request budget")
     return selected
 
 
 def run(prompt: str, workspace: Path, output: Path, *, model: str,
         credentials: dict[str, str], max_turns: int, timeout: int,
-        network: Path, max_tokens: int = 32768, context_chars: int = 360000,
+        network: Path, max_tokens: int = 32768, context_chars: int = 96000,
         docker_wrap: bool = True) -> dict[str, Any]:
     del network
     workspace = workspace.resolve()
@@ -340,6 +410,14 @@ def run(prompt: str, workspace: Path, output: Path, *, model: str,
             # Preserve complete tool outputs on disk. Bound only model context;
             # the gateway rejects large accumulated conversations with HTTP 400.
             request_messages = model_context(messages, context_chars)
+            trace.write(json.dumps({"type": "model_request", "turn": turn,
+                                    "compacted": len(request_messages) != len(messages),
+                                    "original_messages": len(messages),
+                                    "sent_messages": len(request_messages),
+                                    "request_bytes": _request_bytes(request_messages, TOOLS + DECISION_TOOLS),
+                                    "budget_bytes": context_chars,
+                                    "observed_at": timestamp()}, ensure_ascii=False) + "\n")
+            trace.flush()
             try:
                 response = client.messages.create(model=model, max_tokens=max_tokens,
                                                   messages=request_messages,

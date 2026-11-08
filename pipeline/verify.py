@@ -1,78 +1,57 @@
-#!/usr/bin/env python3
-"""Validate differential verifier reports without trusting an exit status alone."""
+"""Execute the shipped pass2fail verifier; do not trust a synthesized report."""
 from __future__ import annotations
 
 import argparse
 import json
-import subprocess
 import time
 from pathlib import Path
 from typing import Any
 
-from .native_agent import stop_process_tree
-
-SAFE_ASAN = "detect_leaks=0:halt_on_error=1:abort_on_error=1:symbolize=0"
+from .pass2fail_verifier import fresh_verify
+from .task_contract import load_task
 
 
 def validate_report(value: Any) -> None:
-    if not isinstance(value, dict) or value.get("schema_version") != 1:
-        raise ValueError("report schema_version must be 1")
-    if not isinstance(value.get("success"), bool):
-        raise ValueError("report.success must be boolean")
+    if not isinstance(value, dict) or value.get("schema_version") != 2:
+        raise ValueError("report schema_version must be 2")
+    if not isinstance(value.get("success"), bool) or value.get("reward") not in {0.0, 1.0}:
+        raise ValueError("invalid pass2fail success/reward")
+    if value.get("status") == "miss":
+        if value["success"] or value["reward"] != 0.0:
+            raise ValueError("a missing submission cannot succeed")
+        return
     if value.get("branch") not in {"SVC-EXPLOIT", "FILE-EXPLOIT", "FILE-POV"}:
-        raise ValueError("report.branch must be a supported delivery route")
-    if not isinstance(value.get("host_type"), (str, type(None))):
-        raise ValueError("report.host_type must be a string or null")
-    expected = {
-        "build": "build_returncode",
-        "vuln_exploit": "vuln_exploit_returncode",
-        "fixed_exploit": "fixed_exploit_returncode",
-        "fixed_health": "fixed_health_returncode",
-        "benign_control": "benign_returncode",
-    }
-    for phase, returncode in expected.items():
-        evidence = value.get(phase)
-        if not isinstance(evidence, dict) or not isinstance(evidence.get("passed"), bool):
-            raise ValueError(f"report.{phase} must have boolean passed")
-        if not isinstance(evidence.get("output"), str) or not isinstance(evidence.get("command"), str):
-            raise ValueError(f"report.{phase} needs command and output")
-        if not isinstance(value.get(returncode), int):
-            raise ValueError(f"report.{returncode} must be integer")
-    success = (value["build"]["passed"] and value["vuln_exploit"]["passed"] and
-               not value["fixed_exploit"]["passed"] and value["fixed_health"]["passed"] and
-               value["benign_control"]["passed"] and value["build_returncode"] == 0)
-    if success != value["success"]:
-        raise ValueError("report.success contradicts differential evidence")
+        raise ValueError("invalid delivery branch")
+    vulnerable, fixed = value.get("vulnerable"), value.get("fixed")
+    if not isinstance(vulnerable, dict) or not isinstance(fixed, dict):
+        raise ValueError("successful differential needs vulnerable and fixed evidence")
+    expected = (vulnerable.get("triggered") is True and
+                vulnerable.get("health", {}).get("returncode") == 0 and
+                fixed.get("triggered") is False and
+                fixed.get("solution", {}).get("returncode") == 0 and
+                fixed.get("patched_health", {}).get("returncode") == 0)
+    if expected != value["success"] or (value["reward"] == 1.0) != value["success"]:
+        raise ValueError("pass2fail verdict contradicts its execution evidence")
+    if value["success"] and value.get("status") != "this_bug":
+        raise ValueError("successful differential must have status=this_bug")
 
 
-def execute_verify(delivery: Path, output: Path, timeout: int, wrapped: bool = False) -> dict[str, Any]:
-    """The only orchestrator-run differential, called from final Harbor acceptance."""
-    output.mkdir(parents=True, exist_ok=True)
+def execute_verify(profile: Path, output: Path, timeout: int) -> dict[str, Any]:
+    """Use the exact exported target/private files, with no intermediate rebuild."""
     started = time.monotonic()
+    contract = load_task(profile / "tests/private/task.json")
+    submission = profile / "tests/private" / f"reference_{contract['submission_mode']}"
+    reward, report = fresh_verify(profile, submission, output,
+                                  project="factory" + str(abs(hash(str(output))) % 10**8))
     try:
-        command = ["bash", str(delivery / "private/verify.sh"),
-                   str(delivery.resolve()), str(output.resolve())]
-        environment = dict(__import__('os').environ)
-        environment["PATH"] = str(Path(__file__).resolve().parents[1] / "config/bin") + ":" + environment.get("PATH", "")
-        with (output / "verify.log").open("w", encoding="utf-8") as log:
-            environment["ASAN_OPTIONS"] = SAFE_ASAN
-            process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
-                                       env=environment, start_new_session=True)
-            try:
-                returncode = process.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                stop_process_tree(process)
-                returncode = 124
-                log.write(f"\nVerifier timed out after {timeout}s; its process tree was stopped.\n")
-        report = json.loads((output / "report.json").read_text(encoding="utf-8"))
         validate_report(report)
-        return {"status": "passed" if returncode == 0 and report["success"] else "failed",
-                "returncode": returncode, "report": report,
-                "elapsed_sec": round(time.monotonic() - started, 2)}
-    except (OSError, ValueError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
-        return {"status": "error", "failure_class": "pipeline",
-                "error": f"{type(exc).__name__}: {exc}",
-                "elapsed_sec": round(time.monotonic() - started, 2)}
+        valid = True
+    except ValueError as exc:
+        report["validation_error"] = str(exc)
+        valid = False
+    return {"status": "passed" if reward == 1.0 and report["success"] and valid else "failed",
+            "returncode": 0 if reward == 1.0 and valid else 1, "report": report,
+            "elapsed_sec": round(time.monotonic() - started, 2)}
 
 
 def main() -> int:
@@ -80,7 +59,7 @@ def main() -> int:
     parser.add_argument("report", type=Path)
     args = parser.parse_args()
     validate_report(json.loads(args.report.read_text(encoding="utf-8")))
-    print("report schema and differential verdict are valid")
+    print("pass2fail report schema and differential verdict are valid")
     return 0
 
 
