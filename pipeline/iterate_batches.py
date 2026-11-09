@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 
 from .common import read_jsonl, timestamp
-from .supervise import atomic_json, load, strictly_accepted
+from .supervise import atomic_json, carry_workspaces, load, strictly_accepted
 
 TERMINAL = {"passed", "failed", "rejected", "error"}
 INFRASTRUCTURE_DIFFERENTIAL = {"error", "infra_error"}
@@ -86,46 +86,35 @@ def classify(task: str, row: dict, root: Path) -> dict:
         category = "delivery_or_oracle_failure"
     elif failure == "input_unavailable":
         category = "input_unavailable"
-    elif failure == "pipeline" and "routing agent did not complete: max_turns" in error:
-        # An exhausted route has not emitted a suitability verdict. Carry its
-        # trajectory into the supervisor's existing bounded handoff budget.
-        category, recovery = "pipeline_recovery_candidate", "route_budget"
-        blocked = recovery_budget_blocked(root, task, recovery)
-        if blocked:
-            category, recovery = "terminal_failure", None
+    elif failure in {"branch_mismatch", "synthesis_blocked", "synthesis_incomplete",
+                     "route_decision_missing"}:
+        category = "manual_recovery_required"
     elif failure == "pipeline" and not (root / task / "workspace/route.json").is_file():
-        category = "pipeline_fix_required"
+        category = "manual_recovery_required"
         missing = load(root / task / "input/manifest.json", {})
         report = load(root.parent / "download-report.json", {})
         preserved_error = any(entry.get("task_id") == task and entry.get("status") == "error"
                               for entry in report.get("tasks", []))
         if preserved_error and (not missing or missing.get("status") != "complete"):
             category = "input_unavailable"
-    elif failure in {"pipeline", "route_decision_missing", "synthesis_incomplete"} or infra_differential:
-        if not (root / task / "workspace/route.json").is_file():
-            category = "pipeline_fix_required"
-        else:
+    elif infra_differential and (row.get("review") or {}).get("passed") is True:
+        category = "pipeline_recovery_candidate"
+        recovery = "harbor_infrastructure"
+        blocked = recovery_budget_blocked(root, task, recovery)
+        if blocked:
+            category, recovery = "terminal_failure", None
+    elif failure in {"pipeline", "route_decision_missing", "synthesis_incomplete"}:
+        # Preserve model-produced evidence, but never automatically resume an
+        # interrupted synthesis or re-route an exhausted task. Only a frozen,
+        # reviewed delivery can resume the review/Harbor tail.
+        if (root / task / "workspace/delivery").is_dir():
             category = "pipeline_recovery_candidate"
-            if failure == "synthesis_incomplete" or (
-                    load(root / task / "synthesis/result.json", {}).get("status") == "max_turns"
-                    and not (root / task / "workspace/delivery/task.json").is_file()):
-                # A partially written delivery is not an independently reviewed
-                # artifact. Resume the bounded synthesis budget rather than
-                # requesting a Harbor resume that lacks an approved review.
-                recovery = "synthesis_interrupted"
-            elif infra_differential:
-                recovery = "harbor_infrastructure"
-            elif "routing agent did not complete: max_turns" in error:
-                recovery = "route_budget"
-            elif failure == "route_decision_missing":
-                recovery = "route_schema_retry"
-            elif (root / task / "workspace/delivery").is_dir():
-                recovery = "review_incomplete"
-            else:
-                recovery = "route_infrastructure"
-            blocked = recovery_budget_blocked(root, task, recovery) if recovery else None
+            recovery = "review_incomplete"
+            blocked = recovery_budget_blocked(root, task, recovery)
             if blocked:
                 category, recovery = "terminal_failure", None
+        else:
+            category = "manual_recovery_required"
     return {"task_id": task, "status": status, "failure_class": failure,
             "classification": category, "strictly_accepted": strictly_accepted(row),
             "recovery_reason": recovery, "retry_blocked": blocked if category == "terminal_failure" else None,
@@ -146,8 +135,6 @@ def recovery_budget_blocked(root: Path, task: str, recovery: str) -> str | None:
         # the next batch; absence of a state file proves no consumed budget.
         return None
     child = state.get("children", {}).get(task, {})
-    if recovery == "synthesis_interrupted" and child.get("bounded_recovery_launched") is True:
-        return "bounded_recovery_already_launched"
     if recovery == "harbor_infrastructure" and (
             child.get("harbor_retry_count", 0) >= 1
             or child.get("gold_protocol_retry_count", 0) >= 1):
@@ -157,12 +144,6 @@ def recovery_budget_blocked(root: Path, task: str, recovery: str) -> str | None:
             or child.get("review_launched") is True
             or child.get("retry_blocked") == "review_attempt_completed"):
         return "review_attempt_completed"
-    if recovery == "route_budget" and child.get("route_budget_recovery_count", 0) >= 1:
-        return "route_budget_already_launched"
-    if recovery in {"route_schema_retry", "route_infrastructure"} and (
-            child.get("retry_reason") in {"route_schema_retry", "route_infrastructure"}
-            and child.get("retry_count", 0) >= 1):
-        return "route_retry_already_launched"
     return None
 
 
@@ -185,8 +166,18 @@ def adopt_existing_carries(results: Path, carried: dict[str, Path]) -> None:
             # A live PID is an already-admitted recovery, not a second budget
             # grant. Preserve its original carry receipt during supervisor
             # restarts; never manufacture a new recovery plan for it.
-            child.update(carried_recovery=True, carry_blocked="missing_explicit_recovery_plan")
+            child.update(carried_recovery=True)
+            child.pop("carry_blocked", None)
             atomic_json(state_path, state)
+
+
+def prepare_carries(results: Path, carried: dict[str, Path], plans: dict[str, dict]) -> None:
+    """Complete an interrupted first copy without discarding its audited plan."""
+    missing = [task for task in carried if not (results / task / "carry-provenance.json").is_file()]
+    if missing:
+        carry_workspaces([carried[task] for task in missing], results, set(missing),
+                         {task: plans[task] for task in missing})
+    adopt_existing_carries(results, carried)
 
 
 def regression_gate(root: Path, log_path: Path) -> None:
@@ -471,7 +462,7 @@ def main() -> int:
                     if (destination / "carry-provenance.json").is_file():
                         atomic_json(destination / "carry-recovery.json",
                                     previous["recovery_plans"][task])
-            adopt_existing_carries(results, carried)
+            prepare_carries(results, carried, previous["recovery_plans"])
             command += ["--only", *fresh, *carried, *receipt.get("observed_only", [])]
             with log_path.open("a", encoding="utf-8") as log:
                 log.write(f"\n[{timestamp()}] launch batch={number}: {command!r}\n")
@@ -585,17 +576,10 @@ def main() -> int:
             if task["task_id"] not in carry_sources:
                 continue
             reason = task["recovery_reason"]
-            mode = {"route_budget": "route_handoff", "route_schema_retry": "route",
-                    "route_infrastructure": "route", "synthesis_interrupted": "synthesis",
-                    "review_incomplete": "review", "harbor_infrastructure": "harbor"}[reason]
+            mode = {"review_incomplete": "review", "harbor_infrastructure": "harbor"}[reason]
             plan = {"schema_version": 1, "task_id": task["task_id"],
                     "instance_id": recovery_instance(Path(carry_sources[task["task_id"]]), task["task_id"]),
                     "mode": mode, "reason": reason}
-            if mode == "route_handoff":
-                trajectory = Path(carry_sources[task["task_id"]]) / "route/trajectory.jsonl"
-                if not trajectory.is_file():
-                    raise RuntimeError(f"missing route handoff evidence: {task['task_id']}")
-                plan["trajectory"] = "route/trajectory.jsonl"
             recovery_plans[task["task_id"]] = plan
         audit = {"schema_version": 1, "batch": number, "fresh": fresh, "carried": sorted(carried),
                  "audited_at": timestamp(), "tasks": tasks, "carry_sources": carry_sources,

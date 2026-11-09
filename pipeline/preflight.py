@@ -10,7 +10,7 @@ import subprocess
 from pathlib import Path
 
 from .common import load_env, timestamp, write_json
-from .native_agent import docker_argv
+from .docker_cli import docker_argv
 
 
 def probe(name: str, command: list[str], *, env: dict[str, str] | None = None,

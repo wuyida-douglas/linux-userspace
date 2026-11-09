@@ -14,6 +14,40 @@ from .common import timestamp, write_json
 EMPTY_MCP = '{"mcpServers":{}}'
 
 
+def workspace_environment(workspace: Path, base: dict[str, str] | None = None) -> dict[str, str]:
+    """Expose the per-task workspace contract to Claude Code's built-in tools.
+
+    Claude Code has no per-command wrapper, so the variables the synthesis
+    prompts promise (TASK_TMP, Compose/IPAM identity, locale, ASan defaults)
+    must live in the agent process environment instead.
+    """
+    import hashlib
+
+    env = dict(os.environ if base is None else base)
+    # Third-party build scripts must never reset the pipeline repository merely
+    # because it is an ancestor of their cwd; keep auth/settings but drop an
+    # inherited repository selection.
+    for variable in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+                     "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_PREFIX"):
+        env.pop(variable, None)
+    resolved = workspace.resolve()
+    env["GIT_CEILING_DIRECTORIES"] = str(resolved.parent)
+    env["PATH"] = str(Path(__file__).resolve().parents[1] / "config/bin") + os.pathsep + env.get("PATH", "")
+    scratch = resolved / ".agent-tmp"
+    scratch.mkdir(exist_ok=True)
+    env["TASK_TMP"] = str(scratch)
+    env.setdefault("ASAN_OPTIONS", "detect_leaks=0:halt_on_error=1:abort_on_error=1:symbolize=0")
+    # Compose defaults to the delivery directory basename, identical for every
+    # task; a unique project keeps model-driven containers auditable.
+    project = "lup" + hashlib.sha256(str(resolved).encode()).hexdigest()[:16]
+    env.setdefault("COMPOSE_PROJECT_NAME", project)
+    env.setdefault("PIPELINE_IPAM_ROLE", "factory")
+    env.setdefault("PIPELINE_IPAM_WORK_DIR", str(resolved / ".compose-ipam"))
+    env.setdefault("LC_ALL", "C.UTF-8")
+    env.setdefault("LANG", "C.UTF-8")
+    return env
+
+
 def command(prompt: str, model: str, max_turns: int, network: Path) -> list[str]:
     return ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose",
             "--permission-mode", "bypassPermissions", "--setting-sources", "",
@@ -46,6 +80,7 @@ def run(prompt: str, workspace: Path, output: Path, *, model: str,
                         "10.140.84.42,10.12.111.133")
             env["NO_PROXY"] = no_proxy
             env["no_proxy"] = no_proxy
+    env = workspace_environment(workspace, env)
     env.update({"CLAUDE_CODE_MAX_RETRIES": "15", "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "131072",
                 "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
                 "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT": "1"})
@@ -55,8 +90,10 @@ def run(prompt: str, workspace: Path, output: Path, *, model: str,
     with (output / "stdout.jsonl").open("w", encoding="utf-8") as stdout, \
             (output / "stderr.txt").open("w", encoding="utf-8") as stderr, \
             (output / "trajectory.jsonl").open("w", encoding="utf-8") as trajectory:
-        process = subprocess.Popen(command(prompt, model, max_turns, network), cwd=workspace,
-                                   env=env, stdout=stdout, stderr=stderr,
+        argv = command(prompt, model, max_turns, network)
+        argv[0] = executable
+        process = subprocess.Popen(argv, cwd=workspace, env=env,
+                                   stdout=stdout, stderr=stderr,
                                    start_new_session=True)
         timed_out = False
         try:

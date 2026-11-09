@@ -15,9 +15,9 @@ from typing import Any
 
 import yaml
 
-from .common import sha256 as digest_file
+from .common import export_task_id, sha256 as digest_file
 from .common import timestamp, write_json
-from .native_agent import docker_argv
+from .docker_cli import docker_argv
 from .runtime_images import AGENT_IMAGE, VERIFIER_IMAGE
 from .task_contract import load_task, validate_route
 from .verify import execute_verify
@@ -643,7 +643,8 @@ def accept(workspace: Path, output: Path, task_id: str, route: dict[str, Any],
         raise FileExistsError(f"refusing to overwrite acceptance directory {output}")
     output.mkdir(parents=True)
     contract = load_task(delivery / "task.json")
-    bundle = output / "bundle" / task_id
+    delivery_id = export_task_id(task_id, contract["branch"], contract.get("host_type"))
+    bundle = output / "bundle" / delivery_id
     # Load a frozen runtime, not a mutable tag that a previous Harbor cleanup
     # may have removed. Task and verifier use the same archive throughout.
     cached_runtime = output.parent.parent / "shared-runtime"
@@ -651,14 +652,15 @@ def accept(workspace: Path, output: Path, task_id: str, route: dict[str, Any],
         shutil.copytree(cached_runtime, output / "bundle/_runtime")
         load_archives(output / "bundle/_runtime")
     result = {"schema_version": 2, "stage": "harbor", "status": "in_progress",
+              "task_id": task_id, "export_task_id": delivery_id,
               "manifest": None, "gold": None, "null": None}
     try:
-        manifest = export(delivery, bundle, task_id, route, bundle_root=output / "bundle")
+        manifest = export(delivery, bundle, delivery_id, route, bundle_root=output / "bundle")
         result["manifest"] = manifest
         load_archives(bundle / "images")
         load_archives(output / "bundle/_runtime")
         jobs = harbor_jobs or output / "jobs"
-        name = re.sub(r"[^a-z0-9-]+", "-", task_id.lower())[:90]
+        name = re.sub(r"[^a-z0-9-]+", "-", delivery_id)[:90]
         gold = oracle_profile(bundle, contract["submission_mode"], output / "gold-profile")
         result["gold"] = harbor_run(gold, jobs, name + "-gold", timeout)
         if result["gold"]["reward"] == 1.0:
@@ -682,7 +684,7 @@ def accept(workspace: Path, output: Path, task_id: str, route: dict[str, Any],
         # first accept() has no pre-existing result.json to copy.
         write_json(output / "result.json", result)
     if result["status"] == "passed" and published_root is not None:
-        publish_bundle(output / "bundle", published_root, task_id,
+        publish_bundle(output / "bundle", published_root, delivery_id,
                        str((output / "result.json").resolve()))
     return result
 
@@ -698,17 +700,23 @@ def main() -> int:
     records = []
     for result_path in sorted(args.results.glob("*/result.json")):
         result = json.loads(result_path.read_text(encoding="utf-8"))
-        if result.get("status") != "passed" or (args.only and result["task_id"] not in args.only):
+        if result.get("status") != "passed":
             continue
-        destination = args.output / result["task_id"]
+        delivery = result_path.parent / "workspace/delivery"
+        contract = load_task(delivery / "task.json")
+        delivery_id = export_task_id(result["task_id"], contract["branch"], contract.get("host_type"))
+        if args.only and result["task_id"] not in args.only and delivery_id not in args.only:
+            continue
+        destination = args.output / delivery_id
         if destination.exists():
             raise FileExistsError(f"refusing to overwrite {destination}")
-        manifest = export(result_path.parent / "workspace/delivery", destination,
-                          result["task_id"], result["route"], args.agent_image, args.output)
+        manifest = export(delivery, destination, delivery_id, result["route"],
+                          args.agent_image, args.output)
         if not args.skip_load_test:
             load_archives(destination / "images")
-        records.append({"task_id": result["task_id"], "status": "exported", "images": manifest["archives"]})
-        print(f"exported {result['task_id']}", flush=True)
+        records.append({"task_id": delivery_id, "source_task_id": result["task_id"],
+                        "status": "exported", "images": manifest["archives"]})
+        print(f"exported {delivery_id}", flush=True)
     write_json(args.output / "manifest.json", {"schema_version": 1, "tasks": records})
     return 0
 

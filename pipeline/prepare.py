@@ -73,6 +73,14 @@ def sample(path: Path, count: int, seed: int, exclude: set[str] | None = None) -
     return [sample_from_row(row, index) for index, row in enumerate(chosen, 1)]
 
 
+def sample_all(path: Path) -> list[dict[str, Any]]:
+    """Use the frozen pool in its original order; no random sampling."""
+    rows = list(read_jsonl(path))
+    if not rows:
+        raise ValueError("candidate pool is empty")
+    return [sample_from_row(row, index) for index, row in enumerate(rows, 1)]
+
+
 def complete_instances(path: Path) -> set[str]:
     return {row["instance_id"] for row in read_jsonl(path)
             if row.get("status") == "complete" and row.get("integrity_ok") is not False}
@@ -547,7 +555,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--count", type=int, default=100)
+    size = parser.add_mutually_exclusive_group()
+    size.add_argument("--count", type=int, default=None,
+                      help="random sample size (default 100 when --all is absent)")
+    size.add_argument("--all", action="store_true",
+                      help="prepare the complete frozen candidate pool in pool order")
     parser.add_argument("--seed", type=int, default=20261103)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--sample-only", action="store_true")
@@ -567,28 +579,45 @@ def main() -> int:
             or any((row.get("metadata_label") or {}).get("label") != "keep" for row in pool_rows):
         parser.error("candidate pool must contain exactly 23,873 unique keep labels")
     if args.top_up_from:
+        if args.all:
+            parser.error("--top-up-from cannot be combined with --all")
         if args.only or args.sample_only:
             parser.error("--top-up-from cannot be combined with --only or --sample-only")
         if not 1 <= args.workers <= 30:
             parser.error("workers must be 1..30")
-        return top_up(args.input, args.top_up_from, args.output, args.count,
+        return top_up(args.input, args.top_up_from, args.output,
+                      args.count if args.count is not None else 100,
                       args.seed, args.workers, args.remote, retain_original=not args.exclude_original)
     args.output.mkdir(parents=True, exist_ok=True)
     selection = args.output / "selection.jsonl"
+    count = args.count if args.count is not None else 100
+    if args.all:
+        policy = "all(frozen_pool_order)"
+        expected = APPROVED_POOL_SIZE
+    else:
+        policy = "random.Random(seed).sample(frozen_pool_order, count)"
+        expected = count
     if selection.exists():
         rows = list(read_jsonl(selection))
-        if len(rows) != args.count:
-            raise ValueError("existing selection has a different count; choose another output directory")
+        if len(rows) != expected:
+            raise ValueError(
+                f"existing selection has {len(rows)} rows, expected {expected}; "
+                "choose another output directory or use the matching --all/--count mode")
+        if args.all:
+            existing = [row["instance_id"] for row in rows]
+            frozen = [row["instance_id"] for row in pool_rows]
+            if existing != frozen:
+                raise ValueError("existing full selection differs from the frozen pool order; use a new output directory")
     elif args.only:
         raise ValueError("cannot repair a partial selection before the fixed sample is created")
     else:
-        rows = sample(args.input, args.count, args.seed)
+        rows = sample_all(args.input) if args.all else sample(args.input, count, args.seed)
         write_jsonl(selection, rows)
         write_json(args.output / "sample.json", {"seed": args.seed, "count": len(rows),
                                                  "input": str(args.input), "input_sha256": APPROVED_POOL_SHA256,
                                                  "input_count": APPROVED_POOL_SIZE,
                                                  "label_policy": "metadata_label.label == keep; no additional filters",
-                                                 "sampling_policy": "random.Random(seed).sample(frozen_pool_order, count)",
+                                                 "sampling_policy": policy,
                                                  "created_at": timestamp()})
     if args.only:
         wanted = set(args.only)

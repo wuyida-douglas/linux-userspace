@@ -83,12 +83,16 @@ def worker_alive(pid: object) -> bool:
 def strictly_accepted(record: dict) -> bool:
     harbor = record.get("harbor") or {}
     differential = harbor.get("differential_from_final_bundle") or {}
+    report = differential.get("report") or {}
+    protocol_ok = all(
+        (report.get(phase) or {}).get("submission_result", {}).get("returncode") == 0
+        for phase in ("vulnerable", "fixed"))
     return (record.get("status") == "passed"
             and (record.get("review") or {}).get("passed") is True
             and (harbor.get("gold") or {}).get("reward") == 1.0
             and (harbor.get("null") or {}).get("reward") == 0.0
             and differential.get("status") == "passed"
-            and (differential.get("report") or {}).get("success") is True)
+            and report.get("success") is True and protocol_ok)
 
 
 def latest_turn(path: Path) -> int:
@@ -105,31 +109,6 @@ def latest_turn(path: Path) -> int:
         except OSError:
             pass
     return result
-
-
-def api_recovery_attempt(task: Path) -> bool:
-    """Count only the exact bounded recovery, not unrelated continuations."""
-    log = task / "supervisor.log"
-    if not log.is_file():
-        return False
-    return any(line.startswith("[") and " launch: " in line
-               and line.rstrip().endswith("--continue-synthesis")
-               for line in log.read_text(encoding="utf-8", errors="replace").splitlines())
-
-
-def api_recovery_pending(task: Path, record: dict, synthesis: dict,
-                         child: dict, route_file: Path) -> bool:
-    """An abandoned scheduler marker is not evidence that a retry ran.
-
-    The executor's own 96-KiB retry is the final allowed attempt. If it ran,
-    neither the scheduler nor a supervisor restart may repeat it.
-    """
-    return ("invalid or oversized HTTP request" in str(record.get("error", ""))
-            or "invalid or oversized HTTP request" in str(synthesis.get("error", ""))) \
-        and route_file.is_file() and record.get("status") in {"failed", "error"} \
-        and not (worker_alive(child.get("pid"))) \
-        and max(child.get("api_request_recovery_count", 0), int(api_recovery_attempt(task))) < 1 \
-        and not (task / "retry-evidence/synthesis-api-request-limit/result.json").is_file()
 
 
 def pipeline_worker_command(pid: int, proc_root: Path = Path("/proc")) -> list[str] | None:
@@ -179,13 +158,13 @@ def worker_start_error(task: Path) -> str | None:
     return None
 
 
-def prioritize_candidates(candidates: list[tuple], children: dict,
+def prioritize_candidates(candidates: list[str], children: dict,
                           selected: list[dict]) -> None:
-    """Preserve sample order within bounded repairs and new work."""
+    """Preserve sample order within Harbor resumes and new work."""
     order = {row["task_id"]: index for index, row in enumerate(selected)}
-    candidates.sort(key=lambda candidate: (
-        0 if children.get(candidate[0], {}).get("repair_priority") else 1,
-        order[candidate[0]]))
+    candidates.sort(key=lambda task: (
+        0 if children.get(task, {}).get("repair_priority") else 1,
+        order[task]))
 
 
 def carry_workspaces(sources: list[Path], results: Path, selected_ids: set[str] | None,
@@ -202,21 +181,15 @@ def carry_workspaces(sources: list[Path], results: Path, selected_ids: set[str] 
         if selected_ids is not None and task not in selected_ids:
             raise ValueError(f"carried task is not in --only: {task}")
         plan = (recovery_plans or {}).get(task, {})
-        mode = plan.get("mode")
+        mode = plan.get("mode", "review")
         if recovery_plans is not None:
             if plan.get("schema_version") != 1 or plan.get("task_id") != task \
-                    or mode not in {"route", "route_handoff", "synthesis", "review", "harbor"}:
-                raise ValueError(f"invalid carried recovery plan for {task}")
-            trajectory = plan.get("trajectory")
-            if mode == "route_handoff" and (
-                    not isinstance(trajectory, str) or Path(trajectory).is_absolute()
-                    or ".." in Path(trajectory).parts or not (source / trajectory).is_file()):
-                raise ValueError(f"carried task lacks route handoff evidence: {source}")
-        if not (source / "result.json").is_file() or not (
-                (source / "workspace/route.json").is_file() or mode == "route_handoff"):
+                    or mode not in {"review", "harbor"}:
+                raise ValueError(f"only review/Harbor delivery carry is supported for {task}")
+        if not (source / "result.json").is_file() or not (source / "workspace/route.json").is_file():
             raise ValueError(f"carried task lacks a frozen result and frozen route: {source}")
-        if not (source / "synthesis/result.json").is_file() and mode not in {"route", "route_handoff"}:
-            raise ValueError(f"carried task lacks synthesis evidence: {source}")
+        if not (source / "synthesis/result.json").is_file() or not (source / "workspace/delivery").is_dir():
+            raise ValueError(f"carried task lacks a completed delivery: {source}")
         destination = results / task
         staged_plan = load(destination / "carry-recovery.json", {}) if destination.is_dir() else {}
         if destination.exists() and (recovery_plans is None or staged_plan != plan):
@@ -252,8 +225,6 @@ def carry_workspaces(sources: list[Path], results: Path, selected_ids: set[str] 
                     "review_launched", "delivery_launched", "harbor_launched", "final_status"):
             child.pop(key, None)
         child["carried_recovery"] = True
-        if mode == "route_handoff":
-            child["route_budget_recovery_count"] = 1
         # A carried result can predate the identity field. Reconcile its
         # verified route identity before checking the explicit recovery plan.
         if not source_result.get("instance_id"):
@@ -264,13 +235,14 @@ def carry_workspaces(sources: list[Path], results: Path, selected_ids: set[str] 
     return carried
 
 
-def launch(task: str, sample: Path, results: Path, route: Path | None,
-           turns: int, timeout: int, continue_synthesis: bool = False,
-           resume_harbor: bool = False, route_handoff: Path | None = None,
+def launch(task: str, sample: Path, results: Path,
+           turns: int, timeout: int,
+           resume_harbor: bool = False,
            published_root: Path | None = None, review_turns: int = 70,
            review_timeout: int = 3600, verify_timeout: int = 1800,
-           workspace_from: Path | None = None, review_delivery: bool = False,
+           review_delivery: bool = False,
            concurrency: int = 30) -> subprocess.Popen:
+    """Launch one new task or resume only its frozen review/Harbor tail."""
     command = [sys.executable, "-m", "pipeline.run", "--sample", str(sample),
                "--results", str(results), "--only", task, "--concurrency", str(concurrency),
                "--max-turns", str(turns), "--route-turns", "45",
@@ -282,14 +254,6 @@ def launch(task: str, sample: Path, results: Path, route: Path | None,
         command.append("--review-delivery")
     elif resume_harbor:
         command.append("--resume")
-    elif continue_synthesis:
-        command.append("--continue-synthesis")
-        if workspace_from is not None:
-            command += ["--workspace-from", str(workspace_from)]
-    elif route_handoff is not None:
-        command += ["--route-handoff-from", str(route_handoff)]
-    elif route is not None:
-        command += ["--route-from", str(route)]
     log = results / task / "supervisor.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("a", encoding="utf-8") as output:
@@ -352,10 +316,8 @@ def main() -> int:
     if carried_ids:
         for task in carried_ids:
             plan = load(args.results / task / "carry-recovery.json", {})
-            if plan.get("mode") == "route_handoff":
-                state = load(args.results / "supervisor-state.json", {"children": {}})
-                state.setdefault("children", {}).setdefault(task, {})["route_budget_recovery_count"] = 1
-                atomic_json(args.results / "supervisor-state.json", state)
+            if plan.get("mode") not in {None, "review", "harbor"}:
+                raise ValueError(f"manual route/synthesis recovery is not supervised: {task}")
         if len(args.carry_results) != len(carried_ids):
             raise ValueError("carry-results must identify distinct tasks")
         (args.results / "carry-manifest.json").write_text(json.dumps({
@@ -815,6 +777,9 @@ def main() -> int:
             if child.get("worker_results")
             and args.recovery_results is not None
             and Path(child["worker_results"]).resolve() == args.recovery_results.resolve()}
+        # Model retries and handoffs are intentionally not supervised. Only a
+        # frozen delivery may resume its independent review/Harbor tail.
+        manual_recovery_modes = {"route", "synthesis"}
         for task, recovery_root in shared_recovery_tasks.items():
             child = children.get(task, {})
             source_sample = load(recovery_root / "supervisor-state.json", {}).get("sample")
@@ -839,27 +804,6 @@ def main() -> int:
             delivery = recovery_root / task / "workspace/delivery"
             synthesis = load(recovery_root / task / "synthesis/result.json", {})
             review = load(recovery_root / task / "workspace/review.json", {})
-            if not review and child.get("retry_reason") == "fresh_review_delivery_repair":
-                review = load(recovery_root / task / "retry-evidence/review-before-delivery-repair.json", {})
-            if record.get("failure_class") == "review_rejected" \
-                    and review.get("passed") is False and synthesis.get("status") == "completed" \
-                    and route.is_file() and child.get("delivery_retry_count", 0) == 0:
-                evidence = recovery_root / task / "retry-evidence"
-                evidence.mkdir(exist_ok=True)
-                from .common import write_json
-                write_json(evidence / "review-before-delivery-repair.json", review)
-                write_json(recovery_root / task / "workspace/repair-request.json", {
-                    "reason": "independent review rejected the completed delivery",
-                    "source": "latest independent review.json", "findings": review.get("findings", []),
-                    "review_reason": review.get("reason", ""), "requires_fresh_independent_review": True})
-                if (recovery_root / task / "workspace/review.json").is_file() \
-                        and not (evidence / "synthesis-review-before-repair.json").exists():
-                    os.rename(recovery_root / task / "workspace/review.json",
-                              evidence / "synthesis-review-before-repair.json")
-                child.update(retry_reason="fresh_review_delivery_repair", repair_priority=1,
-                             external_worker=False, pid=None)
-                candidates.append((task, None, True))
-                continue
             if strictly_accepted(record):
                 completed.add(task)
                 external.discard(task)
@@ -873,31 +817,10 @@ def main() -> int:
                     and (report.get("vulnerable") or {}).get("oracle", {}).get("returncode") == 0
                     and (report.get("fixed") or {}).get("error_stage") == "submission"
                     and (report.get("fixed") or {}).get("submission_result", {}).get("returncode") not in {0, None})
-                if gold_protocol_defect and synthesis.get("status") == "completed" \
-                        and child.get("delivery_retry_count", 0) == 0 \
-                        and not (delivery.parent / "repair-request.json").is_file():
-                    evidence = recovery_root / task / "retry-evidence"
-                    archive = evidence / "harbor-before-gold-submission-repair"
-                    if archive.exists():
-                        child.update(retry_blocked="gold_submission_repair_already_attempted",
-                                     external_worker=False, pid=None)
-                        completed.add(task)
-                        continue
-                    evidence.mkdir(exist_ok=True)
-                    atomic_json(evidence / "review-before-delivery-repair.json", review)
-                    os.rename(delivery.parent / "review.json",
-                              evidence / "synthesis-review-before-repair.json")
-                    if (recovery_root / task / "harbor").is_dir():
-                        os.rename(recovery_root / task / "harbor", archive)
-                    atomic_json(delivery.parent / "repair-request.json", {
-                        "schema_version": 1, "reason": "delivery_review_repair",
-                        "error": "Gold must finish the public protocol with exit 0 on patched; the private oracle alone decides whether the effect remains.",
-                        "review": {"passed": False, "findings": [{"severity": "major",
-                                   "evidence": (report.get("fixed") or {}).get("submission_result", {}).get("output", "")[-4000:]}]},
-                        "requires_fresh_independent_review": True})
-                    child.update(retry_reason="fresh_review_delivery_repair", repair_priority=1,
-                                 delivery_retry_count=1, external_worker=False, pid=None)
-                    candidates.append((task, None, True))
+                if gold_protocol_defect:
+                    child.update(retry_reason="manual_recovery_required",
+                                 external_worker=False, pid=None)
+                    completed.add(task)
                     continue
                 contract = load(delivery / "task.json", {})
                 file_exploit_verifier_bug = (
@@ -918,7 +841,7 @@ def main() -> int:
                         os.rename(previous_harbor, archive)
                     child.update(retry_reason="review_infrastructure", repair_priority=1,
                                  acceptance_resume_requested=True, external_worker=False, pid=None)
-                    candidates.append((task, None, False))
+                    candidates.append(task)
                     continue
         for row in selected:
             task = row["task_id"]
@@ -954,11 +877,26 @@ def main() -> int:
             # schema retry; the record checks below make other finals terminal.
             record = load(args.results / task / "result.json", {})
             child = children.setdefault(task, {})
+            if record.get("status") in {"failed", "error"} \
+                    and (child.get("retry_reason") == "bounded_recovery"
+                         or (args.results / task / "workspace/repair-request.json").is_file()
+                         or (args.results / task / "workspace/reroute-request.json").is_file()):
+                child["retry_reason"] = "manual_recovery_required"
+                completed.add(task)
+                continue
+            if record.get("status") in {"failed", "rejected", "routed"} \
+                    and load(args.results / task / "workspace/review.json", {}).get("passed") is not True:
+                # Route, synthesis and review failures are terminal here. A
+                # later manual recovery may inspect the preserved workspace.
+                completed.add(task)
+                continue
             route_file = args.results / task / "workspace/route.json"
             delivery_dir = args.results / task / "workspace/delivery"
             synthesis = load(args.results / task / "synthesis/result.json", {})
             review = load(args.results / task / "workspace/review.json", {})
-            if child.get("carried_recovery") and not child.get("carry_recovery_dispatched"):
+            if child.get("carry_recovery_dispatched"):
+                child.pop("carry_blocked", None)
+            elif child.get("carried_recovery"):
                 plan_path = args.results / task / "carry-recovery.json"
                 if not plan_path.is_file():
                     children[task]["carry_blocked"] = "missing_explicit_recovery_plan"
@@ -966,37 +904,33 @@ def main() -> int:
                     atomic_json(state_path, state)
                     continue
                 plan = load(plan_path, {})
+                mode = plan.get("mode")
                 if (plan.get("schema_version") != 1 or plan.get("task_id") != task
-                        or plan.get("instance_id") != record.get("instance_id")
-                        or plan.get("mode") not in {"route", "route_handoff", "synthesis", "review", "harbor"}):
+                        or plan.get("instance_id") != record.get("instance_id")):
                     raise ValueError(f"invalid carried recovery plan for {task}")
-                mode = plan["mode"]
-                if mode in {"review", "harbor"} and not (
+                if mode in manual_recovery_modes:
+                    children[task]["carry_blocked"] = "manual_recovery_required"
+                    completed.add(task)
+                    continue
+                if mode not in {"review", "harbor"}:
+                    raise ValueError(f"unsupported carried recovery plan for {task}")
+                if not (
                         (args.results / task / "workspace/delivery").is_dir()
                         and review.get("passed") is True):
                     children[task]["carry_blocked"] = "approved_delivery_missing"
                     completed.add(task)
                     continue
-                if mode in {"synthesis", "route", "route_handoff"} and not (
-                        (args.results / task / "workspace/input/src").is_dir()
-                        and (mode in {"route", "route_handoff"} or route_file.is_file())
-                        and (mode != "synthesis" or record.get("status") in {
-                            "synthesizing", "failed", "error"})):
-                    children[task]["carry_blocked"] = "reusable_workspace_missing"
-                    completed.add(task)
-                    continue
                 children[task].update(retry_reason="carry_" + mode,
-                                      carry_recovery_dispatched=True, repair_priority=1)
-                candidates.append((task, None, mode == "synthesis"))
+                                      carry_recovery_dispatched=True, repair_priority=1,
+                                      carry_blocked=None)
+                candidates.append(task)
                 continue
             if child.get("retry_blocked") == "worker_start_import":
                 completed.add(task)
                 continue
             if child.get("retry_reason") == "bounded_recovery" \
-                    and child.get("bounded_recovery_launched") is True \
                     and record.get("status") in {"failed", "error"}:
-                children[task].update(retry_blocked="bounded_recovery_already_launched",
-                                      retry_reason=None)
+                children[task]["retry_reason"] = "manual_recovery_required"
                 completed.add(task)
                 continue
             if child.get("retry_reason") == "review_incomplete" \
@@ -1013,40 +947,15 @@ def main() -> int:
             delivery_dir = args.results / task / "workspace/delivery"
             synthesis = load(args.results / task / "synthesis/result.json", {})
             review = load(args.results / task / "workspace/review.json", {})
-            if (record.get("failure_class") == "review_rejected"
-                    and review.get("passed") is False
-                    and synthesis.get("status") == "completed" and route_file.is_file()
-                    and child.get("delivery_retry_count", 0) == 0):
-                # The newest independent verdict supersedes a stale repair
-                # request carried before this review completed.
-                request = args.results / task / "workspace/repair-request.json"
-                evidence = args.results / task / "retry-evidence"
-                evidence.mkdir(exist_ok=True)
-                from .common import write_json
-                write_json(evidence / "review-before-delivery-repair.json", review)
-                write_json(request, {
-                    "reason": "independent review rejected the completed delivery",
-                    "source": "latest independent review.json",
-                    "findings": review.get("findings", []),
-                    "review_reason": review.get("reason", ""),
-                    "requires_fresh_independent_review": True})
-                if request.is_file():
-                    os.rename(args.results / task / "workspace/review.json",
-                              evidence / "synthesis-review-before-repair.json")
-                children[task].update(retry_reason="fresh_review_delivery_repair",
-                                      repair_priority=1)
-                candidates.append((task, None, True))
+            if record.get("failure_class") == "review_rejected" \
+                    and review.get("passed") is False:
+                children[task]["retry_reason"] = "manual_recovery_required"
+                completed.add(task)
                 continue
-            if (record.get("status") in {"error", "failed"}
-                    and (args.results / task / "workspace/repair-request.json").is_file()
-                    and synthesis.get("status") == "completed" and route_file.is_file()
-                    and child.get("delivery_retry_count", 0) == 0):
-                # A concrete repair is more specific than the generic missing
-                # review recovery. Continue the existing synthesis session;
-                # never package a known-defective delivery as-is.
-                children[task].update(retry_reason="delivery_contract_repair",
-                                      repair_priority=1)
-                candidates.append((task, None, True))
+            if record.get("status") in {"error", "failed"} \
+                    and (args.results / task / "workspace/repair-request.json").is_file():
+                children[task]["retry_reason"] = "manual_recovery_required"
+                completed.add(task)
                 continue
             if (synthesis.get("status") == "completed" and route_file.is_file()
                     and delivery_dir.is_dir()
@@ -1064,7 +973,7 @@ def main() -> int:
                 # the normal independent-review/Harbor tail of the same task.
                 children[task].update(retry_reason="review_incomplete",
                                       repair_priority=1)
-                candidates.append((task, None, False))
+                candidates.append(task)
                 continue
             if (record.get("status") == "error"
                     and any(token in str(record.get("error", ""))
@@ -1100,20 +1009,6 @@ def main() -> int:
             published_acceptance = (args.published_root / task / "acceptance.json") \
                 if args.published_root is not None else None
             approved_review = load(args.results / task / "workspace/review.json", {})
-            if (record.get("status") in {"error", "failed", "synthesizing", "reviewing", "harbor"}
-                    and record.get("error") == "continue-synthesis needs route or existing workspace"
-                    and synthesis.get("status") == "completed"
-                    and route_file.is_file() and delivery_dir.is_dir()
-                    and not (args.results / task / "workspace/review.json").is_file()
-                    and child.get("review_incomplete_retry_count", 0) >= 1
-                    and child.get("retry_reason") == "review_incomplete"):
-                # Only a previously unreviewed delivery may continue its
-                # synthesis session. It must not receive another fresh review.
-                children[task].update(retry_reason="completed_route_recovery",
-                                      retry_count=0, previous_status=None,
-                                      retry_blocked=None)
-                candidates.append((task, route_file, True))
-                continue
             if ((not record or record.get("error") == "ValueError: completed delivery requires --resume; refusing to replace it with a fresh route")
                     and synthesis.get("status") == "completed"
                     and route_file.is_file() and delivery_dir.is_dir()
@@ -1122,7 +1017,7 @@ def main() -> int:
                 # callback recovery must not bypass the existing review.
                 children[task].update(retry_reason="review_infrastructure",
                                       acceptance_resume_requested=True, repair_priority=1)
-                candidates.append((task, None, False))
+                candidates.append(task)
                 continue
             if (record.get("status") == "failed"
                     and approved_review.get("passed") is True
@@ -1160,7 +1055,7 @@ def main() -> int:
                     child.update(retry_reason="review_infrastructure",
                                  gold_protocol_retry_count=1,
                                  acceptance_resume_requested=True, repair_priority=1)
-                    candidates.append((task, None, False))
+                    candidates.append(task)
                     continue
             if (record.get("status") == "failed"
                     and approved_review.get("passed") is True
@@ -1173,7 +1068,7 @@ def main() -> int:
                 # The old Harbor tree has already been archived for this exact
                 # infrastructure retry. Never reinterpret the preserved failed
                 # result as a fresh contract repair or return it as terminal.
-                candidates.append((task, None, False))
+                candidates.append(task)
                 continue
             if (record.get("status") in {"synthesizing", "reviewing", "harbor"}
                     and approved_review.get("passed") is True
@@ -1186,11 +1081,41 @@ def main() -> int:
                     atomic_json(evidence / "result.json", record)
                 child.update(retry_reason="review_infrastructure",
                              acceptance_resume_requested=True, repair_priority=1)
-                candidates.append((task, None, False))
+                candidates.append(task)
                 continue
-            if strictly_accepted(record) or (published_acceptance is not None
+            historical_gold_defect = gold_writable_path_evidence(args.results, task, record)
+            if child.get("retry_reason") == "review_infrastructure" \
+                    and child.get("acceptance_resume_requested") \
+                    and not worker_alive(child.get("pid")):
+                # The evidence archive above has already admitted this one
+                # re-acceptance. A generic terminal guard must not consume it.
+                candidates.append(task)
+                continue
+            if historical_gold_defect is not None and record.get("status") == "passed":
+                # A target-side oracle can outlive a defective reference
+                # submission in preserved evidence. Rebuild the final Harbor
+                # acceptance once, without changing the already-reviewed
+                # vulnerability, fix, oracle or image isolation.
+                evidence = args.results / task / "retry-evidence/gold-protocol-reacceptance"
+                if evidence.exists():
+                    completed.add(task)
+                    continue
+                evidence.mkdir(parents=True)
+                for name in ("harbor", "review"):
+                    source = args.results / task / name
+                    if source.exists():
+                        os.rename(source, evidence / name)
+                atomic_json(evidence / "result.json", record)
+                children[task].update(retry_reason="review_infrastructure",
+                                      retry_count=1, acceptance_resume_requested=True,
+                                      harbor_launched=False, gold_protocol_retry_count=1,
+                                      repair_priority=1)
+                candidates.append(task)
+                continue
+            if (strictly_accepted(record) or (published_acceptance is not None
                     and published_acceptance.is_file()
-                    and strictly_accepted(load(published_acceptance, {}))):
+                    and strictly_accepted(load(published_acceptance, {})))) \
+                    and historical_gold_defect is None:
                 child.update(pid=None, final_status="passed", manual_correction=True)
                 completed.add(task)
                 external.discard(task)
@@ -1231,7 +1156,6 @@ def main() -> int:
                     and child.get("retry_count", 0) >= 1 and record.get("status") in \
                     {"routing", "synthesizing", "reviewing", "harbor", "routed"} \
                     and worker_alive(child.get("pid")) \
-                    and "continue-synthesis needs" not in str(record.get("error", "")) \
                     and str(record.get("error", "")) not in {
                         "ValueError: public_runner is only valid for FILE-POV",
                         "ValueError: unsupported task branch"}:
@@ -1308,7 +1232,7 @@ def main() -> int:
                 # A stale in-flight last_status may mark an intended recovery
                 # that was never launched; it is not evidence of a retry.
                 children[task].update(retry_reason="review_incomplete", repair_priority=1)
-                candidates.append((task, None, False))
+                candidates.append(task)
                 continue
             pending_restartable_synthesis = (
                 record.get("status") == "synthesizing"
@@ -1327,11 +1251,7 @@ def main() -> int:
                      or pending_restartable_synthesis))
             if bounded_recovery and child.get("bounded_recovery_launched") is True \
                     and record.get("status") in {"failed", "error"}:
-                # A durable launch receipt is the budget boundary. An original
-                # interrupted status or an old intent marker cannot buy another
-                # full model session after this recovery has actually run.
-                child.update(retry_blocked="bounded_recovery_already_launched",
-                             retry_reason=None)
+                child["retry_reason"] = "manual_recovery_required"
                 completed.add(task)
                 continue
             if bounded_recovery:
@@ -1348,22 +1268,15 @@ def main() -> int:
                     # also preserves the existing review's exclusive vote.
                     child.update(retry_reason="review_infrastructure",
                                  acceptance_resume_requested=True, repair_priority=1)
-                    candidates.append((task, None, False))
+                    candidates.append(task)
                     continue
                 recovery = (args.recovery_results or args.results) / task
                 recovery.mkdir(parents=True, exist_ok=True)
                 child.update(recovery_requested=True, retry_merged=False,
                              recovery_reason=recovery_reason,
                              retry_reason="bounded_recovery", repair_priority=1)
-                source_workspace = recovery.parent / "workspace"
-                if args.recovery_results is None:
-                    # The reusable workspace is already canonical. Passing it
-                    # as --workspace-from makes launch prefer a nonexistent
-                    # root-level route and archives the only durable trace.
-                    # Continue in place instead; only an isolated retry needs
-                    # an explicit source workspace to copy.
-                    source_workspace = None
-                candidates.append((task, source_workspace, True))
+                child["retry_reason"] = "manual_recovery_required"
+                completed.add(task)
                 continue
             if (record.get("status") == "error" and child.get("retry_reason") == "bounded_recovery"
                     and "PermissionError: [Errno 13]" in str(record.get("error", ""))):
@@ -1380,22 +1293,8 @@ def main() -> int:
                                             or (child.get("delivery_retry_count") == 1
                                                 and child.get("retry_reason") == "review_incomplete")))
             if pending_delivery_repair:
-                # Preparation already archived the original verdict. A restart
-                # must enqueue that exact request before terminal-failure guards.
-                if child.get("retry_reason") == "review_incomplete" \
-                        and not (args.results / task / "retry-evidence/review-incomplete/trajectory.jsonl").is_file():
-                    children[task]["review_incomplete_retry_count"] = 0
-                # A rejected or self-authored review predates this repair.
-                # Preserve it, but never resume Harbor using that stale verdict.
-                previous_review = args.results / task / "workspace/review.json"
-                if previous_review.is_file():
-                    archived_review = args.results / task / "retry-evidence/pre-delivery-repair-review.json"
-                    archived_review.parent.mkdir(exist_ok=True)
-                    if not archived_review.exists():
-                        os.rename(previous_review, archived_review)
-                children[task].update(retry_reason="delivery_review_repair",
-                                      repair_priority=1)
-                candidates.append((task, None, True))
+                children[task]["retry_reason"] = "manual_recovery_required"
+                completed.add(task)
                 continue
             retry_reason = None
             if child.get("retry_reason") == "review_incomplete" \
@@ -1440,14 +1339,10 @@ def main() -> int:
                 children[task]["retry_blocked"] = "missing_original_review_verdict"
                 completed.add(task)
                 continue
-            if ((delivery_contract or review_rejected) and synthesis.get("status") == "completed"
-                    and route_file.is_file()
-                    and not (args.results / task / "workspace/repair-request.json").is_file()
-                    and child.get("delivery_retry_count", 0) < 1):
-                # A malformed or oracle-spoofable delivery needs one concrete
-                # repair session, not silent acceptance or another model vote.
-                retry_reason = ("delivery_review_repair" if review_rejected
-                                else "delivery_contract_repair")
+            if delivery_contract or review_rejected:
+                children[task]["retry_reason"] = "manual_recovery_required"
+                completed.add(task)
+                continue
             differential_failure = (differential.get("status") == "error"
                                     or (differential.get("report") or {}).get("status") == "infra_error")
             if (record.get("status") == "failed" and differential_failure
@@ -1464,19 +1359,12 @@ def main() -> int:
                     and ((differential.get("report") or {}).get("fixed") or {})
                         .get("submission_result", {}).get("returncode") != 0
                     and child.get("delivery_retry_count", 0) < 1):
-                retry_reason = "delivery_review_repair"
-                review_findings = {"passed": False, "execution_checked": True,
-                                   "findings": [{"severity": "major",
-                                                 "evidence": (differential["report"]["fixed"].get("submission_result", {}).get("output", "")[-4000:])}],
-                                   "reason": "Gold submission must exit 0 after expected fixed-target rejection; only the target oracle decides vulnerability absence."}
+                retry_reason = "manual_recovery_required"
             gold_path_defect = gold_writable_path_evidence(args.results, task, record)
             if (gold_path_defect is not None
                     and load(args.results / task / "workspace/review.json", {}).get("passed") is True
                     and child.get("delivery_retry_count", 0) < 1):
-                retry_reason = "delivery_review_repair"
-                review_findings = {"passed": False, "execution_checked": True,
-                                   "findings": [{"severity": "major", "evidence": gold_path_defect}],
-                                   "reason": "Write reference evidence only to a writable submitted directory. The protocol client must exit 0 on an expected fixed-target rejection; the independent target oracle decides vulnerability absence."}
+                retry_reason = "manual_recovery_required"
             if retry_reason == "harbor_infrastructure" and (child.get("harbor_retry_count", 0) >= 1
                                             and child.get("harbor_launched")):
                 retry_reason = None
@@ -1486,20 +1374,14 @@ def main() -> int:
                   and not (args.results / task / "workspace/repair-request.json").is_file()
                   and child.get("delivery_retry_count", 0) < 1
                   and (differential.get("report") or {}).get("status") == "other_bug"):
-                # A genuinely applied fix that leaves the old daemon running
-                # fails the real contract even if a developer manually
-                # restarted it during self-check. One bounded delivery repair
-                # must implement the documented restart and prove the full
-                # verifier sequence, then undergo fresh independent review.
-                retry_reason = "delivery_review_repair"
-                review_findings = {"passed": False, "execution_checked": True,
-                                   "findings": [{"severity": "major",
-                                                 "evidence": "Harbor differential is other_bug: solution.sh patched files but the live daemon remained vulnerable; implement and verify the target restart contract."}],
-                                   "reason": "Patched service still exhibits the vulnerability because its process was not restarted."}
+                # Preserve the differential for manual delivery repair; do not
+                # silently launch another synthesis session.
+                retry_reason = "manual_recovery_required"
             elif (record.get("status") == "failed"
                   and record.get("failure_class") == "harbor_failed"
                   and load(args.results / task / "workspace/review.json", {}).get("passed") is True
-                  and child.get("review_retry_count", 0) < 1
+                  and (child.get("review_retry_count", 0) < 1
+                       or gold_path_defect is not None)
                   and (differential.get("report") or {}).get("status") == "infra_error"):
                 # The verifier failed before it could judge the submission.
                 # Keep the approved delivery frozen and retry only acceptance;
@@ -1596,52 +1478,12 @@ def main() -> int:
                 # a fresh bounded review instead of turning missing review.json
                 # into a permanent orchestration error.
                 retry_reason = "review_incomplete"
-            if api_recovery_pending(args.results / task, record, synthesis, child, route_file):
-                # This gateway error is not an exploitability verdict. Resume
-                # the exact workspace once with a 96 KiB full-request limit;
-                # do not reset the ordinary retry counter or other failures.
-                evidence = args.results / task / "retry-evidence/api-request-recovery"
-                evidence.mkdir(parents=True, exist_ok=True)
-                atomic_json(evidence / "result.json", record)
-                child.update(api_request_recovery_count=child.get("api_request_recovery_count", 0) + 1,
-                             retry_reason=None, retry_count=1,
-                             previous_status=record.get("status"))
-                children[task] = child
-                completed.discard(task)
-                candidates.append((task, route_file, True))
-                continue
-            if child.get("retry_count", 0) < 1 and retry_reason is None:
-                if (record.get("status") in {"synthesizing", "error"}
-                        and route_file.exists()
-                        and not (args.results / task / "workspace/review.json").exists()
-                        and (child.get("reset_eligible")
-                             or child.get("retry_reason") == "completed_route_recovery"
-                             or load(args.results / task / "synthesis/result.json", {}).get("status")
-                             in {"running", "max_turns", "timeout", "api_error"})):
-                    retry_reason = "synthesis_interrupted"
-            # A submit_route callback crash can leave a valid decision but a
-            # still-running top-level status. Validate and resume that exact
-            # decision, rather than spending another route budget on it.
-            if (record.get("status") == "error"
-                    and ("continue-synthesis needs" in str(record.get("error", ""))
-                         or "non-recovery route fixed_revision is not the exact downloaded candidate fix revision"
-                         in str(record.get("error", "")))
-                    and route_file.is_file() and not delivery_dir.is_dir()
-                    and not child.get("input_restoration_retry")):
-                # The old continuation path could remove the immutable input
-                # before checking it. The repaired worker restores that input.
-                children[task].update(retry_count=1, retry_reason="input_restoration",
-                                      previous_status=record.get("status"),
-                                      input_restoration_retry=True)
-                candidates.append((task, route_file, True))
-                continue
             if (record.get("status") == "routing" and not route_file.is_file()
-                    and not (worker_alive(child.get("pid")))
-                    and child.get("retry_reason") != "carry_route_handoff"):
+                    and not worker_alive(child.get("pid"))):
                 # A nonterminal route has no accept/reject verdict to retry.
                 # Regardless of a stale migration marker, it remains work.
-                children[task].update(retry_count=1, retry_reason="unfinished_route_recovery")
-                candidates.append((task, None, False))
+                children[task].update(retry_reason="manual_recovery_required")
+                completed.add(task)
                 continue
             if (retry_reason is None and record.get("status") in {"routing", "error"}
                     and not route_file.is_file() and child.get("retry_count", 0) < 1):
@@ -1660,11 +1502,17 @@ def main() -> int:
                 try:
                     task_record = load(args.sample / "tasks" / task / "input/meta.json", {})
                     validate_route(args.results / task / "workspace", task_record["instance_id"])
-                    children[task]["retry_reason"] = "completed_route_recovery"
-                    candidates.append((task, route_file, True))
+                    completed.add(task)
                     continue
                 except (OSError, ValueError, KeyError):
                     pass
+            if retry_reason in {"route_budget", "route_schema_retry", "route_infrastructure",
+                                "synthesis_interrupted", "delivery_contract_repair",
+                                "delivery_review_repair"}:
+                children[task].update(retry_reason="manual_recovery_required",
+                                      previous_status=record.get("status"))
+                completed.add(task)
+                continue
             if retry_reason:
                 # Several specific recovery paths mutate the local child dict.
                 # Flush them once before terminal/launch handling so they cannot
@@ -1687,60 +1535,17 @@ def main() -> int:
                         completed.add(task)
                         continue
                     children[task]["review_incomplete_retry_count"] = 1
-                if retry_reason in {"route_budget", "route_schema_retry", "route_infrastructure", "synthesis_interrupted"}:
-                    for relative in (("route",) if retry_reason != "synthesis_interrupted" else ("synthesis",)):
-                        source = args.results / task / relative
-                        destination = evidence / relative
-                        if source.exists() and not destination.exists():
-                            os.rename(source, destination)
-                if retry_reason in {"route_budget", "route_schema_retry", "route_infrastructure"}:
-                    # Preserve a failed route's original verdict before the
-                    # replacement overwrites result.json. An archived max-turn
-                    # result must not consume its replacement's only retry.
-                    child.pop("pipeline_repair_pending", None)
-                    result_evidence = evidence / "result.json"
-                    if result_evidence.exists():
-                        result_evidence = evidence / ("result-" + retry_reason + ".json")
-                    shutil.copy2(args.results / task / "result.json", result_evidence)
-                if retry_reason in {"delivery_contract_repair", "delivery_review_repair"}:
-                    repair_evidence = evidence / retry_reason
-                    if repair_evidence.exists():
-                        children[task].update(delivery_retry_count=1, retry_blocked="archive_exists")
-                        completed.add(task)
-                        continue
-                    repair_evidence.mkdir()
-                    workspace = args.results / task / "workspace"
-                    for name in ("review.json", "review-input"):
-                        source = workspace / name
-                        if source.exists():
-                            if source.is_dir():
-                                shutil.copytree(source, repair_evidence / name, symlinks=True)
-                            else:
-                                shutil.copy2(source, repair_evidence / name)
-                    for name in ("review.json",):
-                        source = workspace / name
-                        if source.exists():
-                            source.unlink()
-                    for name in ("review", "harbor"):
-                        source = args.results / task / name
-                        if source.exists():
-                            os.rename(source, repair_evidence / name)
-                    atomic_json(repair_evidence / "result.json", record)
-                    atomic_json(workspace / "repair-request.json", {
-                        "schema_version": 1, "reason": retry_reason,
-                        "error": record.get("error") or differential.get("error"),
-                        "review": review_findings,
-                        "requirement": "Fix every blocker/major review finding and the exact contract defect. Rerun private verification and adversarial public-oracle checks. Submit the changed delivery for fresh independent review and full Harbor acceptance. Do not modify report.json after executing verify.sh, suppress the adversarial test, or bypass any differential check.",
-                        "created_at": timestamp()})
-                    children[task]["delivery_retry_count"] = 1
                 children[task].update(retry_count=1, retry_reason=retry_reason,
                                       previous_status=record.get("status"))
                 if retry_reason in {"harbor_infrastructure", "review_infrastructure"}:
                     child.pop("harbor_launched", None)
                 if retry_reason == "review_incomplete":
                     child.pop("review_launched", None)
-                if retry_reason in {"delivery_contract_repair", "delivery_review_repair"}:
-                    child.pop("delivery_launched", None)
+                    children[task]["review_incomplete_retry_count"] = 1
+                    previous_review = args.results / task / "review"
+                    archived_review = evidence / "review-incomplete"
+                    if previous_review.exists() and not archived_review.exists():
+                        os.rename(previous_review, archived_review)
                 if retry_reason == "review_infrastructure":
                     if record.get("status") == "harbor":
                         children[task]["harbor_exception_retry_count"] = 1
@@ -1749,8 +1554,6 @@ def main() -> int:
                         completed.add(task)
                         continue
                     children[task]["review_retry_count"] = 1
-                if retry_reason in {"delivery_contract_repair", "delivery_review_repair"}:
-                    children[task]["repair_priority"] = 1
                 if retry_reason == "harbor_infrastructure":
                     previous_harbor = args.results / task / "harbor"
                     archived_harbor = evidence / "harbor-infrastructure"
@@ -1764,13 +1567,7 @@ def main() -> int:
                     for gold in (archived_harbor / "jobs").glob("*-gold"):
                         shutil.copytree(gold, previous_harbor / "jobs" / gold.name)
                     children[task]["harbor_retry_count"] = 1
-                candidates.append((task, None, retry_reason in {"synthesis_interrupted", "delivery_contract_repair",
-                                                               "delivery_review_repair"}))
-                if retry_reason == "route_budget":
-                    children[task]["route_handoff"] = str(evidence / "route/trajectory.jsonl")
-                    children[task]["route_budget_recovery_count"] = 1
-                    children[task]["retry_reason"] = None
-                    children[task]["previous_status"] = None
+                candidates.append(task)
                 continue
             if record.get("status") in {"routing", "synthesizing", "reviewing", "harbor", "routed",
                                           "rejected", "passed", "failed", "error"}:
@@ -1779,9 +1576,8 @@ def main() -> int:
                 completed.add(task)
                 continue
             if args.route_only:
-                candidates.append((task, None, False))
+                candidates.append(task)
                 continue
-            route_path = None
             if args.from_pilot is not None:
                 pilot = load(args.from_pilot / task / "result.json", {})
                 route_file = args.from_pilot / task / "workspace/route.json"
@@ -1793,7 +1589,10 @@ def main() -> int:
                 if pilot.get("status") == "routing":
                     continue
                 if pilot.get("status") == "routed" and route_file.is_file():
-                    route_path = route_file.resolve()
+                    # A routed-only result needs a fresh --route-from run;
+                    # never silently start it from this batch supervisor.
+                    completed.add(task)
+                    continue
                 elif pilot:
                     children[task] = {"pilot_status": pilot.get("status"),
                                       "not_admitted": pilot.get("status") != "passed",
@@ -1805,7 +1604,7 @@ def main() -> int:
                         state["final_tasks"] = sorted(set(state.get("final_tasks", [])) | {task})
                     completed.add(task)
                     continue
-            candidates.append((task, route_path, False))
+            candidates.append(task)
         # The outer production runner supplies one disjoint fresh batch plus
         # explicitly admitted infrastructure repairs. Repairs share the same
         # 30-worker budget but do not consume a new-sample slot.
@@ -1819,20 +1618,12 @@ def main() -> int:
         # repairs and new candidates is preserved; the shared cap is unchanged.
         prioritize_candidates(candidates, children, selected)
         while candidates and len(active) + external_running < args.concurrency:
-            task, route, resume_synthesis = candidates.pop(0)
+            task = candidates.pop(0)
             child_state = children.setdefault(task, {})
             resume_harbor = child_state.get("retry_reason") in {
                 "harbor_infrastructure", "review_infrastructure", "carry_harbor"}
-            handoff = (Path(child_state["route_handoff"])
-                       if child_state.get("route_handoff") and not resume_synthesis else None)
             carry_plan = load(args.results / task / "carry-recovery.json", {}) \
                 if child_state.get("retry_reason", "").startswith("carry_") else {}
-            if carry_plan.get("mode") == "route":
-                route = args.results / task / "workspace/route.json"
-            if carry_plan.get("mode") == "route_handoff":
-                handoff = args.results / task / carry_plan["trajectory"]
-                if not handoff.is_file():
-                    raise ValueError(f"carried route trajectory is missing for {task}")
             worker_results = (args.retry_results if child_state.get("retry_reason") == "bounded_recovery"
                               and args.retry_results is not None else args.results)
             if task in shared_recovery_tasks:
@@ -1843,16 +1634,20 @@ def main() -> int:
             state["observed_only"] = sorted(observed_ids)
             state["batch_number"] = batch_number
             retry_reason = child_state.get("retry_reason")
+            if child_state.get("retry_reason") in {
+                    "delivery_contract_repair", "delivery_review_repair",
+                    "fresh_review_delivery_repair"}:
+                # Delivery and route failures are terminal. Their evidence is
+                # retained for a later manual recovery, not another model vote.
+                completed.add(task)
+                continue
             child = launch(task, Path(child_state["source_sample"]) if task in shared_recovery_tasks
                            and child_state.get("source_sample") else args.sample,
-                           worker_results, route, args.max_turns,
-                           args.timeout, resume_synthesis, resume_harbor=resume_harbor,
-                           route_handoff=handoff, published_root=args.published_root,
+                           worker_results, args.max_turns,
+                           args.timeout, resume_harbor=resume_harbor,
+                           published_root=args.published_root,
                            review_turns=args.review_turns, review_timeout=args.review_timeout,
-                               verify_timeout=args.verify_timeout,
-                           workspace_from=(worker_results / task / "workspace")
-                               if retry_reason == "bounded_recovery"
-                               and worker_results.resolve() != args.results.resolve() else None,
+                           verify_timeout=args.verify_timeout,
                            review_delivery=retry_reason in {"review_incomplete", "carry_review"},
                            concurrency=args.concurrency)
             active[task] = child
@@ -1860,7 +1655,7 @@ def main() -> int:
                 state.setdefault("initial_launches", {})[task] = {
                     "batch": batch_number, "started_at": timestamp()}
             child_state.update(pid=child.pid, worker_results=str(worker_results),
-                               external_worker=False, route_reused=route is not None,
+                               external_worker=False, route_reused=route_file.is_file(),
                                launched_at=timestamp(), last_status=None,
                                delivery_launched=retry_reason in {"delivery_contract_repair",
                                                                   "delivery_review_repair"},

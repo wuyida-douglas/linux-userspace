@@ -1,0 +1,12 @@
+{
+  "seed": 20261108,
+  "count": 200,
+  "source": "/nvme/wuyida/新管线开发/results/label-production-v1/candidates-kept.jsonl",
+  "original_sample": "samples/label-production-v1-random100-s20261107",
+  "original_complete": 0,
+  "retain_original": false,
+  "excluded_original_instances": 100,
+  "rounds": 4,
+  "strategy": "disjoint-new-instances-only",
+  "completed_at": "2026-11-08T13:00:50Z"
+}

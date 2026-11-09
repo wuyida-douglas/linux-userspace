@@ -6,7 +6,53 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
-from pipeline import prepare
+from pipeline import common, prepare
+
+
+class NamingTests(unittest.TestCase):
+    def test_task_id_uses_cve_and_owner_repo_without_clone_url(self):
+        row = {"instance_id": "CVE-2024-23346::https://github.com/materialsproject/pymatgen",
+               "canonical_id": "CVE-2024-23346",
+               "repo": "https://github.com/materialsproject/pymatgen.git"}
+        self.assertEqual(common.task_id(row, 14),
+                         "linux-014-cve-2024-23346-materialsproject-pymatgen")
+        same_name = {"instance_id": "CVE-2022-0326::https://github.com/mruby/mruby",
+                     "canonical_id": "CVE-2022-0326",
+                     "repo": "https://github.com/mruby/mruby.git"}
+        self.assertEqual(common.task_id(same_name, 1), "linux-001-cve-2022-0326-mruby")
+
+    def test_export_task_id_appends_branch_and_svc_host_type(self):
+        task = "linux-001-cve-2020-28483-gin-gonic-gin"
+        self.assertEqual(
+            common.export_task_id(task, "SVC-EXPLOIT", "synthetic_host"),
+            "linux-001-cve-2020-28483-gin-gonic-gin-svc-exploit-synthetic-host")
+        self.assertEqual(common.export_task_id(task, "FILE-POV", None),
+                         "linux-001-cve-2020-28483-gin-gonic-gin-file-pov")
+
+    def test_export_task_id_cleans_legacy_url_and_stays_bounded(self):
+        legacy = "linux-009-osv-2020-177-https-github-com-ntop-ndpi"
+        cleaned = common.export_task_id(legacy, "SVC-EXPLOIT", "real_host")
+        self.assertEqual(cleaned, "linux-009-osv-2020-177-ntop-ndpi-svc-exploit-real-host")
+        long = common.export_task_id("linux-001-" + "a" * 200, "FILE-EXPLOIT", None)
+        self.assertLessEqual(len(long), 160)
+        self.assertTrue(long.endswith("-file-exploit"))
+
+
+class FullPoolTests(unittest.TestCase):
+    def test_sample_all_preserves_pool_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pool = Path(directory) / "pool.jsonl"
+            rows = [
+                {"instance_id": "CVE-b::https://github.com/o/b", "canonical_id": "CVE-b",
+                 "repo": "https://github.com/o/b", "vulnerability": {}, "code": {}, "old_tags": {}},
+                {"instance_id": "CVE-a::https://github.com/o/a", "canonical_id": "CVE-a",
+                 "repo": "https://github.com/o/a", "vulnerability": {}, "code": {}, "old_tags": {}},
+            ]
+            pool.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            selected = prepare.sample_all(pool)
+            self.assertEqual([row["instance_id"] for row in selected],
+                             ["CVE-b::https://github.com/o/b", "CVE-a::https://github.com/o/a"])
+            self.assertEqual([row["sample_id"] for row in selected], [1, 2])
 
 
 class InputDownloadTests(unittest.TestCase):

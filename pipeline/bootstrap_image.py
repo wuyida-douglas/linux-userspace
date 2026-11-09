@@ -12,7 +12,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from .native_agent import docker_argv
+from .docker_cli import docker_argv
 
 MIRRORS = {
     "jammy": "http://10.140.220.33:8081/repository/jammy-proxy-x86/",

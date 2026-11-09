@@ -11,7 +11,7 @@ import tempfile
 from pathlib import Path
 
 from .common import ROOT
-from .native_agent import docker_argv
+from .docker_cli import docker_argv
 
 AGENT_IMAGE = "linux-userspace-agent:22.04"
 VERIFIER_IMAGE = "linux-userspace-verifier:22.04"

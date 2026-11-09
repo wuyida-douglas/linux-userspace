@@ -8,7 +8,8 @@ import unittest.mock
 from pathlib import Path
 
 from pipeline.iterate_batches import (adopt_existing_carries, batch_candidates, classify,
-                                      preserve_missing_input_result, recovery_instance)
+                                      prepare_carries, preserve_missing_input_result,
+                                      recovery_instance)
 
 
 class BatchAttributionTests(unittest.TestCase):
@@ -24,7 +25,9 @@ class BatchAttributionTests(unittest.TestCase):
     def test_strict_acceptance_requires_every_real_contract(self):
         row = {"status": "passed", "review": {"passed": True}, "harbor": {
             "gold": {"reward": 1.0}, "null": {"reward": 0.0},
-            "differential_from_final_bundle": {"status": "passed", "report": {"success": True}}}}
+            "differential_from_final_bundle": {"status": "passed", "report": {
+                "success": True, "vulnerable": {"submission_result": {"returncode": 0}},
+                "fixed": {"submission_result": {"returncode": 0}}}}}}
         self.assertEqual(classify(self.task.name, row, self.root)["classification"],
                          "strict_harbor_acceptance")
         row["harbor"]["gold"]["reward"] = 0.0
@@ -40,14 +43,14 @@ class BatchAttributionTests(unittest.TestCase):
         self.assertEqual(result["classification"], "delivery_or_oracle_failure")
         self.assertIsNone(result["recovery_reason"])
 
-    def test_synthesis_interruption_is_bounded_recovery_not_a_second_vote(self):
+    def test_synthesis_interruption_requires_manual_recovery(self):
         (self.task / "workspace/route.json").write_text("{}")
         row = {"status": "failed", "failure_class": "synthesis_incomplete"}
         result = classify(self.task.name, row, self.root)
-        self.assertEqual(result["classification"], "pipeline_recovery_candidate")
-        self.assertEqual(result["recovery_reason"], "synthesis_interrupted")
+        self.assertEqual(result["classification"], "manual_recovery_required")
+        self.assertIsNone(result["recovery_reason"])
 
-    def test_partial_max_turn_delivery_is_synthesis_not_fake_review_recovery(self):
+    def test_partial_delivery_does_not_trigger_model_repair(self):
         (self.task / "workspace/route.json").write_text("{}")
         (self.task / "workspace/delivery/private").mkdir(parents=True)
         (self.task / "synthesis").mkdir()
@@ -56,39 +59,34 @@ class BatchAttributionTests(unittest.TestCase):
                "error": "ValueError: missing delivery/task.json"}
         result = classify(self.task.name, row, self.root)
         self.assertEqual(result["classification"], "pipeline_recovery_candidate")
-        self.assertEqual(result["recovery_reason"], "synthesis_interrupted")
+        self.assertEqual(result["recovery_reason"], "review_incomplete")
 
-    def test_exhausted_route_has_only_its_existing_budget_recovery(self):
+    def test_exhausted_route_is_preserved_for_manual_recovery(self):
         row = {"status": "error", "failure_class": "pipeline",
                "error": "RuntimeError: routing agent did not complete: max_turns"}
         result = classify(self.task.name, row, self.root)
-        self.assertEqual(result["classification"], "pipeline_recovery_candidate")
-        self.assertEqual(result["recovery_reason"], "route_budget")
+        self.assertEqual(result["classification"], "manual_recovery_required")
+        self.assertIsNone(result["recovery_reason"])
 
-    def test_exhausted_route_does_not_buy_another_budget_after_handoff(self):
+    def test_legacy_handoff_marker_cannot_admit_another_route(self):
         (self.root / "supervisor-state.json").write_text(json.dumps({
             "children": {self.task.name: {"route_budget_recovery_count": 1}}
         }))
         row = {"status": "error", "failure_class": "pipeline",
                "error": "RuntimeError: routing agent did not complete: max_turns"}
         result = classify(self.task.name, row, self.root)
-        self.assertEqual(result["classification"], "terminal_failure")
-        self.assertEqual(result["retry_blocked"], "route_budget_already_launched")
-        self.assertIsNone(result["recovery_reason"])
+        self.assertEqual(result["classification"], "manual_recovery_required")
+        self.assertIsNone(result["retry_blocked"])
 
-    def test_exhausted_synthesis_does_not_buy_another_full_session(self):
+    def test_exhausted_synthesis_is_terminal_for_the_supervisor(self):
         (self.task / "workspace/route.json").write_text("{}")
         (self.task / "workspace/input/src").mkdir(parents=True, exist_ok=True)
         (self.task / "synthesis").mkdir()
         (self.task / "synthesis/result.json").write_text('{"status": "max_turns"}')
-        (self.root / "supervisor-state.json").write_text(json.dumps({
-            "children": {self.task.name: {"bounded_recovery_launched": True}}
-        }))
         row = {"status": "error", "failure_class": "pipeline",
                "error": "ValueError: missing delivery/task.json"}
         result = classify(self.task.name, row, self.root)
-        self.assertEqual(result["classification"], "terminal_failure")
-        self.assertEqual(result["retry_blocked"], "bounded_recovery_already_launched")
+        self.assertEqual(result["classification"], "manual_recovery_required")
         self.assertIsNone(result["recovery_reason"])
 
     def test_failed_gold_protocol_requires_code_fix_not_acceptance_retry(self):
@@ -120,6 +118,30 @@ class BatchAttributionTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "does not match"):
             adopt_existing_carries(results, {self.task.name: source})
 
+    def test_interrupted_first_copy_completes_from_the_audited_source(self):
+        source = self.root / "source" / self.task.name
+        source.joinpath("workspace/input/src").mkdir(parents=True)
+        source.joinpath("workspace/route.json").write_text(
+            '{"instance_id": "CVE-test::project"}')
+        source.joinpath("synthesis").mkdir()
+        source.joinpath("synthesis/result.json").write_text('{"status": "completed"}')
+        source.joinpath("workspace/delivery").mkdir(parents=True)
+        source.joinpath("workspace/review.json").write_text('{"passed": true}')
+        source.joinpath("result.json").write_text('{"status": "failed"}')
+        results = self.root / "results"
+        destination = results / self.task.name
+        destination.mkdir(parents=True)
+        plan = {"schema_version": 1, "task_id": self.task.name,
+                "instance_id": "CVE-test::project", "mode": "harbor"}
+        (destination / "carry-recovery.json").write_text(json.dumps(plan))
+        prepare_carries(results, {self.task.name: source}, {self.task.name: plan})
+        self.assertEqual(json.loads((destination / "carry-provenance.json").read_text())["source"],
+                         str(source.resolve()))
+        child = json.loads((results / "supervisor-state.json").read_text())["children"][self.task.name]
+        self.assertTrue(child["carried_recovery"])
+        self.assertNotIn("carry_blocked", child)
+        self.assertNotIn("bounded_recovery_launched", child)
+
     def test_same_batch_carry_with_live_pid_is_adopted_without_new_budget(self):
         source = self.root / "source" / self.task.name
         source.mkdir(parents=True)
@@ -148,7 +170,8 @@ class BatchAttributionTests(unittest.TestCase):
 
     def test_true_infra_differential_is_not_an_oracle_failure(self):
         (self.task / "workspace/route.json").write_text("{}")
-        row = {"status": "failed", "failure_class": "harbor_failed", "harbor": {
+        row = {"status": "failed", "failure_class": "harbor_failed",
+               "review": {"passed": True}, "harbor": {
             "gold": {"reward": 1.0},
             "differential_from_final_bundle": {"status": "error"}}}
         result = classify(self.task.name, row, self.root)

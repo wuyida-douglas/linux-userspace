@@ -47,7 +47,7 @@ class WorkerStartTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             task = Path(directory)
             (task / "supervisor.log").write_text(
-                '[2026-11-07T16:27:02Z] launch: python -m pipeline.run --continue-synthesis\n'
+                '[2026-11-07T16:27:02Z] launch: python -m pipeline.run --resume\n'
                 'Traceback (most recent call last):\n'
                 '  File "pipeline/run.py", line 20, in <module>\n'
                 "ModuleNotFoundError: No module named 'pipeline.common'\n", encoding="utf-8")
@@ -57,10 +57,10 @@ class WorkerStartTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             task = Path(directory)
             (task / "supervisor.log").write_text(
-                '[2026-11-07T16:27:02Z] launch: python -m pipeline.run --continue-synthesis\n'
+                '[2026-11-07T16:27:02Z] launch: python -m pipeline.run --resume\n'
                 'Traceback (most recent call last):\n'
                 "ModuleNotFoundError: No module named 'pipeline.common'\n"
-                '[2026-11-07T16:31:00Z] launch: python -m pipeline.run --continue-synthesis\n'
+                '[2026-11-07T16:31:00Z] launch: python -m pipeline.run --resume\n'
                 'linux-004: failed\n', encoding="utf-8")
             self.assertIsNone(worker_start_error(task))
 
@@ -169,12 +169,16 @@ class CarriedRecoveryTests(unittest.TestCase):
             source.joinpath("workspace").mkdir(parents=True)
             source.joinpath("workspace/route.json").write_text(
                 '{"instance_id": "CVE-test::project"}')
+            source.joinpath("workspace/delivery").mkdir()
+            source.joinpath("workspace/review.json").write_text('{"passed": true}')
             source.joinpath("synthesis").mkdir()
-            source.joinpath("synthesis/result.json").write_text('{"status": "max_turns"}')
+            source.joinpath("synthesis/result.json").write_text('{"status": "completed"}')
             source.joinpath("result.json").write_text(
                 '{"status": "error", "failure_class": "pipeline"}')
             target = root / "new"
-            supervise.carry_workspaces([source], target, {"task"})
+            supervise.carry_workspaces([source], target, {"task"}, {"task": {
+                "schema_version": 1, "task_id": "task",
+                "instance_id": "CVE-test::project", "mode": "review"}})
             copied_result = json.loads((target / "task/result.json").read_text())
             self.assertEqual(copied_result["instance_id"], "CVE-test::project")
             original_result = json.loads((source / "result.json").read_text())
@@ -184,7 +188,7 @@ class CarriedRecoveryTests(unittest.TestCase):
             self.assertEqual(provenance["instance_id"], "CVE-test::project")
             self.assertTrue(provenance["same_instance_continuation"])
 
-    def test_latest_rejected_review_supersedes_a_stale_repair_request(self):
+    def test_rejected_review_is_terminal_and_preserves_repair_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             task = "linux-014"
@@ -209,10 +213,63 @@ class CarriedRecoveryTests(unittest.TestCase):
                                                        "--results", str(root), "--concurrency", "30",
                                                        "--batch-size", "30", "--only", task, "--once"]):
                     self.assertEqual(supervise.main(), 0)
-            self.assertIs(launch.call_args.args[6], True)
+            launch.assert_not_called()
             request = json.loads(base.joinpath("workspace/repair-request.json").read_text())
-            self.assertEqual(request["findings"][0]["evidence"], "private marker mismatch")
-            self.assertFalse(base.joinpath("workspace/review.json").exists())
+            self.assertEqual(request["reason"], "stale metadata only")
+            self.assertFalse(json.loads(base.joinpath("workspace/review.json").read_text())["passed"])
+
+
+class StrictProtocolEvidenceTests(unittest.TestCase):
+    def test_oracle_cannot_mask_a_nonzero_gold_submission(self):
+        row = {"status": "passed", "review": {"passed": True}, "harbor": {
+            "gold": {"reward": 1.0}, "null": {"reward": 0.0},
+            "differential_from_final_bundle": {"status": "passed", "report": {
+                "success": True, "vulnerable": {"submission_result": {"returncode": 0}},
+                "fixed": {"submission_result": {"returncode": 1}}}}}}
+        self.assertFalse(supervise.strictly_accepted(row))
+        row["harbor"]["differential_from_final_bundle"]["report"]["fixed"]["submission_result"]["returncode"] = 0
+        self.assertTrue(supervise.strictly_accepted(row))
+
+
+class HistoricalGoldDefectTests(unittest.TestCase):
+    def test_readonly_gold_history_invalidates_current_pass_and_resumes_acceptance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task = "linux-012"
+            base = root / task
+            base.joinpath("workspace/delivery").mkdir(parents=True)
+            base.joinpath("workspace/route.json").write_text("{}")
+            base.joinpath("workspace/review.json").write_text('{"passed": true}')
+            base.joinpath("synthesis").mkdir()
+            base.joinpath("synthesis/result.json").write_text('{"status": "completed"}')
+            old = {"status": "infra_error",
+                   "vulnerable": {"oracle": {"returncode": 1},
+                                  "submission_result": {"output": "Read-only file system"}},
+                   "fixed": {"oracle": {"returncode": 0},
+                             "submission_result": {"output": "Read-only file system"}}}
+            evidence = base.joinpath("infrastructure-attempts/old")
+            evidence.mkdir(parents=True)
+            (evidence / "result.json").write_text(json.dumps({"harbor": {
+                "gold": {"reward": 0.0}, "differential_from_final_bundle": {"report": old}}}))
+            row = {"status": "passed", "review": {"passed": True}, "harbor": {
+                "gold": {"reward": 1.0}, "null": {"reward": 0.0},
+                "differential_from_final_bundle": {"status": "passed", "report": {
+                    "success": True, "vulnerable": {"submission_result": {"returncode": 0}},
+                    "fixed": {"submission_result": {"returncode": 0}}}}}}
+            (base / "result.json").write_text(json.dumps(row))
+            (root / "selection.jsonl").write_text(json.dumps({
+                "task_id": task, "instance_id": "CVE-test::project"}) + "\n")
+            (root / "supervisor-state.json").write_text(json.dumps({
+                "children": {task: {"review_retry_count": 1}}, "scheduled": [task]}))
+            with unittest.mock.patch.object(supervise, "launch") as launch, \
+                    unittest.mock.patch.object(supervise, "pipeline_worker_command", return_value=None), \
+                    unittest.mock.patch("sys.argv", ["supervise", "--sample", str(root),
+                                                       "--results", str(root), "--only", task, "--once"]):
+                launch.return_value.pid = 4321
+                self.assertEqual(supervise.main(), 0)
+            launch.assert_not_called()
+            self.assertTrue((base / "workspace/review.json").is_file())
+            self.assertFalse((base / "workspace/repair-request.json").exists())
 
 
 class ReviewRetryBoundTests(unittest.TestCase):
@@ -278,7 +335,7 @@ class ReviewRetryBoundTests(unittest.TestCase):
             state = json.loads((root / "supervisor-state.json").read_text())
             self.assertEqual(state["children"][task]["retry_blocked"], "review_attempt_completed", state)
 
-    def test_terminal_route_handoff_review_uses_its_launch_receipt(self):
+    def test_legacy_handoff_marker_cannot_relaunch_a_terminal_review(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             task = "linux-032"
@@ -295,8 +352,7 @@ class ReviewRetryBoundTests(unittest.TestCase):
             (root / "supervisor-state.json").write_text(json.dumps({
                 "schema_version": 1, "children": {task: {
                     "retry_reason": "review_incomplete", "final_status": "error",
-                    "review_incomplete_retry_count": 0, "review_launched": True,
-                    "route_handoff": "retry-evidence/route/trajectory.jsonl"}},
+                    "review_incomplete_retry_count": 0, "review_launched": True}},
                 "scheduled": [task]}))
             with unittest.mock.patch.object(supervise, "launch") as launch, \
                     unittest.mock.patch.object(supervise, "pipeline_worker_command", return_value=None), \
@@ -312,7 +368,7 @@ class ReviewRetryBoundTests(unittest.TestCase):
 
 
 class SharedRecoveryAdoptionTests(unittest.TestCase):
-    def test_terminal_adopted_review_rejection_enters_bounded_delivery_repair(self):
+    def test_terminal_adopted_review_rejection_requires_manual_recovery(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             sample, results, recovery = root / "sample", root / "results", root / "old"
@@ -345,14 +401,11 @@ class SharedRecoveryAdoptionTests(unittest.TestCase):
                                                        "--results", str(results), "--recovery-results", str(recovery),
                                                        "--only", task, "--once"]):
                     self.assertEqual(supervise.main(), 0)
-            self.assertTrue(launch.called)
-            self.assertEqual(launch.call_args.args[1], sample)
-            self.assertEqual(launch.call_args.args[2], recovery)
-            self.assertTrue(launch.call_args.args[6])
-            request = json.loads(base.joinpath("workspace/repair-request.json").read_text())
-            self.assertIn("wrong input description", str(request["findings"]))
+            launch.assert_not_called()
+            self.assertTrue(base.joinpath("workspace/review.json").is_file())
+            self.assertFalse(base.joinpath("workspace/repair-request.json").exists())
 
-    def test_terminal_adopted_gold_exit_defect_enters_bounded_delivery_repair(self):
+    def test_terminal_adopted_gold_exit_defect_does_not_resume_synthesis(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             sample, results, recovery = root / "sample", root / "results", root / "old"
@@ -391,11 +444,10 @@ class SharedRecoveryAdoptionTests(unittest.TestCase):
                                                        "--results", str(results), "--recovery-results", str(recovery),
                                                        "--only", "linux-001", task, "--once"]):
                     self.assertEqual(supervise.main(), 0)
-            self.assertEqual(launch.call_count, 1)
-            self.assertTrue(launch.call_args.args[6])
-            self.assertIn("delivery_review_repair", base.joinpath("workspace/repair-request.json").read_text())
-            self.assertTrue(base.joinpath("retry-evidence/harbor-before-gold-submission-repair").is_dir())
-            self.assertFalse(base.joinpath("workspace/review.json").exists())
+            launch.assert_not_called()
+            self.assertTrue(base.joinpath("workspace/review.json").is_file())
+            self.assertTrue(base.joinpath("harbor").is_dir())
+            self.assertFalse(base.joinpath("workspace/repair-request.json").exists())
 
 
 class ExplicitCarryPlanTests(unittest.TestCase):
@@ -412,54 +464,29 @@ class ExplicitCarryPlanTests(unittest.TestCase):
 
     def route_handoff_plan(self) -> dict:
         return {"schema_version": 1, "task_id": "task", "instance_id": "CVE-test::project",
-                "mode": "route_handoff", "reason": "route_budget",
+                "mode": "route", "reason": "route_budget",
                 "trajectory": "route/trajectory.jsonl"}
 
-    def test_route_only_carry_requires_real_evidence_and_launches_exactly_once(self):
+    def test_route_only_carry_preserves_source_without_launching_handoff(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = self.route_only_source(root)
-            results = root / "new"
-            plans = {"task": self.route_handoff_plan()}
-            with unittest.mock.patch.object(supervise, "pipeline_worker_command", return_value=None):
-                supervise.carry_workspaces([source], results, {"task"}, plans)
-            self.assertFalse((results / "task/workspace/route.json").exists())
-            self.assertFalse((results / "task/synthesis/result.json").exists())
-            (results / "selection.jsonl").write_text("")
-            (results / "batch-selection.json").write_text(json.dumps({
-                "batch": 2, "fresh": [], "carried": ["task"], "observed_only": []}))
-            (root / "selection.jsonl").write_text(json.dumps({
-                "task_id": "task", "instance_id": "CVE-test::project"}) + "\n")
-            with unittest.mock.patch.object(supervise, "launch") as launch, \
-                    unittest.mock.patch.object(supervise, "pipeline_worker_command", return_value=None):
-                launch.return_value.pid = 4321
-                with unittest.mock.patch("sys.argv", ["supervise", "--sample", str(root),
-                                                       "--results", str(results), "--only", "task", "--once",
-                                                       "--batch-selection", str(results / "batch-selection.json"),
-                                                       "--batch-number", "2"]):
-                    self.assertEqual(supervise.main(), 0)
-            self.assertEqual(launch.call_count, 1)
-            self.assertEqual(launch.call_args.kwargs["route_handoff"],
-                             results / "task/route/trajectory.jsonl")
-            child = json.loads((results / "supervisor-state.json").read_text())["children"]["task"]
-            self.assertEqual(child["route_budget_recovery_count"], 1)
-            self.assertEqual(json.loads((source / "result.json").read_text())["failure_class"], "pipeline")
+            original = (source / "result.json").read_text()
+            with self.assertRaisesRegex(ValueError, "only review/Harbor"):
+                supervise.carry_workspaces([source], root / "new", {"task"},
+                                           {"task": self.route_handoff_plan()})
+            self.assertEqual((source / "result.json").read_text(), original)
+            self.assertTrue((source / "route/trajectory.jsonl").is_file())
+            self.assertFalse((root / "new").exists())
 
-    def test_route_only_carry_cannot_invent_route_or_consume_a_second_budget(self):
-        from pipeline.iterate_batches import recovery_budget_blocked
+    def test_route_only_carry_cannot_invent_a_route(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = self.route_only_source(root)
-            results = root / "new"
             with self.assertRaisesRegex(ValueError, "frozen route"):
-                supervise.carry_workspaces([source], results, {"task"})
-            plans = {"task": self.route_handoff_plan()}
-            with unittest.mock.patch.object(supervise, "pipeline_worker_command", return_value=None):
-                supervise.carry_workspaces([source], results, {"task"}, plans)
-            self.assertEqual(recovery_budget_blocked(results, "task", "route_budget"),
-                             "route_budget_already_launched")
+                supervise.carry_workspaces([source], root / "new", {"task"})
 
-    def test_route_retry_with_completed_route_has_no_synthesis_prerequisite(self):
+    def test_completed_route_failure_requires_manual_recovery(self):
         from pipeline.iterate_batches import classify
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -467,71 +494,20 @@ class ExplicitCarryPlanTests(unittest.TestCase):
             source.joinpath("workspace/route.json").write_text("{}")
             row = json.loads((source / "result.json").read_text())
             row["error"] = "ValueError: route failed a post-route contract check"
-            (source / "result.json").write_text(json.dumps(row))
-            plan = self.route_handoff_plan() | {"mode": "route", "reason": "route_infrastructure"}
-            plan.pop("trajectory")
-            self.assertEqual(classify("task", row, root / "old")["recovery_reason"],
-                             "route_infrastructure")
-            with unittest.mock.patch.object(supervise, "pipeline_worker_command", return_value=None):
-                supervise.carry_workspaces([source], root / "new", {"task"}, {"task": plan})
-            (root / "selection.jsonl").write_text(json.dumps({
-                "task_id": "task", "instance_id": "CVE-test::project"}) + "\n")
-            with unittest.mock.patch.object(supervise, "launch") as launch, \
-                    unittest.mock.patch.object(supervise, "pipeline_worker_command", return_value=None):
-                launch.return_value.pid = 4321
-                with unittest.mock.patch("sys.argv", ["supervise", "--sample", str(root),
-                                                       "--results", str(root / "new"), "--only", "task", "--once"]):
-                    self.assertEqual(supervise.main(), 0)
-            self.assertEqual(launch.call_count, 1,
-                             (root / "new/supervisor-state.json").read_text())
-            self.assertEqual(launch.call_args.args[3],
-                             root / "new/task/workspace/route.json")
-            self.assertIsNone(launch.call_args.kwargs["route_handoff"])
+            result = classify("task", row, root / "old")
+            self.assertEqual(result["classification"], "manual_recovery_required")
+            self.assertIsNone(result["recovery_reason"])
 
-    def test_plan_only_staging_is_not_an_evidence_overwrite(self):
+    def test_synthesis_carry_is_rejected_before_copying(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = self.route_only_source(root)
-            results = root / "new"
-            plan = self.route_handoff_plan()
-            destination = results / "task"
-            destination.mkdir(parents=True)
-            (destination / "carry-recovery.json").write_text(json.dumps(plan))
-            supervise.carry_workspaces([source], results, {"task"}, {"task": plan})
-            self.assertTrue((destination / "route/trajectory.jsonl").is_file())
-            self.assertEqual(json.loads((destination / "carry-recovery.json").read_text()), plan)
-
-    def test_stale_pid_is_detached_and_explicit_synthesis_plan_resumes(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            source = root / "old/task"
-            source.joinpath("workspace/input/src").mkdir(parents=True)
             source.joinpath("workspace/route.json").write_text("{}")
-            source.joinpath("synthesis").mkdir()
-            source.joinpath("synthesis/result.json").write_text('{"status": "max_turns"}')
-            source.joinpath("result.json").write_text(json.dumps({
-                "task_id": "task", "instance_id": "CVE-test::project",
-                "status": "failed", "failure_class": "synthesis_incomplete"}))
-            (root / "old/selection.jsonl").write_text(json.dumps({
-                "task_id": "task", "instance_id": "CVE-test::project"}) + "\n")
-            results = root / "new"
-            supervise.carry_workspaces([source], results, {"task"})
-            (results / "selection.jsonl").write_text("")
-            (results / "task/carry-recovery.json").write_text(json.dumps({
-                "schema_version": 1, "task_id": "task", "instance_id": "CVE-test::project",
-                "mode": "synthesis"}))
-            child = json.loads((results / "supervisor-state.json").read_text())["children"]["task"]
-            self.assertNotIn("pid", child)
-            self.assertNotIn("recovery_requested", child)
-            with unittest.mock.patch.object(supervise, "launch") as launch, \
-                    unittest.mock.patch.object(supervise, "pipeline_worker_command", return_value=None):
-                launch.return_value.pid = 4321
-                with unittest.mock.patch("sys.argv", ["supervise", "--sample", str(root / "old"),
-                                                       "--results", str(results), "--only", "task", "--once"]):
-                    self.assertEqual(supervise.main(), 0)
-            self.assertTrue(launch.call_args.args[6])
-            self.assertFalse(launch.call_args.kwargs["resume_harbor"])
-            self.assertEqual(launch.call_args.args[2], results)
+            with self.assertRaisesRegex(ValueError, "only review/Harbor"):
+                supervise.carry_workspaces([source], root / "new", {"task"}, {"task": {
+                    "schema_version": 1, "task_id": "task",
+                    "instance_id": "CVE-test::project", "mode": "synthesis"}})
+            self.assertFalse((root / "new").exists())
 
     def test_carry_without_explicit_plan_never_launches_an_empty_worker(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -539,13 +515,15 @@ class ExplicitCarryPlanTests(unittest.TestCase):
             task = root / "task"
             task.joinpath("workspace/input/src").mkdir(parents=True)
             task.joinpath("workspace/route.json").write_text("{}")
+            task.joinpath("workspace/delivery").mkdir()
             task.joinpath("synthesis").mkdir()
-            task.joinpath("synthesis/result.json").write_text('{"status": "max_turns"}')
+            task.joinpath("synthesis/result.json").write_text('{"status": "completed"}')
             task.joinpath("carry-provenance.json").write_text(json.dumps({
                 "same_instance_continuation": True, "instance_id": "CVE-test::project"}))
             task.joinpath("result.json").write_text(json.dumps({
                 "task_id": "task", "instance_id": "CVE-test::project",
-                "status": "failed", "failure_class": "synthesis_incomplete"}))
+                "status": "error", "failure_class": "pipeline",
+                "error": "reviewer interrupted before review.json"}))
             (root / "selection.jsonl").write_text(json.dumps({
                 "task_id": "task", "instance_id": "CVE-test::project"}) + "\n")
             (root / "supervisor-state.json").write_text(json.dumps({
@@ -599,7 +577,7 @@ class BoundedRecoveryTests(unittest.TestCase):
             self.assertTrue(launch.called)
             self.assertFalse(launch.call_args.kwargs["resume_harbor"])
             self.assertTrue(launch.call_args.kwargs["review_delivery"])
-            self.assertIs(launch.call_args.args[6], False)
+            self.assertEqual(launch.call_args.args[4], 18000)
             self.assertEqual(launch.call_args.args[2], root)
             self.assertTrue((base / "retry-evidence/review-incomplete/trajectory.jsonl").is_file())
 
@@ -613,12 +591,12 @@ class BoundedRecoveryTests(unittest.TestCase):
             base.joinpath("synthesis").mkdir()
             base.joinpath("synthesis/result.json").write_text('{"status": "max_turns"}')
             base.joinpath("result.json").write_text(json.dumps({
-                "status": "failed", "failure_class": "synthesis_incomplete"}))
+                "status": "failed", "failure_class": "harbor_failed"}))
             (root / "selection.jsonl").write_text(json.dumps({
                 "task_id": task, "instance_id": "CVE-test::project"}) + "\n")
             (root / "supervisor-state.json").write_text(json.dumps({
                 "children": {task: {"pid": None, "recovery_requested": True,
-                                    "last_status": "synthesizing", "retry_reason": "bounded_recovery",
+                                    "retry_reason": "bounded_recovery",
                                     "bounded_recovery_launched": True, "final_status": "failed"}}}))
             with unittest.mock.patch.object(supervise, "launch") as launch, \
                     unittest.mock.patch.object(supervise, "worker_alive", return_value=False), \
@@ -629,10 +607,10 @@ class BoundedRecoveryTests(unittest.TestCase):
                     self.assertEqual(supervise.main(), 0)
             launch.assert_not_called()
             state = json.loads((root / "supervisor-state.json").read_text())
-            self.assertEqual(state["children"][task]["retry_blocked"],
-                             "bounded_recovery_already_launched")
+            self.assertEqual(state["children"][task]["retry_reason"],
+                             "manual_recovery_required")
 
-    def test_explicit_delivery_repair_survives_an_infrastructure_result(self):
+    def test_explicit_delivery_repair_is_preserved_without_relaunch(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             task = "linux-017"
@@ -655,10 +633,12 @@ class BoundedRecoveryTests(unittest.TestCase):
                                                        "--results", str(root), "--concurrency", "30",
                                                        "--batch-size", "30", "--only", task, "--once"]):
                     self.assertEqual(supervise.main(), 0)
-            self.assertIs(launch.call_args.args[6], True)
-            self.assertEqual(launch.call_args.kwargs["concurrency"], 30)
+            launch.assert_not_called()
+            self.assertTrue((base / "workspace/repair-request.json").is_file())
+            self.assertEqual(json.loads((base / "result.json").read_text())["error"],
+                             "ValueError: sidecar_services must contain service names")
 
-    def test_complete_workspace_continuation_does_not_start_a_fresh_route(self):
+    def test_legacy_complete_workspace_error_does_not_resume_synthesis(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             task = "linux-003"
@@ -685,10 +665,10 @@ class BoundedRecoveryTests(unittest.TestCase):
                 with unittest.mock.patch("sys.argv", ["supervise", "--sample", str(root),
                                                        "--results", str(root), "--only", task, "--once"]):
                     self.assertEqual(supervise.main(), 0)
-            self.assertIs(launch.call_args.args[6], True)
-            self.assertFalse(launch.call_args.kwargs["resume_harbor"])
-            self.assertFalse(launch.call_args.kwargs["review_delivery"])
-            self.assertEqual(launch.call_args.args[3], base / "workspace/route.json")
+            launch.assert_not_called()
+            self.assertTrue((base / "workspace/route.json").is_file())
+            self.assertEqual(json.loads((base / "result.json").read_text())["error"],
+                             "continue-synthesis needs route or existing workspace")
 
     def test_approved_complete_delivery_never_resumes_synthesis(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -717,7 +697,7 @@ class BoundedRecoveryTests(unittest.TestCase):
                     self.assertEqual(supervise.main(), 0)
             self.assertTrue(launch.call_args.kwargs["resume_harbor"])
             self.assertFalse(launch.call_args.kwargs["review_delivery"])
-            self.assertIs(launch.call_args.args[6], False)
+            self.assertEqual(launch.call_args.args[4], 18000)
 
     def test_approved_delivery_without_result_resumes_harbor(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -742,7 +722,7 @@ class BoundedRecoveryTests(unittest.TestCase):
                     self.assertEqual(supervise.main(), 0)
             self.assertTrue(launch.call_args.kwargs["resume_harbor"])
             self.assertFalse(launch.call_args.kwargs["review_delivery"])
-            self.assertIs(launch.call_args.args[6], False)
+            self.assertEqual(launch.call_args.args[4], 18000)
 
     def test_approved_delivery_with_archived_gold_failure_retries_harbor_only(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -774,7 +754,7 @@ class BoundedRecoveryTests(unittest.TestCase):
                     self.assertEqual(supervise.main(), 0)
             self.assertTrue(launch.call_args.kwargs["resume_harbor"])
             self.assertFalse(launch.call_args.kwargs["review_delivery"])
-            self.assertIs(launch.call_args.args[6], False)
+            self.assertEqual(launch.call_args.args[4], 18000)
 
     def test_file_pov_gold_crash_protocol_error_retries_current_verifier_once(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -810,7 +790,7 @@ class BoundedRecoveryTests(unittest.TestCase):
                                                        "--results", str(root), "--only", task, "--once"]):
                     self.assertEqual(supervise.main(), 0)
             self.assertTrue(launch.call_args.kwargs["resume_harbor"])
-            self.assertIs(launch.call_args.args[6], False)
+            self.assertEqual(launch.call_args.args[4], 18000)
             self.assertFalse((base / "harbor").exists())
             self.assertTrue((base / "retry-evidence/harbor-file-pov-gold-protocol").is_dir())
 
@@ -860,9 +840,9 @@ class BoundedRecoveryTests(unittest.TestCase):
             (base / "result.json").write_text(json.dumps({
                 "status": "failed", "failure_class": "harbor_failed",
                 "harbor": {"gold": {"reward": 0.0}, "differential_from_final_bundle": {
-                    "status": "failed", "report": {"status": "infra_error",
-                        "vulnerable": {"oracle": {"returncode": 1}},
-                        "fixed": {"oracle": {"returncode": 0},
+                    "status": "failed", "report": {"status": "this_bug",
+                        "vulnerable": {"oracle": {"returncode": 0}},
+                        "fixed": {"oracle": {"returncode": 1},
                                   "submission_result": {"returncode": 1, "output": output}}}}}}))
             evidence = base / "harbor/jobs/task-gold/trial/verifier"
             evidence.mkdir(parents=True)
@@ -870,17 +850,16 @@ class BoundedRecoveryTests(unittest.TestCase):
                 "vulnerable": {"triggered": True, "submission_result": {"returncode": 0, "output": output}}}))
             (root / "supervisor-state.json").write_text(json.dumps({
                 "children": {task: {"pid": None, "delivery_retry_count": 0,
-                                    "harbor_launched": True, "review_retry_count": 1}}}))
+                                    "review_retry_count": 1}}}))
             with unittest.mock.patch.object(supervise, "launch") as launch, \
                     unittest.mock.patch.object(supervise, "pipeline_worker_command", return_value=None):
                 launch.return_value.pid = 4321
                 with unittest.mock.patch("sys.argv", ["supervise", "--sample", str(root),
                                                        "--results", str(root), "--only", task, "--once"]):
                     self.assertEqual(supervise.main(), 0)
-            self.assertEqual(launch.call_count, 1)
-            self.assertTrue(launch.call_args.args[6])
-            self.assertIn("delivery_review_repair", (base / "workspace/repair-request.json").read_text())
-            self.assertFalse((base / "workspace/review.json").exists())
+            launch.assert_not_called()
+            self.assertTrue((base / "workspace/review.json").is_file())
+            self.assertFalse((base / "workspace/repair-request.json").exists())
 
     def test_infra_error_with_approved_delivery_never_resumes_synthesis(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -902,7 +881,7 @@ class BoundedRecoveryTests(unittest.TestCase):
             (root / "supervisor-state.json").write_text(json.dumps({
                 "children": {task: {"pid": None, "recovery_requested": True,
                                     "last_status": "harbor", "review_retry_count": 1,
-                                    "retry_reason": "bounded_recovery"}}}))
+                                    "retry_reason": "review_infrastructure"}}}))
             with unittest.mock.patch.object(supervise, "launch") as launch, \
                     unittest.mock.patch.object(supervise, "pipeline_worker_command", return_value=None):
                 launch.return_value.pid = 4321
@@ -910,7 +889,6 @@ class BoundedRecoveryTests(unittest.TestCase):
                                                        "--results", str(root), "--only", task, "--once"]):
                     self.assertEqual(supervise.main(), 0)
             self.assertTrue(launch.call_args.kwargs["resume_harbor"])
-            self.assertIs(launch.call_args.args[6], False)
             self.assertFalse(launch.call_args.kwargs["review_delivery"])
 
     def test_passing_gold_and_null_do_not_hide_stale_final_verifier(self):
@@ -1003,7 +981,7 @@ class BoundedRecoveryTests(unittest.TestCase):
                     self.assertEqual(supervise.main(), 0)
             self.assertTrue(launch.call_args.kwargs["review_delivery"])
             self.assertFalse(launch.call_args.kwargs["resume_harbor"])
-            self.assertIs(launch.call_args.args[6], False)
+            self.assertEqual(launch.call_args.args[4], 18000)
 
 
 if __name__ == "__main__":

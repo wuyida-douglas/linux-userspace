@@ -1,225 +1,407 @@
-# 新管线开发交接说明
+# Linux 用户态漏洞题目管线使用说明
 
-> 更新日期：2026-11-03。本目录包含当前规划、原始输入、候选清单、筛选脚本和抽样审查。
->
-> **当前已实现轻量四阶段管线，并跑通首个 Janet 题目的真实 Harbor 0.22.0 验收。**100 题固定随机样本已建立，80 条源码输入完整，20 条上游输入异常已记录；尚未完成 100 题批量试产，不能将单题通过当作批量成功率。
+把固定漏洞候选池中的 **CVE × 仓库 × 修复候选** 变成可审计的 Harbor 题包。
+主流程是：固定抽样（或全量）→ 定点 S3 下载与校验 → 路由 → 分支合成 →
+独立审查 → Harbor gold/null 与最终 bundle 差分验收。
 
-## 1. 一句话说明任务
+本 README 面向后续负责运行和 scaling 的工程同学。**当前是按操作更新的
+开发版，不是已完成多租户 scaling 的产品。** 运行前阅读第 2、9 节；输入
+预处理的逐字段解释见 **[输入下载与预处理](doc/输入下载与预处理.md)**。
 
-利用旧 Web 管线未选用的 **38,901 个漏洞 × 仓库实例**，合成真实可验证的 Linux 用户态漏洞环境：能做网络服务高阶利用就做 `SVC-EXPLOIT`，否则做 `FILE/BIN`，其中高阶利用优先、PoV 兜底，最终统一交付 Harbor 题包。
+## 1. 和 exploit 管线的区别
 
-老管线是 `exploit-from-git`，已选 **13,173 条普通 Web 应用实例**；新管线不重复批量制造普通 CMS/业务 Web 题，而处理服务、可宿主化组件和单文件目标。
+exploit 管线按 CVE 下载现成 `{source}_{CVE}/` 目录，并从题单 JSONL 取一行
+写成 `meta.exploit.json`，见 `../exploit/README.md` 的“数据准备”。
 
-## 2. 先读哪些文件
+新管线多了固定样本和证据审计：
 
-1. **[完整实施计划](doc/Linux用户态漏洞利用新管线计划.md)**：分支定义、排除范围、四阶段流程、Harbor 验收和数量口径。
-2. **[Harbor 交付格式](docs/reference/交付格式.md)**：最终题包的目录、镜像、配置与运行要求。
-3. **[全池随机 50 条审查](work/remaining_38901_random50_audit.json)**：理解剩余数据的实际构成。
-4. **[28 条排除项中文说明](work/remaining_38901_random50_exclusions_zh.md)**：理解为什么有些 CVE 不能硬套到当前分支。
-5. **[SVC 随机 50 条审查](work/svc_exploit_recall_random50_audit.json)**：理解服务候选池的真实噪声。
+1. 校验冻结候选池，再按 seed 固定抽取实例（scale-up 时用 `--all` 准备全池），
+   不先挑容易题；
+2. 只下载所选 candidate 的 `prefix/` 和 `fix.diff`，不整桶复制；
+3. 匹配 candidate/仓库，重建白名单 `meta.json`，验证源码、补丁与缓存；
+4. 每位置保留下载失败，不因缺输入而偷换样本；
+5. 启动任务时复制只读输入，并生成 `alternate-candidates.json` 备用修复索引。
 
-飞书旧页面：<https://aicarrier.feishu.cn/wiki/UnB4wnwLDiV6MJku1HtcduZ3nfd>。**本地 Markdown 比飞书更新，后续以本地计划为准。**
+所有下载、格式检查、摘要与元数据精简都是 **Python 脚本** 完成的，不调用
+模型。`complete` 仅表示输入完整且格式合格，不表示补丁一定是该 CVE 的真实
+安全修复，更不表示题目通过。
 
-## 3. 已确认的核心原则
+## 2. 环境与安全边界
 
-### 3.1 三个交付分支
+### 2.1 前置依赖
 
-| 分支 | 选手入口 | 合格结果 |
-| --- | --- | --- |
-| `SVC-EXPLOIT` | 真实网络协议或官方客户端访问服务/宿主 | 未授权执行、读取、写入、认证绕过、SSRF 或有严格对照的服务 DoS |
-| `FILE-EXPLOIT` | 一个文件，固定 runner，真实 release 目标 | 未授权代码执行、受保护数据读取等，不接受 crash-only |
-| `FILE-POV` | 一个文件，固定 runner | vulnerable 触发目标 sanitizer/运行时/资源效果，fixed 不触发，良性正常 |
+- Linux 金属机、足够的本地磁盘、Docker Engine 与 Compose v2；
+- Python 3.12（当前验证版本），`rclone`；
+- 项目 `.venv`，至少包含 `PyYAML`、`anthropic` 和 Harbor CLI `0.22.0`；
+- 模型网关的环境文件；S3 remote 的 rclone 凭据；
+- 可访问的官方上游、包镜像和 Docker Hub mirror，见
+  [裸金属网络约定](config/bare-metal-network.md)。
 
-SVC 的宿主可为原生 daemon、真实应用宿主或审计通过的薄宿主。**不是库就直接排除，也不是给文件解析器随便套 HTTP 就算 SVC。**
+当前仓库没有 `requirements.txt`/`pyproject.toml`，新机器需要先固定一份
+依赖清单再作为标准镜像交付，不能假设任意 Python 环境都兼容。
 
-### 3.2 四阶段，不做复杂状态机
+在当前开发机可检查：
 
-1. **路由准入**：Agent 判断抛弃或选择一个分支，写 `route.json`；调度器只按该文件路由。
-2. **分支合成**：不同分支使用不同 prompt、产物、test/verifier，保存完整合成轨迹。
-3. **独立审查**：新 session 输入轨迹与产物，检查伪造、hack、泄漏、错误分支和证据真实性。
-4. **Harbor 验收**：导出镜像与题包，执行对应 `tests/test.sh`/verifier，用 Harbor 0.22.0 做真实终验。
+```bash
+cd /nvme/wuyida/新管线开发
+.venv/bin/python -c 'import yaml, anthropic; print("Python dependencies OK")'
+.venv/bin/harbor --version                 # 0.22.0
+rclone version
+config/bin/docker version
+config/bin/docker compose version
+test -r /nvme/wuyida/env                  # 不 cat，不打印密钥
+```
 
-使用通用 shell、文件编辑、编译器、容器 CLI、公开网络工具和 Python/Shell。**不设计专属 MCP 工具，不复制老管线多阶段状态机、阶段产物矩阵和 MVP 工具。**合成轨迹后续要用于通用 SFT。
+不要把模型/S3/代理密钥写进 Git、Prompt、命令参数、题目文件或镜像。
 
-### 3.3 统一验收底线
+### 2.2 当前运行模型不是最终多租户隔离
 
-- 正常输入/请求和健康检查通过；
-- gold 在干净 vulnerable 环境成功；
-- 同一 gold 在干净 fixed 环境失败，fixed 健康；
-- 从最终交付包重复验证，结果稳定且归因于目标漏洞；
-- fixed、gold 和私有裁判不能泄漏给选手。
+合成 Agent 使用宿主 Docker/Compose，不启动 DinD；交付的选手容器不能获得
+Docker socket。管线为每题分配 Compose project 和 IPAM，限制公开交付的
+权限与挂载，但**共享宿主 Docker 不是恶意任务之间的最终安全边界**。
 
-可以用固定 secret、固定配置，不额外设计动态 nonce。参考 verifier 只用于理解 vulnerable/fixed 两轮验证思想，不要求复用其复杂编排。
+scaling 前必须由工程负责人明确每 attempt 的隔离方案（例如经过审计的
+私有 DinD 或 VM/microVM）、磁盘/内存/并发额度和清理策略。不要仅因为提高
+`--concurrency` 就把开发环境称为多租户生产平台。
 
-## 4. 数据与候选口径
+当前 `pipeline/harbor.py` 使用仓库 `.venv/bin/harbor`，Docker/IPAM 也带有
+本机配置。换机器时先确认路径和 wrapper，不要硬编码另一位开发者的 home。
 
-### 4.1 原始输入已放进本目录
+## 3. 数据从哪里来
 
-`data/raw/` 中的文件为原样复制：
+### 3.1 冻结候选池
 
-| 文件 | 行数 | 用途 |
-| --- | ---: | --- |
-| `catalog.instances.jsonl` | **52,074** | 完整“漏洞 × 仓库”实例，含 CVE、仓库、修复候选、引用和 PoC 线索 |
-| `meta.exploit.g0.jsonl` | **13,173** | 老 Web 管线已选题单，用规范化 `instance_id` 排除 |
-| `catalog.tagged_instances.g0.jsonl` | **52,074** | 旧标签，仅作召回/排序线索，不作新管线硬准入 |
-
-旧标签里的 `P0–PX`、`g0_keep`、`poc_available`、`surface=local_file`、C/C++ 等都可能误杀，不可直接当新管线真值。
-
-### 4.2 派生数据
-
-| 文件 | 数量 | 含义 |
-| --- | ---: | --- |
-| `data/remaining-38901.instances.jsonl` | 38,901 | 原始全集扣除旧 Web 题单后的完整剩余池，附 `old_tags` |
-| `data/file-pov-g1.candidates.jsonl` | 13,956 | 非 kernel overflow/DoS 高召回，含 C/C++ 之外的语言 |
-| `data/bin-file-exploit-g1.candidates.jsonl` | 8,372 | 上述池中具有内存破坏线索、优先尝试高阶利用的子集 |
-| `data/svc-exploit.recall-candidates.jsonl` | 13,076 | 按新 SVC/宿主定义生成的宽召回池 |
-| `data/candidate-report.json` | — | FILE/BIN 候选的语言、标签等统计 |
-| `data/svc-exploit.recall-report.json` | — | SVC 候选召回原因与统计 |
-
-**所有候选都是元数据线索，不是已准入、已构建或可交付题目。**路由前不同池可重叠；路由后一个实例只进一个分支，至多产出一道题。
-
-本目录包含完整元数据，但**不包含所有实例的源码快照**。阶段一/二 Agent 需根据仓库、提交和引用自行恢复 vulnerable/fixed 源码与所需材料。
-
-### 4.3 如何正确理解数量
-
-- 全池随机 50 条静态审查：9 条初步 SVC、9 条初步 FILE-POV、4 条待定、28 条排除。
-- `18/50 × 38,901 ≈ 14,004` 只是**全池可能进入分支评估的粗略外推**，不是交付量。
-- SVC 候选池另一组 50 条：14 条明确符合、3 条待定、33 条不符合；`17/50 × 13,076 ≈ 4,446` 只是 **SVC 宽候选估算**，两组样本不能混用。
-- 真正数量必须由 100 道完整四阶段试产的通过率决定，并扣除普通 Web 重复、错误仓库、无法构建、无法恢复 gold、审查与 Harbor 失败。
-
-## 5. 目录结构
+默认文件：
 
 ```text
-新管线开发/
-├── README.md                         # 本交接说明
-├── doc/
-│   └── Linux用户态漏洞利用新管线计划.md  # 最新完整计划
-├── data/
-│   ├── raw/                          # 原始全集、旧题单、旧标签
-│   ├── remaining-38901.instances.jsonl
-│   ├── file-pov-g1.candidates.jsonl
-│   ├── bin-file-exploit-g1.candidates.jsonl
-│   ├── svc-exploit.recall-candidates.jsonl
-│   └── *report.json
-├── scripts/
-│   ├── export_remaining_and_service_scan.py
-│   ├── select_two_route_candidates.py
-│   ├── select_svc_exploit_candidates.py
-│   └── publish_plan_to_feishu.py     # 可选发布工具，与合成无关
-├── work/                             # 抽样与人工/Agent静态审查证据
-├── docs/reference/交付格式.md
-└── reference/pass2fail_verifier.py   # 老管线参考实现
+results/label-production-v1/candidates-kept.jsonl
 ```
 
-## 6. 复现候选清单
+`pipeline.prepare` 在 S3 调用之前强制验证：
 
-只需 Python 3 标准库，在**本目录**运行：
+- 23,873 个唯一 `instance_id`；
+- 每行 `metadata_label.label == keep`；
+- 文件 SHA-256 为
+  `1d9bdbd09a55a84fee01bd5ccf19027e0db2b8e1da37c91eaa653565c2c36142`。
+
+它是已筛选的候选集合，不是漏洞可交付性的保证。候选池构建脚本位于
+`scripts/`，日常固定样本生产**不要重新随机筛选或改写候选池**。
+
+### 3.2 S3 布局和凭据
+
+默认 remote：
+
+```text
+p_huawei_hdd1:private-data-3/DataWheel/en-code-osv-nvd/file
+```
+
+每题只探测有限的已知对象：
+
+```text
+<remote>/osv_<CVE>/meta.json
+<remote>/cvelist_<CVE>/meta.json
+<remote>/<source>_<CVE>/candidates/<candidate-id>/prefix/
+<remote>/<source>_<CVE>/candidates/<candidate-id>/fix.diff
+```
+
+rclone 配置必须包含名为 `p_huawei_hdd1` 的 S3 remote。若使用自定义配置
+文件，在调用前设置 `RCLONE_CONFIG=/安全路径/rclone.conf`。也可传
+`--remote <配置中的remote名>:<bucket>/<前缀>` 切换到其他数据源。
+
+**不要对整个 bucket 做 list/copy。** 脚本先按已知 CVE 和 candidate 定位，
+目录下载后逐文件核对字节数；缓存按 SHA-256 复核。不会自动拉 `base/`、
+`fix/`、`.git/` 或其他 candidate。
+
+## 4. 从 S3 建立一个新固定样本
+
+以下命令只做数据准备，不调用模型。请替换样本名、数量和 seed；已有目录
+代表已有实验，不要换个参数覆盖。
 
 ```bash
-# 重建剩余全集与旧版服务线索池；旧服务池只作历史对照
-python3 scripts/export_remaining_and_service_scan.py
+cd /nvme/wuyida/新管线开发
 
-# 重建 FILE/BIN 两个高召回池
-python3 scripts/select_two_route_candidates.py
+# 可选：只固定抽样，完全不访问 S3。
+.venv/bin/python -m pipeline.prepare \
+  --input results/label-production-v1/candidates-kept.jsonl \
+  --output samples/my-fixed100-s20261120 \
+  --count 100 --seed 20261120 --sample-only
 
-# 重建当前 SVC 候选池和固定随机种子的50条样本
-python3 scripts/select_svc_exploit_candidates.py
+# 下载并预处理同一固定样本；workers 仅控制下载并发，最大 30。
+.venv/bin/python -m pipeline.prepare \
+  --input results/label-production-v1/candidates-kept.jsonl \
+  --output samples/my-fixed100-s20261120 \
+  --count 100 --seed 20261120 --workers 4
 ```
 
-注意：前两个脚本会重写 `data/` 中同名派生文件；`raw/` 原始数据不会被修改。脚本报告中的路径按执行环境生成，不代表额外数据依赖。
+输入候选池非默认位置时显式传 `--input`。不要在同一输出目录用另一个
+count/seed 重抽。存在失败时命令返回非零，这是保留异常位置的回执，不能
+直接忽略后声称全部可运行。
 
-`work/` 中：
+生成目录：
 
-- `remaining_38901_random50*`：全池 50 条审查，随机种子 `20261103`；
-- `svc_exploit_recall_random50*`：当前 SVC 池 50 条审查；
-- `service_scan_random50*`：旧版 16,418 条原生服务定义审查，**不要与当前 SVC 定义混用**；
-- `file_pov_100_samples.jsonl`、`review_samples.jsonl`：早期分层审查材料，仅供证据参考，不是当前最终路由结果。
+```text
+samples/my-fixed100-s20261120/
+├── sample.json                 # 池、seed、数量与抽样策略
+├── selection.jsonl             # 固定位置，含候选/advisory 恢复线索
+├── download-report.json        # 各位置 complete/partial/error 及原因
+├── download-history.jsonl
+└── tasks/<task-id>/
+    ├── task.json
+    └── input/
+        ├── src/                # 下载的 prefix，不预先应用补丁
+        ├── fix.diff            # 所选候选补丁，若缺失则记录
+        ├── meta.json           # 白名单重建的精简元数据
+        └── manifest.json       # 字节数、SHA-256 与输入状态
+```
 
-## 7. 接手后的具体工作
+`meta.json` 保留实例、仓库、漏洞描述、所选 candidate、真实 candidate ID、
+来源和旧标签，而不是原样复制整个远端抓取上下文。`old_tags` 只是路由线索。
+`alternate-candidates.json` 则在启动工作时由 `pipeline.run` 从 `selection.jsonl`
+生成，**不是 S3 原始输入**。
 
-1. 从剩余池随机抽取 **100 道**，固定样本与随机种子，直接开始完整流程，不先挑简单题。
-2. 实现轻量调度器：阶段一读写 `route.json`，根据分支选择 prompt；只保留日志和失败原因，不建复杂状态机。
-3. 分别实现三个分支的合成 prompt、最小环境/gold 模板和 verifier。
-4. 实现独立 review session，确保输入包含合成轨迹和实际产物，并输出可追踪的审查证据。
-5. 实现镜像归档和 Harbor 导出，真实跑通 vulnerable 成功、fixed 失败、良性健康及交付包终验。
-6. 记录每条实例的路由、合成、审查、Harbor 结果与成本；按实际通过率决定是否扩产。
-7. 最终提供分布清单：三个分支数量；SVC 的宿主类型；漏洞类型、语言和验收方式。只统计通过独立审查与 Harbor 验收的题。
+只修复原位置的缺失/不完整下载，可对同一输出再次执行 `prepare` 并传
+`--only <task-id或CVE> ...`。它会先验证缓存清单；缓存损坏不会静默重下载
+冒充原始输入。`partial` 不是 `complete`，不能直接进入要求完整输入的调度；
+但当前普通 `run`/`supervise` 尚未统一强制这一条件，详见第 4.1 节。
 
-## 8. 当前实现与已实测结果
+### 4.1 严格固定样本与 top-up 不可混用
 
-### 8.1 运行入口
+固定位置实验要保留 `input_unavailable` 的原始错误，不用新实例补位。
 
-在 `/nvme/wuyida/新管线开发` 执行。模型凭据仅从 `/nvme/wuyida/env` 读取，不写入题目、日志或镜像。
+只有明确要建立一个“完整输入的新样本”时，才使用：
 
 ```bash
-# 固定种子抽样；后续重复执行只校验缓存，并记录上游缺失/损坏。
-python3 -m pipeline.prepare --output samples/pilot100-20261103 --workers 4
-
-# 保留80条完整原始输入，排除原始失败实例后继续固定随机补样到100条。
-python3 -m pipeline.prepare --output samples/pilot100-usable-20261103 \
-  --top-up-from samples/pilot100-20261103 --count 100 --workers 4
-
-# 首次从本机 apt 代理准备 ubuntu:22.04；已有镜像时直接复用。
-python3 -m pipeline.bootstrap_image
-
-# 单题：路由 -> GLM-5.3 分支合成 -> 新会话独立审查 -> 最终Harbor验收。
-python3 -m pipeline.run --sample samples/pilot100-20261103 \
-  --results results/pilot100-v1 --only CVE-2026-10267
-
-# 中断后保留 input/ 和 delivery/，用新 session 继续；不要重跑路由或清空构建产物。
-python3 -m pipeline.run --sample samples/pilot100-20261103 \
-  --results results/<new-run> --only <CVE-ID> --retry-synthesis --continue-synthesis \
-  --route-from results/<old-run>/<task-id>/workspace/route.json \
-  --workspace-from results/<old-run>/<task-id>/workspace
-
-# 只导出通过审查和差分验证的题；默认公开包不含 gold。
-python3 -m pipeline.harbor --results results/janet-synthesis-v2 \
-  --output harbor_export/janet
-
-# --oracle 另外生成隔离的验收配置；不可将该配置作为玩家题包发布。
-python3 -m pipeline.harbor --results results/janet-synthesis-v2 \
-  --output harbor_export/janet --oracle
-sg docker -c 'exec .venv/bin/harbor run \
-  --path harbor_export/janet/<task-id>/harbor-oracle-profile \
-  --agent oracle --n-attempts 1 --n-concurrent 1 \
-  --jobs-dir harbor_jobs --job-name <unique-job-name> --yes'
+.venv/bin/python -m pipeline.prepare \
+  --output samples/my-complete100-topup \
+  --top-up-from samples/my-fixed100-s20261120 \
+  --count 100 --seed 20261120 --workers 4
 ```
 
-`--concurrency` 控制题级并发，但 Docker 构建/差分验证串行执行，避免相互污染。默认模型为 `glm-5.3`，执行器为原生 Anthropic 工具循环。
+它排除失败历史并补抽其他实例，已改变样本组成。历史写入
+`download-history.jsonl`/`rejected-instances.jsonl`；不能拿它的成功率替代
+原始固定样本的成功率。
 
-### 8.2 输入和交付边界
+### 4.2 全量数据准备（scale-up 入口）
 
-- 抽样从 38,901 条剩余实例固定抽取 100 条，种子 `20261103`；S3 只拉选中实例的 prefix 与 `fix.diff`，不因坏数据换简单题。
-- 缓存输入由 `manifest.json` 校验；失败的实例保留原因。源码快照不完整时允许从对应官方 revision 补齐，但不能换仓库或伪造基线。
-- 每个阶段保存 `result.json` 与轨迹，合成工具输出单独保存；审查可读取合成轨迹、工具日志、gold 和实际执行报告。
-- 合成 Agent 只做自检；总控不在中间运行完整 verify。独立审查通过后冻结全部交付文件哈希，最终 Harbor 阶段从冻结副本完成私有差分，并对导出的真实题包运行 gold（1.0）与空提交（0.0）。
-- 差分报告必须满足：构建成功、良性输入正常、gold 在 vulnerable 成功、gold 在 fixed 不触发且 fixed 健康。
-- 公开交付只含漏洞工作站/服务、指令和公开评分器；gold、fixed 和私有 verifier 只在工厂侧。`harbor-oracle-profile` 是显式隔离的验收入口。
+`pipeline.prepare --all` 是给工程同学的一键全量入口：按冻结池原始顺序准备
+全部 23,873 条输入，不做随机抽样，也不再需要 `--count/--seed`。
 
-### 8.3 Harbor 0.22.0 实测约束
+```bash
+cd /nvme/wuyida/新管线开发
 
-- `[environment].docker_image` 必须声明预构建主服务镜像；任务 Compose 的 `main.image` 在导出时移除，避免覆盖 Harbor 注入的 Agent 镜像。
-- 本机不支持 Harbor 的 `no-network` egress 内核探测，默认配置使用 `public`；任务本身不需要外网，交付镜像包含全部运行依赖。
-- `/logs/verifier/reward.json` 只允许数值 reward 字段。导出器将原始详细评分移至 `evidence.json`，最终只写 `{"reward": 0.0 或 1.0}`。
-- 不用 `sh` 强行执行带 `pipefail` 的 Bash 测试；保留测试脚本的 shebang。
-- `docker load` 成功不等于 Harbor 验收成功，必须实际执行 `harbor run` 并检查 trial 的 `verifier_result` 与 `exception_info`。
+# 一键入口（推荐给工程同学；输出目录和 workers 可选）
+scripts/prepare_full_pool.sh samples/full-20261109 30
 
-### 8.4 已完成的端到端样例
+# 等价的原生命令
+.venv/bin/python -m pipeline.prepare \
+  --input results/label-production-v1/candidates-kept.jsonl \
+  --output samples/full-20261109 \
+  --all --workers 30
+```
 
-Janet `CVE-2026-10267` 路由为 `FILE-POV`。独立审查通过；gold 的 42 字节 marshalled image 在 vulnerable 触发 `doframe` 的 ASAN heap-buffer-overflow，fixed 在 unmarshal 阶段拒绝，良性 image 正常执行。冷构建和冻结复验均通过。
+特性：
 
-最终使用真实 Harbor 0.22.0 `oracle` 运行：**1 trial、0 exception、reward=1.0**。空提交反例为 **reward=0.0**。报告见 `results/janet-synthesis-v2/`、`harbor_jobs/janet-harbor-oracle-v5/`。
+- 输出目录的 `sample.json.sampling_policy` 会写成 `all(frozen_pool_order)`；
+- 已有全量 `selection.jsonl` 时只校验顺序并补齐缺失下载，可重复执行；
+- `--all` 与 `--count` 互斥，也不能和 `--top-up-from` 混用；
+- 仍可用 `--only <task-id或CVE>` 先修某几条，或用 `--sample-only` 只生成清单；
+- 全量下载量很大（源码快照 + 补丁），运行前确认磁盘、S3 配额和 `--workers`
+  （最大 30）。
 
-tcpdump `CVE-2017-13048` 已确认 RSVP Fast Re-Route 的 vulnerable/fixed ASAN 差分，正在完成交付与独立审查。100 题完整通过率尚未测量。
+> 全量模式只准备**分支无关的输入**。路由、SVC/FILE 分支判断仍在
+> `pipeline.run`/`pipeline.supervise` 中进行，不在下载阶段预先分类。
 
-## 9. 不应踩的坑
+## 5. 模型配置和运行前检查
 
-- 把正则召回数、静态审查比例或 100% 转化假设说成产量；
-- 把“本地文件 crash”包装成高阶 exploit；
-- 给任意本地库套 HTTP 后声称是真实原生网络服务；
-- 把客户端被恶意服务端攻击改写成服务端漏洞；
-- 将普通 Web/XSS/CSRF 题重新量产，或与老管线重复；
-- 忽略 CVE—仓库—版本—补丁错配；
-- 让固定 runner 改变真实 API 语义，或制造漏洞/旁路来通过裁判；
-- 用工厂内部 Python 自检替代最终 Harbor 运行；
-- 在合成或选手轨迹中引入专属 MCP 工具、私有路径、fixed/gold/私有裁判。
+默认模型环境文件是 `/nvme/wuyida/env`，可用 `--env-file` 指定其他安全路径。
+它至少提供：
+
+```text
+ANTHROPIC_BASE_URL=<模型网关>
+ANTHROPIC_AUTH_TOKEN=<密钥>   # 或 ANTHROPIC_API_KEY
+```
+
+不要将真实文件复制进文档。执行器固定为 Claude Code（`claude -p` 流式会话，
+可用 `CLAUDE_BIN` 指定可执行文件），默认模型 `glm-5.3`；模型名必须与实际网关支持一致。
+
+环境预检会检查 Docker/Compose/buildx、模型网关和基础镜像：
+
+```bash
+.venv/bin/python -m pipeline.preflight \
+  --env-file /安全路径/env \
+  --output work/preflight-my-environment.json
+```
+
+准备共享的选手和 verifier 开发镜像：
+
+```bash
+.venv/bin/python -m pipeline.runtime_images
+```
+
+已存在的同名镜像默认复用；`--force` 会重建，使用前审查 tag 是否仍符合预期。
+`runtime_images` 只是开发期准备，不能替代每题真实 target 的构建与验收。
+
+## 6. 批量并发运行：统一入口
+
+**先确认第 2 节的环境与隔离前提。** 运行入口只有一个：`pipeline.supervise`
+统一并发调度；`pipeline.run` 是 supervisor 为单个 task 拉起的内部 worker，
+不作为人工操作入口单独使用。下面命令会调用模型和 Docker；当前维护期间的
+停机指令优先，不要因阅读 README 而自行启动正在暂停的样本。
+
+```bash
+cd /nvme/wuyida/新管线开发
+
+.venv/bin/python -m pipeline.supervise \
+  --sample samples/my-fixed100-s20261120 \
+  --results results/my-batch-r1 \
+  --env-file /安全路径/env \
+  --batch-size 20 --concurrency 20 \
+  --only <task-id-1> <task-id-2> # 从 selection.jsonl 取完整 ID，不用 shell 猜数补位
+```
+
+`--batch-size` 是新题名额上限，`--concurrency` 是本监督器 worker 上限；
+携带恢复任务也共享并发额度，不能另开一批绕过限制。两者最大 30。
+一个 results 目录只能属于一个样本，有 supervisor 锁，不能多个调度器
+同时写同一目录。需要严格固定样本配额时，使用第 8 节的
+`pipeline.iterate_batches` 协调器，它内部同样调用 supervisor。
+
+### 6.1 四阶段分别做什么
+
+1. **路由**：读取输入证据，产生结构化 `route.json`，选择 SVC-EXPLOIT、
+   FILE-EXPLOIT 或 FILE-POV。接受路由只是合成假设，不是通过。
+2. **合成**：按路由分支创建真实 target、公开工作站、gold、oracle 和
+   官方修复。原始 `input/` 不修改，恢复证据写入 `delivery/project/`。
+3. **独立审查**：新会话读取冻结交付和合成轨迹，通过普通文件写入输出
+   `review.json`；控制器校验其布尔 `passed`、findings 和执行检查字段。
+4. **验收**：冻结审查通过的交付，导出预构建镜像，执行 Harbor gold、null
+   以及最终 bundle 的 vulnerable/fixed 差分。
+
+严格通过必须同时有：
+
+```text
+独立 review.passed = true
+Harbor gold.reward = 1.0
+Harbor null.reward = 0.0
+最终 bundle differential.status = passed
+最终 bundle differential.report.success = true
+```
+
+不要只看 `result.json.status=passed`、Harbor 进程无异常或容器启动成功。
+详情见 [Harbor 交付与差分验证设计](doc/统一Harbor交付与差分验证设计.md)。
+
+### 6.2 输出位置
+
+```text
+results/<run>/<task-id>/
+├── result.json                 # 当前最终/失败状态
+├── route/                      # 路由轨迹和结果
+├── synthesis/                  # 合成轨迹和结果
+├── review/                     # 独立审查轨迹
+├── harbor/                     # gold/null、导出和差分证据
+└── workspace/
+    ├── input/                  # 只读输入副本与备用候选索引
+    ├── route.json
+    ├── review.json
+    └── delivery/               # 接受审查的实际交付
+```
+
+默认接受包发布到 `harbor_export/<YYYYMMDD>-production/`；不同 run 同日发布
+必须注意冲突。生产应为每批显式指定不同的 `--published-root`，例如
+`harbor_export/my-small-batch`。失败题不得因重试被发布。
+
+导出题目名会把完整仓库 URL 从内部 `task-id` 里去掉，并在末尾追加分支：
+
+```text
+linux-014-cve-2024-23346-materialsproject-pymatgen-file-pov
+linux-001-cve-2020-28483-gin-gonic-gin-svc-exploit-synthetic-host
+```
+
+后缀规则：SVC 用 `-svc-exploit-native-service` / `-svc-exploit-real-host` /
+`-svc-exploit-synthetic-host`，FILE 用 `-file-exploit` / `-file-pov`。
+每个导出题目录里的 `acceptance.json` 是本次验收证据的只读副本（Harbor
+gold/null 与最终 bundle 差分），不是运行依赖。
+
+**镜像 tag 必须每题唯一。** 导出只按该题 `task.json` 的 `images.target` /
+`images.agent` 精确 tag 做 `docker save`，不会从容器或工作区猜镜像；复用
+`:latest` 或跨题同名 tag 会让后构建的镜像覆盖前者，导出仍“成功”但内容错。
+合成 Prompt 要求 tag 带 task id 或唯一 slug，并在所有修改完成后重新
+build/tag；修改只存在于容器可写层时必须 `docker commit` 成这题最终 tag。
+
+多容器 target 按公开 Compose 的**每个服务镜像**分别保存（client 进
+`images/target.tar.gz`，sidecar 进 `images/<service>.tar.gz`）。`docker commit`
+是单容器操作，不会自动提交整个 Compose 项目：每个可写层里有必需修改的容器
+都要单独 commit 到自己的唯一 tag，并改对应服务的 `image`；卷内容不会被
+commit 带走。
+
+## 7. 失败边界、审查/验收续跑和历史证据
+
+路由、合成和审查都使用普通文件写决定：`route.json`、`review.json`。
+模型没有管线专用决策工具。字段缺失、格式错误、预算耗尽、合成主动写
+`failure.json` 或 `reroute-request.json` 都会结束当前任务；控制器不自动改路由、
+不重新合成，也不拼接 continuation/交接 Prompt。分支错误或失败题保留工作区
+和轨迹，后续由人工回捞。
+
+仅对已有冻结交付保留两种不重新合成的入口：
+
+- `--review-delivery`：对已有交付重新独立审查。
+- `--resume`：保留已批准交付，重跑验收，不调用合成修改交付。
+
+复制这类已有交付到下一批时必须有 `carry-provenance.json` 和明确的
+`carry-recovery.json`，实例身份一致；旧结果、轨迹、Harbor 证据和错误回执不得覆盖。
+路由/合成恢复计划不会自动派发。
+
+## 8. 批次协调器与 scaling 操作
+
+`pipeline.iterate_batches` 在 `pipeline.supervise` 之上负责：固定批次选择、
+监控、逐批归因、人工代码修复复核门禁、把明确的管线恢复任务带入下一批。
+它不是简单“失败后无限重启”的循环。
+
+每批结束生成 `batch-NNN-audit.json`。下一批前必须检查轨迹与代码缺陷，并把
+该审计的 `code_fix_review.approved` 设为 `true`；这是一项**人工/独立代码
+复核门禁**，不是自动测试或模型自批。严格验收数量要按第 6.1 节逐项统计。
+
+新生产建议先用第 6 节的显式题单监督器完成受控批次，再按审计结果编排
+下一批。`iterate_batches` 当前的 `number == 1` 路径需要接管已有的
+initial-results 和 initial supervisor，不是通用的从零启动接口：
+
+```text
+--sample <固定样本>
+--output <协调器状态目录>
+--initial-results <第一批结果目录>
+--initial-supervisor-pid <当前第一批监督器 PID，无存活接管场景时不能乱填>
+--initial-only <第一批固定 fresh ID...>
+--initial-observed-only <已观察且禁止新派遣的旧位置...>
+--batch-size 20 --concurrency 20 --target-size 100
+--preserve-unavailable-inputs
+```
+
+只有在接管现有生产时才传 `initial-carried-root`/`initial-carried` 等历史参数。
+**不要把当前一次实验的 PID、carry 列表或 selection 复制到新样本。** 工程
+scaling 前应把“从零新建第一批”和“接管既有第一批”拆成明确、独立的命令，
+并给批次完成、失败、停机和人工审批定义标准自动化接口。
+
+## 9. 当前已知工程化缺口
+
+以下事项必须如实保留在交付风险中：
+
+- 共享宿主 Docker 仅供开发，最终强隔离方案尚未在本管线实现。
+- 缺少锁定的依赖清单、标准 worker 镜像与跨机器配置入口。
+- 批协调器首 batch 是接管式接口，尚非通用从零生产 API；普通监督器也尚未
+  统一强制 `manifest.status=complete`，scaling 前必须补齐入口校验。
+- 路由、合成和分支纠错失败只保留证据供人工回捞，不再自动续跑；仅冻结交付
+  的审查和 Harbor 基础设施验收有有界恢复。
+- 2026-11-09 的离线单元回归为 102 项通过；这不代表真实模型、Docker 或生产
+  端到端验收已通过，恢复生产前仍需审查变更并做受控小规模验证。
+- 历史 gold 证据严格门禁仍需在恢复生产前完成复核。
+- 只有实际证据满足严格验收的题目才能发布和计数；fixture、候选数量、
+  路由接受率与旧发布记录都不能冒充生产通过率。
+
+## 10. 相关文档
+
+- [输入下载与预处理](doc/输入下载与预处理.md)：S3 对象、字段白名单、缓存、
+  状态与 `alternate-candidates.json` 的详细解释。
+- [Prompt 索引与原文](doc/pipeline-prompts.md)：路由、通用合成、分支指南与审查。
+- [Harbor 交付与差分验证设计](doc/统一Harbor交付与差分验证设计.md)：交付和验收边界。
+- [开发交接](doc/管线开发交接.md)：历史开发状态；其中带日期的结果不是当前
+  生产完成度证明。
+- [交付格式](docs/reference/交付格式.md)：Harbor 题包格式参考。

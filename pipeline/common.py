@@ -75,10 +75,57 @@ def repository_key(value: str | None) -> str:
     return value
 
 
+URL_NOISE = re.compile(r"https?-(?:github|gitlab|bitbucket)-(?:com|org)-", re.I)
+
+
+def repo_short_name(repo: str | None) -> str:
+    """owner-repo, without the hosting URL noise, for stable task names."""
+    value = (repo or "").strip().rstrip("/")
+    value = re.sub(r"^[a-z][a-z0-9+.-]*://", "", value, flags=re.I)
+    value = value.removesuffix(".git")
+    parts = [part for part in value.split("/") if part]
+    if parts and ("." in parts[0] or ":" in parts[0] or "@" in parts[0]):
+        parts = parts[1:]
+    if len(parts) >= 2:
+        if parts[-1].lower() == parts[-2].lower():
+            return parts[-1]
+        return "-".join(parts[-2:])
+    return parts[-1] if parts else ""
+
+
 def task_id(row: dict[str, Any], index: int | None = None) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", str(row["instance_id"]).lower()).strip("-")
+    """Readable task id: CVE + owner-repo, never the full clone URL."""
+    canonical = str(row.get("canonical_id") or str(row["instance_id"]).split("::", 1)[0])
+    short = repo_short_name(row.get("repo"))
+    base = f"{canonical}-{short}" if short else URL_NOISE.sub("-", str(row["instance_id"]))
+    slug = re.sub(r"[^a-z0-9]+", "-", base.lower()).strip("-")
     suffix = f"{index:03d}-" if index is not None else ""
     return f"linux-{suffix}{slug[:100]}"
+
+
+def branch_suffix(branch: str, host_type: str | None) -> str:
+    """Delivery-name suffix that makes the selected branch explicit."""
+    if branch == "SVC-EXPLOIT":
+        return "svc-exploit-" + re.sub(r"[^a-z0-9]+", "-", (host_type or "unknown").lower()).strip("-")
+    if branch == "FILE-EXPLOIT":
+        return "file-exploit"
+    if branch == "FILE-POV":
+        return "file-pov"
+    return re.sub(r"[^a-z0-9]+", "-", branch.lower()).strip("-") or "unknown"
+
+
+def export_task_id(task_id: str, branch: str, host_type: str | None) -> str:
+    """Strip legacy URL noise and append the branch/host_type suffix."""
+    base = URL_NOISE.sub("-", task_id.lower())
+    base = re.sub(r"[^a-z0-9-]+", "-", base)
+    base = re.sub(r"-{2,}", "-", base).strip("-")
+    suffix = branch_suffix(branch, host_type)
+    if not base.endswith("-" + suffix):
+        base = f"{base}-{suffix}"
+    # Harbor ids are limited to 160 characters; the suffix must survive.
+    if len(base) > 160:
+        base = base[:160 - len(suffix) - 1].rstrip("-") + "-" + suffix
+    return base
 
 
 def inventory(root: Path, exclude: set[str] | None = None) -> dict[str, Any]:

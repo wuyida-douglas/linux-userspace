@@ -45,10 +45,11 @@ class PublicContractTests(unittest.TestCase):
             validate_public_services(value)
 
     def test_prompt_discloses_host_port_and_hard_contract(self):
-        combined = SYNTHESIZE + REVIEW
+        from pipeline.prompts import BRANCH_GUIDES
+        combined = SYNTHESIZE + REVIEW + "".join(BRANCH_GUIDES.values())
         for text in ("DO NOT add `ports:`", "nonempty and <=16 MiB", "/usr/bin/env",
-                     "0 when the vulnerability effect is present and 1", "0755",
-                     "file_capability_inheritance is unsupported", "runner_network_aliases",
+                     "exit exactly 0 when the vulnerability effect is present and 1", "0755",
+                     "file_capability_inheritance", "runner_network_aliases",
                      "umask 022", "host/external/shared networks"):
             self.assertIn(text, combined)
 
@@ -140,18 +141,20 @@ class PublicContractTests(unittest.TestCase):
                 "fixed_revision": "UNRESOLVED", "recovery_required": True}))
             (task / "result.json").write_text('{"instance_id": "CVE-test::project"}')
             selection = {"instance_id": "CVE-test::project"}
-            args = argparse.Namespace(resume=True, review_delivery=False, continue_synthesis=False,
-                                      workspace_from=None, retry_synthesis=False, route_from=None,
-                                      route_handoff_from=None, route_only=False, handoff_from=None,
-                                      executor="native", model="test", review_turns=1, review_timeout=1,
+            args = argparse.Namespace(resume=True, review_delivery=False, route_from=None,
+                                      route_only=False,
+                                      model="test", review_turns=1, review_timeout=1,
                                       verify_timeout=1, published_root=None)
             called = []
             def review(prompt, workspace, output, **kwargs):
                 contract = json.loads((workspace / "delivery/task.json").read_text())
                 called.append(contract["sidecar_services"])
-                (workspace / "review.json").write_text('{"passed": false, "findings": []}')
+                (workspace / "review.json").write_text(json.dumps({
+                    "passed": False, "findings": [],
+                    "reason": "The test reviewer rejected the delivery.",
+                    "execution_checked": True}))
                 return {"status": "completed"}
-            with patch("pipeline.native_agent.run", side_effect=review):
+            with patch("pipeline.agent.run", side_effect=review):
                 record = run.run_one(task, selection, root, args, {})
             self.assertEqual(called, [["mongo"]], record)
             self.assertEqual(record["failure_class"], "review_rejected", record)
@@ -178,10 +181,9 @@ class FreshWorkspaceTests(unittest.TestCase):
             (task / "input/meta.json").write_text('{"instance_id": "instance"}')
             selection = {"instance_id": "instance"}
             args = argparse.Namespace(
-                resume=False, review_delivery=False, continue_synthesis=False,
-                workspace_from=None, retry_synthesis=False, route_from=None,
-                route_handoff_from=None, route_only=False, handoff_from=None,
-                executor="native", model="test", route_turns=1,
+                resume=False, review_delivery=False, route_from=None,
+                route_only=False,
+                model="test", route_turns=1,
                 route_timeout=1, review_turns=1, review_timeout=1,
                 verify_timeout=1, published_root=None)
             called = []
@@ -190,7 +192,7 @@ class FreshWorkspaceTests(unittest.TestCase):
                 self.assertTrue((workspace / "input/src").is_dir())
                 self.assertTrue((workspace / "NETWORK.md").is_file())
                 return {"status": "completed"}
-            with patch("pipeline.native_agent.run", side_effect=route_agent):
+            with patch("pipeline.agent.run", side_effect=route_agent):
                 record = run.run_one(task, selection, root, args, {})
             self.assertEqual(record["failure_class"], "route_decision_missing", record)
             self.assertEqual(len(called), 1)
@@ -249,35 +251,69 @@ class OracleContractTests(unittest.TestCase):
         self.assertNotIn("triggered", result)
         self.assertEqual(result["ipam_release"], ["10.112.1.0/24"])
 
-    def test_continuation_rejects_an_unrelated_shared_workspace(self):
+    def test_synthesis_reroute_preserves_route_and_stops(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             task = root / "task"
-            (task / "workspace").mkdir(parents=True)
-            (task / "workspace/delivery").mkdir()
-            (task / "workspace/review.json").write_text("{}")
-            (task / "result.json").write_text(json.dumps({"status": "synthesizing"}))
-            (task / "workspace/route.json").write_text(json.dumps({
+            workspace = task / "workspace"
+            (task / "input/src").mkdir(parents=True)
+            (task / "input/meta.json").write_text('{"instance_id": "instance"}')
+            (task / "input/fix.diff").write_text("diff --git a/a b/a\n")
+            route_value = {
                 "instance_id": "instance", "accepted": True,
-                "branch": "FILE-POV", "host_type": None,
+                "branch": "SVC-EXPLOIT", "host_type": "native_service",
                 "recovery_required": True, "fixed_revision": "UNRESOLVED",
-                "entry": "parser input", "oracle": "precise crash",
-                "normal_input": "ordinary file",
-                "branch": None, "reason": "not suitable for this contract test"}))
-            (task / "workspace/input/src").mkdir(parents=True)
-            (task / "synthesis").mkdir()
-            (task / "synthesis/result.json").write_text('{"status": "running"}')
-            args = argparse.Namespace(continue_synthesis=True, route_from=None,
-                                      retry_synthesis=False, workspace_from=root / "workspace",
-                                      only=["task"], resume=False, review_delivery=False,
-                                      route_handoff_from=None, executor="native", results=root,
-                                      route_only=False, max_tokens=4096, model="test",
-                                      review_turns=1, review_timeout=1, max_turns=1,
-                                      timeout=1, route_turns=1, route_timeout=1,
+                "entry": "protocol request", "oracle": "unauthorized effect",
+                "normal_input": "normal request", "reason": "network attack path"}
+            args = argparse.Namespace(resume=False, review_delivery=False, route_from=None,
+                                      route_only=False, model="test",
+                                      max_turns=1, timeout=1,
+                                      route_turns=1, route_timeout=1,
+                                      review_turns=1, review_timeout=1,
                                       verify_timeout=1, published_root=None)
-            result = run.run_one(task, {"instance_id": "instance"}, root, args, {})
-            self.assertEqual(result["status"], "error")
-            self.assertIn("authoritative workspace", result["error"])
+
+            def executor(prompt, current, output, **kwargs):
+                from pipeline.common import write_json
+                if not (current / "route.json").is_file():
+                    write_json(current / "route.json", route_value)
+                    return {"status": "completed"}
+                self.assertIn("Branch guide -- SVC-EXPLOIT", prompt)
+                self.assertNotIn("Branch guide -- FILE-POV", prompt)
+                write_json(current / "reroute-request.json", route_value | {
+                    "branch": "FILE-POV", "host_type": None,
+                    "reason": "Only a file-triggered crash was demonstrated."})
+                return {"status": "completed"}
+
+            with patch.object(run, "agent", unittest.mock.Mock(run=executor)):
+                result = run.run_one(task, {"instance_id": "instance"}, root, args, {})
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["failure_class"], "branch_mismatch")
+            self.assertEqual(json.loads((workspace / "route.json").read_text()), route_value)
+
+    def test_common_synthesis_defers_branch_specific_contracts(self):
+        from pipeline.prompts import BRANCH_GUIDES, SYNTHESIZE
+        for branch_only in ("ASAN_OPTIONS", "public_runner", "reroute-request.json",
+                            'interaction="protocol"', 'interaction="interactive_file"',
+                            'interaction="file_pov"'):
+            self.assertNotIn(branch_only, SYNTHESIZE)
+        self.assertNotIn("SVC-EXPLOIT and FILE-EXPLOIT reference submission", SYNTHESIZE)
+        self.assertIn("ASAN_OPTIONS", BRANCH_GUIDES["FILE-POV"])
+        self.assertIn("public_runner", BRANCH_GUIDES["FILE-POV"])
+        self.assertIn('interaction="protocol"', BRANCH_GUIDES["SVC-EXPLOIT"])
+        self.assertIn('interaction="interactive_file"', BRANCH_GUIDES["FILE-EXPLOIT"])
+        for branch in ("SVC-EXPLOIT", "FILE-EXPLOIT"):
+            guide = BRANCH_GUIDES[branch]
+            self.assertIn('"branch": "FILE-POV"', guide)
+            self.assertIn('"evidence":', guide)
+            self.assertNotIn("SVC guide's exact schema", guide)
+
+    
+    def test_review_requires_an_ordinary_complete_json_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "review.json").write_text('{"passed": false, "findings": []}')
+            with self.assertRaisesRegex(ValueError, "review.json must contain exactly"):
+                run.review(root)
 
     def test_runner_uses_path_lookup_for_portable_python(self):
         differential = self.differential()
