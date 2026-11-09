@@ -183,6 +183,14 @@ def run_bounded(command: str, workspace: Path, timeout: int) -> subprocess.Compl
     # unprivileged runner even when the controller has a restrictive umask.
     wrapper = "umask 022\ntrap 'exit 143' TERM; eval " + shlex.quote(command)
     env = dict(os.environ)
+    # Third-party build scripts run inside model workspaces must never reset
+    # the pipeline repository merely because it is an ancestor of their cwd.
+    # Preserve authentication and other settings, but quarantine repository
+    # selection variables inherited from an outer Git hook or automation.
+    for variable in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+                     "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_PREFIX"):
+        env.pop(variable, None)
+    env["GIT_CEILING_DIRECTORIES"] = str(workspace.resolve().parent)
     config = Path(__file__).resolve().parents[1] / "config"
     # The PT proxy credential stays in the user's 0600 config file. Source it
     # inside each bounded shell so a long-lived controller needs no restart.

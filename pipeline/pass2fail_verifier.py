@@ -604,15 +604,14 @@ sys.exit(result["returncode"])
                 record["submission_result"] = json.loads(evidence.read_text(encoding="utf-8"))
             if self.contract["branch"] != "FILE-POV" \
                     and record["submission_result"].get("returncode") != 0:
-                if self.contract["branch"] == "FILE-EXPLOIT" \
+                if self.contract["branch"] in {"FILE-EXPLOIT", "SVC-EXPLOIT"} \
                         and record["submission_result"].get("returncode") == 1:
-                    # The published FILE-EXPLOIT contract specifies only that
-                    # a vulnerability effect occurred; a patched exploit may
-                    # explicitly return 1. Always execute the target oracle.
+                    # A reference exploit may explicitly reject a patched target
+                    # with exit 1. Only the target oracle decides effect absence.
                     pass
                 else:
-                    # Protocol services must complete their exchange cleanly;
-                    # infrastructure failures never become null/oracle passes.
+                    # Other nonzero exits, including protocol errors, must not
+                    # become an oracle absence verdict.
                     record["error_stage"] = "submission"
                     record["error"] = "submission must exit 0 after the protocol exchange"
                     return record

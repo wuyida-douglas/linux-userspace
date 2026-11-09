@@ -45,6 +45,15 @@ def _docker_networks(docker: str) -> list[ipaddress.IPv4Network]:
         [docker, "network", "inspect", *ids, "--format",
          "{{range .IPAM.Config}}{{.Subnet}} {{end}}"],
         capture_output=True, text=True, timeout=60)
+    if inspected.returncode and " not found" in inspected.stderr:
+        # The combined inspect may name one vanished network. Retry only the
+        # remaining IDs; other daemon/permission errors must stay visible.
+        remaining = [network_id for network_id in ids if network_id not in inspected.stderr]
+        inspected = subprocess.run(
+            [docker, "network", "inspect", *remaining, "--format",
+             "{{range .IPAM.Config}}{{.Subnet}} {{end}}"],
+            capture_output=True, text=True, timeout=60) if remaining else subprocess.CompletedProcess(
+                inspected.args, 0, "", "")
     if inspected.returncode:
         raise RuntimeError("cannot inspect Docker subnets for IPAM allocation: " + inspected.stderr[-1000:])
     networks = []

@@ -23,6 +23,39 @@ from .common import ROOT, inventory, load_env, read_jsonl, timestamp, write_json
 from .run import route as validate_route, reported_published_root
 
 
+def gold_writable_path_evidence(root: Path, task: str, record: dict) -> str | None:
+    """Identify only a proven reference-submission path/protocol defect."""
+    def inspect(harbor_root: Path, harbor: dict) -> str | None:
+        report = (harbor.get("differential_from_final_bundle") or {}).get("report") or {}
+        if ((harbor.get("gold") or {}).get("reward") != 0.0
+                or report.get("status") not in {"this_bug", "infra_error"}
+                or (report.get("vulnerable") or {}).get("oracle", {}).get("returncode") != 1
+                or (report.get("fixed") or {}).get("oracle", {}).get("returncode") != 0):
+            return None
+        paths = sorted(harbor_root.glob("jobs/*gold/*/verifier/evidence.json"))
+        evidence = load(paths[-1] if paths else Path("/nonexistent"), {})
+        output = (((evidence.get("vulnerable") or {}).get("submission_result") or {})
+                  .get("output", ""))
+        fixed_output = (((report.get("fixed") or {}).get("submission_result") or {})
+                        .get("output", ""))
+        if "Read-only file system" in output and "Read-only file system" in fixed_output:
+            return "writable_gold_log_path"
+        if "Permission denied" in output:
+            return "writable_gold_submission_directory"
+        return None
+    defect = inspect(root / task / "harbor", record.get("harbor") or {})
+    if defect is not None:
+        return defect
+    # A transient later error must not erase a concrete archived delivery defect.
+    archives = sorted((root / task / "infrastructure-attempts").glob("*/result.json"),
+                      key=lambda path: path.stat().st_mtime_ns)
+    for path in reversed(archives):
+        defect = inspect(path.parent, load(path, {}).get("harbor") or {})
+        if defect is not None:
+            return defect
+    return None
+
+
 def atomic_json(path: Path, value: dict) -> None:
     temporary = path.with_name(path.name + f".{os.getpid()}.{threading.get_ident()}.tmp")
     write_json(temporary, value)
@@ -155,7 +188,8 @@ def prioritize_candidates(candidates: list[tuple], children: dict,
         order[candidate[0]]))
 
 
-def carry_workspaces(sources: list[Path], results: Path, selected_ids: set[str] | None) -> set[str]:
+def carry_workspaces(sources: list[Path], results: Path, selected_ids: set[str] | None,
+                     recovery_plans: dict[str, dict] | None = None) -> set[str]:
     """Carry frozen evidence into a new sample; never mutate the old attempt.
 
     The carry manifest is its allowlist: --only may narrow it, never add an
@@ -167,15 +201,31 @@ def carry_workspaces(sources: list[Path], results: Path, selected_ids: set[str] 
         task = source.resolve().name
         if selected_ids is not None and task not in selected_ids:
             raise ValueError(f"carried task is not in --only: {task}")
-        if not (source / "result.json").is_file() or not (source / "workspace/route.json").is_file():
-            raise ValueError(f"carried task lacks a frozen result and route: {source}")
-        if not (source / "synthesis/result.json").is_file():
+        plan = (recovery_plans or {}).get(task, {})
+        mode = plan.get("mode")
+        if recovery_plans is not None:
+            if plan.get("schema_version") != 1 or plan.get("task_id") != task \
+                    or mode not in {"route", "route_handoff", "synthesis", "review", "harbor"}:
+                raise ValueError(f"invalid carried recovery plan for {task}")
+            trajectory = plan.get("trajectory")
+            if mode == "route_handoff" and (
+                    not isinstance(trajectory, str) or Path(trajectory).is_absolute()
+                    or ".." in Path(trajectory).parts or not (source / trajectory).is_file()):
+                raise ValueError(f"carried task lacks route handoff evidence: {source}")
+        if not (source / "result.json").is_file() or not (
+                (source / "workspace/route.json").is_file() or mode == "route_handoff"):
+            raise ValueError(f"carried task lacks a frozen result and frozen route: {source}")
+        if not (source / "synthesis/result.json").is_file() and mode not in {"route", "route_handoff"}:
             raise ValueError(f"carried task lacks synthesis evidence: {source}")
-        if (results / task).exists():
+        destination = results / task
+        staged_plan = load(destination / "carry-recovery.json", {}) if destination.is_dir() else {}
+        if destination.exists() and (recovery_plans is None or staged_plan != plan):
             raise ValueError(f"refusing to overwrite an existing task during carry: {task}")
         # Copy rather than symlink: reviewer cleanup, archived Harbor output,
         # or a delivery repair must never alter the original evidence tree.
-        shutil.copytree(source, results / task, symlinks=True)
+        shutil.copytree(source, destination, symlinks=True, dirs_exist_ok=bool(staged_plan))
+        if recovery_plans is not None:
+            atomic_json(destination / "carry-recovery.json", plan)
         source_result = load(source / "result.json", {})
         source_route = load(source / "workspace/route.json", {})
         instance_id = source_result.get("instance_id") or source_route.get("instance_id")
@@ -197,9 +247,13 @@ def carry_workspaces(sources: list[Path], results: Path, selected_ids: set[str] 
                     "recovery_merged", "recovery_merged_at", "retry_count", "retry_reason",
                     "previous_status", "review_incomplete_retry_count", "delivery_retry_count",
                     "harbor_retry_count", "harbor_exception_retry_count", "review_retry_count",
-                    "retry_blocked", "acceptance_resume_requested", "manual_correction"):
+                    "retry_blocked", "acceptance_resume_requested", "manual_correction",
+                    "route_budget_recovery_count", "carry_recovery_dispatched", "bounded_recovery_launched",
+                    "review_launched", "delivery_launched", "harbor_launched", "final_status"):
             child.pop(key, None)
         child["carried_recovery"] = True
+        if mode == "route_handoff":
+            child["route_budget_recovery_count"] = 1
         # A carried result can predate the identity field. Reconcile its
         # verified route identity before checking the explicit recovery plan.
         if not source_result.get("instance_id"):
@@ -296,6 +350,12 @@ def main() -> int:
             parser.error("the batch receipt exceeds the fresh-task limit")
     carried_ids = carry_workspaces(args.carry_results or [], args.results, selected_ids)
     if carried_ids:
+        for task in carried_ids:
+            plan = load(args.results / task / "carry-recovery.json", {})
+            if plan.get("mode") == "route_handoff":
+                state = load(args.results / "supervisor-state.json", {"children": {}})
+                state.setdefault("children", {}).setdefault(task, {})["route_budget_recovery_count"] = 1
+                atomic_json(args.results / "supervisor-state.json", state)
         if len(args.carry_results) != len(carried_ids):
             raise ValueError("carry-results must identify distinct tasks")
         (args.results / "carry-manifest.json").write_text(json.dumps({
@@ -360,7 +420,8 @@ def main() -> int:
         child["terminal_observation_only"] = True
         if load(args.results / task / "result.json", {}).get("status") in {"failed", "rejected", "error"}:
             child["observation_final_status"] = load(args.results / task / "result.json", {})["status"]
-    completed = set(state.get("scheduled", []))
+    completed = {task for task in state.get("scheduled", [])
+                 if not children.get(task, {}).get("carried_recovery")}
     # A supervisor is disposable; workers are not. Reconcile all command lines
     # before scheduling so a restart never creates duplicate model sessions.
     process_rows = subprocess.run(["ps", "-eo", "pid=,ppid=,comm=,args="], capture_output=True,
@@ -861,12 +922,24 @@ def main() -> int:
                     continue
         for row in selected:
             task = row["task_id"]
+            if children.get(task, {}).get("carried_recovery"):
+                completed.discard(task)
+            if task in completed and (args.results / task / "carry-recovery.json").is_file():
+                # An explicit same-instance carry is a new admitted recovery,
+                # not the already-finished original attempt.
+                child = children.setdefault(task, {})
+                child["carried_recovery"] = True
+                child.pop("pid", None)
+                completed.discard(task)
             if children.get(task, {}).get("terminal_observation_only") is True:
                 # An accidentally launched duplicate is retained as evidence,
                 # but gets no additional route, synthesis, review or repair.
                 child = children.setdefault(task, {})
                 record = load(args.results / task / "result.json", {})
                 child["observation_final_status"] = record.get("status")
+                if child.get("pid") and not worker_alive(child.get("pid")):
+                    child["pid"] = None
+                    child["external_worker"] = False
                 completed.add(task)
                 continue
             if task in shared_recovery_tasks:
@@ -919,6 +992,23 @@ def main() -> int:
             if child.get("retry_blocked") == "worker_start_import":
                 completed.add(task)
                 continue
+            if child.get("retry_reason") == "bounded_recovery" \
+                    and child.get("bounded_recovery_launched") is True \
+                    and record.get("status") in {"failed", "error"}:
+                children[task].update(retry_blocked="bounded_recovery_already_launched",
+                                      retry_reason=None)
+                completed.add(task)
+                continue
+            if child.get("retry_reason") == "review_incomplete" \
+                    and child.get("review_launched") is True \
+                    and child.get("final_status") in {"passed", "failed", "error"} \
+                    and record.get("status") in {"passed", "failed", "error"}:
+                review = load(args.results / task / "workspace/review.json", {})
+                if review.get("passed") is not False:
+                    children[task].update(retry_blocked="review_attempt_completed",
+                                          retry_reason=None, review_incomplete_retry_count=1)
+                    completed.add(task)
+                    continue
             route_file = args.results / task / "workspace/route.json"
             delivery_dir = args.results / task / "workspace/delivery"
             synthesis = load(args.results / task / "synthesis/result.json", {})
@@ -1078,7 +1168,8 @@ def main() -> int:
                     and not (args.results / task / "harbor").is_dir()
                     and not record.get("harbor")
                     and not worker_alive(child.get("pid"))
-                    and child.get("retry_reason") in {"harbor_infrastructure", "review_infrastructure"}):
+                    and child.get("retry_reason") in {"harbor_infrastructure", "review_infrastructure"}
+                    and not child.get("carried_recovery")):
                 # The old Harbor tree has already been archived for this exact
                 # infrastructure retry. Never reinterpret the preserved failed
                 # result as a fresh contract repair or return it as terminal.
@@ -1156,14 +1247,16 @@ def main() -> int:
             if child.get("terminal_observation_only"):
                 completed.add(task)
                 continue
-            if (not (args.sample / "tasks" / task / "input/manifest.json").is_file()
+            download_error = next((entry for entry in
+                                   load(args.sample / "download-report.json", {}).get("tasks", [])
+                                   if entry.get("task_id") == task and entry.get("status") == "error"), None)
+            if (download_error is not None
+                    and not (args.sample / "tasks" / task / "input/manifest.json").is_file()
                     and not (args.results / task / "workspace/delivery").is_dir()
                     and not worker_alive(child.get("pid"))):
                 missing = load(args.results / task / "result.json", {})
                 if missing.get("failure_class") != "input_unavailable":
-                    download = next((entry for entry in
-                                     load(args.sample / "download-report.json", {}).get("tasks", [])
-                                     if entry.get("task_id") == task), {})
+                    download = download_error
                     atomic_json(args.results / task / "result.json", {
                         "task_id": task, "instance_id": row["instance_id"],
                         "status": "error", "failure_class": "input_unavailable",
@@ -1191,6 +1284,8 @@ def main() -> int:
                     and (differential.get("report") or {}).get("status") in
                     {"infra_error", "patch_failed", "other_bug"}))
             exhausted_review = load(args.results / task / "review/result.json", {}).get("status") == "max_turns"
+            pending_infrastructure = pending_infrastructure and gold_writable_path_evidence(
+                args.results, task, record) is None
             pending_review_incomplete = (
                 record.get("status") == "error" and not (args.results / task / "workspace/review.json").is_file()
                 and (synthesis.get("status") == "completed" or exhausted_review)
@@ -1374,6 +1469,14 @@ def main() -> int:
                                    "findings": [{"severity": "major",
                                                  "evidence": (differential["report"]["fixed"].get("submission_result", {}).get("output", "")[-4000:])}],
                                    "reason": "Gold submission must exit 0 after expected fixed-target rejection; only the target oracle decides vulnerability absence."}
+            gold_path_defect = gold_writable_path_evidence(args.results, task, record)
+            if (gold_path_defect is not None
+                    and load(args.results / task / "workspace/review.json", {}).get("passed") is True
+                    and child.get("delivery_retry_count", 0) < 1):
+                retry_reason = "delivery_review_repair"
+                review_findings = {"passed": False, "execution_checked": True,
+                                   "findings": [{"severity": "major", "evidence": gold_path_defect}],
+                                   "reason": "Write reference evidence only to a writable submitted directory. The protocol client must exit 0 on an expected fixed-target rejection; the independent target oracle decides vulnerability absence."}
             if retry_reason == "harbor_infrastructure" and (child.get("harbor_retry_count", 0) >= 1
                                             and child.get("harbor_launched")):
                 retry_reason = None
@@ -1439,7 +1542,7 @@ def main() -> int:
                     retry_reason = "review_infrastructure"
                     record["error"] = "infrastructure: Harbor oracle could not traverse the exported solution directory"
                     atomic_json(args.results / task / "result.json", record)
-                else:
+                elif gold_path_defect is None:
                     completed.add(task)
                     continue
             elif (record.get("status") == "error"
@@ -1724,6 +1827,8 @@ def main() -> int:
                        if child_state.get("route_handoff") and not resume_synthesis else None)
             carry_plan = load(args.results / task / "carry-recovery.json", {}) \
                 if child_state.get("retry_reason", "").startswith("carry_") else {}
+            if carry_plan.get("mode") == "route":
+                route = args.results / task / "workspace/route.json"
             if carry_plan.get("mode") == "route_handoff":
                 handoff = args.results / task / carry_plan["trajectory"]
                 if not handoff.is_file():
@@ -1780,7 +1885,7 @@ def main() -> int:
         snapshot = {"updated_at": timestamp(), "complete_inputs": len(selected),
                     "active": sorted(active), "external_active": sorted(external),
                     "batch": {"number": batch_number, "members": sorted(
-                        accountable_ids or [], key=batch_positions.__getitem__),
+                        accountable_ids or [], key=lambda task: (batch_positions.get(task, len(batch_positions)), task)),
                               "observed_only": sorted(observed_ids)},
                     "worker_count": len(active) + external_running, "counts": statuses,
                     "turns": {task: latest_turn(Path(children.get(task, {}).get("worker_results", args.results)) / task / "synthesis/trajectory.jsonl")
