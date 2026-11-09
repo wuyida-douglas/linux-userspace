@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 import unittest.mock
@@ -109,7 +110,10 @@ class BatchAttributionTests(unittest.TestCase):
         (destination / "carry-provenance.json").write_text(json.dumps({
             "source": str(source.resolve()), "instance_id": "CVE-test::project"}))
         (destination / "carry-recovery.json").write_text('{"mode": "synthesis"}')
-        adopt_existing_carries(results, {self.task.name: source})
+        previous = Path.cwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, previous)
+        adopt_existing_carries(results, {self.task.name: Path("source") / self.task.name})
         self.assertTrue(destination.exists())
         (destination / "carry-provenance.json").write_text(json.dumps({
             "source": str(source.resolve()), "instance_id": "different"}))

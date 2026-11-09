@@ -392,7 +392,7 @@ def main() -> int:
             fresh = [row["task_id"] for row in selected if row["task_id"] not in consumed][:args.batch_size]
             if not fresh:
                 break
-            carried = {task: Path(source) for task, source in previous.get("carry_sources", {}).items()}
+            carried = {task: Path(source).resolve() for task, source in previous.get("carry_sources", {}).items()}
             for task, source in carried.items():
                 plan = previous.get("recovery_plans", {}).get(task)
                 if not plan:
@@ -409,7 +409,7 @@ def main() -> int:
                 receipt = load(frozen_selection, {})
                 validate_batch_selection(receipt, number, consumed)
                 fresh = list(receipt["fresh"])
-                carried = {task: Path(source) for task, source in previous.get("carry_sources", {}).items()
+                carried = {task: Path(source).resolve() for task, source in previous.get("carry_sources", {}).items()
                            if task in set(receipt.get("carried", []))}
             else:
                 if results.exists():
