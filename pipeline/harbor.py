@@ -975,10 +975,10 @@ def accept(workspace: Path, output: Path, task_id: str, route: dict[str, Any],
         shutil.copytree(profile, accept_profile)
         (accept_profile / "instruction.md").write_text(
             "# Reference acceptance\n\n"
-            f"The reference submission is already present read-only at "
-            f"`/workspace/{submission}`. Do not modify it, do not run task "
-            "work, and do not start any service. Reply with one line "
-            "confirming the file is present, then end.\n",
+            f"The reference submission is at `/opt/reference/{submission}` "
+            f"(read-only). Copy it to `/workspace/{submission}` with `cp`, do "
+            "not modify its contents, and do not run task work or start any "
+            "service. Reply with one line and end.\n",
             encoding="utf-8")
         reference = accept_profile / "tests/private" / f"reference_{submission}"
         if not reference.is_file():
@@ -988,7 +988,7 @@ def accept(workspace: Path, output: Path, task_id: str, route: dict[str, Any],
             {"type": "bind", "source": claude_bin,
              "target": "/usr/local/bin/claude", "read_only": True},
             {"type": "bind", "source": str(reference),
-             "target": f"/workspace/{submission}", "read_only": True},
+             "target": f"/opt/reference/{submission}", "read_only": True},
         ]
         # Start from the sealed writable binds. The first Agent run may
         # write through a bind; restore the seal before the second run, then
