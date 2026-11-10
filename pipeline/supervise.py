@@ -311,7 +311,7 @@ def launch(task: str, sample: Path, results: Path,
     """Launch one new task or resume only its frozen route/synthesis/review tail."""
     command = [sys.executable, "-m", "pipeline.run", "--sample", str(sample),
                "--results", str(results), "--only", task, "--concurrency", str(concurrency),
-               "--max-turns", str(turns), "--route-turns", "45",
+               "--max-turns", str(turns), "--route-turns", "60",
                "--timeout", str(timeout), "--review-turns", str(review_turns),
                "--review-timeout", str(review_timeout), "--verify-timeout", str(verify_timeout)]
     if published_root is not None:

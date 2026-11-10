@@ -499,7 +499,7 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=18000)
     parser.add_argument("--max-turns", type=int, default=400)
     parser.add_argument("--route-timeout", type=int, default=1800)
-    parser.add_argument("--route-turns", type=int, default=45)
+    parser.add_argument("--route-turns", type=int, default=60)
     parser.add_argument("--review-timeout", type=int, default=3600)
     parser.add_argument("--review-turns", type=int, default=100)
     parser.add_argument("--verify-timeout", type=int, default=3600)
