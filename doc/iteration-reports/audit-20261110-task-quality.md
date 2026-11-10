@@ -14,6 +14,20 @@
 2. **pass2fail 是主判据。** 非 CVE 效果如果在 fixed 上也触发，会被 fixed phase 拒绝；
    只有三类例外需要管线额外处理（§2）。
 3. 不记录单题包装问题；只保留会影响**一批题**或**管线正确性**的改动。
+4. **Review 必须检查可解性。** verifier 好不代表题可做；agent 只有 `main` + `instruction.md`。
+   `main` 必须有 instruction 声称的源码/工具；SVC 必须能从 main 访问 `client:PORT`。
+   否则 review 拒绝。能在 review 检查的，不写代码；能改 prompt 的，不改代码。
+
+**修复位置**
+
+| 项 | 位置 |
+|---|---|
+| §1 自洽 | SYNTHESIZE + REVIEW prompt |
+| §2 oracle 因果性 | SYNTHESIZE + REVIEW prompt |
+| §3 导出 | 代码（`harbor.py` publish/export） |
+| §4 rename 路径 | 代码（`rename_results.py`） |
+| §5 可解性 | REVIEW prompt（不用 acceptance 脚本） |
+| §6 小项 | contract/review prompt |
 
 ---
 
@@ -34,7 +48,7 @@
   v4.3.3 的 CHANGELOG 才把 #530 移过去；真正改 `tree.c` 的是 `53919090`）。
 - 所以不要 route 阶段拒掉候选；要在 **synthesis/review** 保证自洽。
 
-**管线改动**
+**管线改动（SYNTHESIZE + REVIEW prompt，不改代码）**
 
 - synthesis：
   - 如果 supplied `fix.diff` 没有触达被演示的文件/函数，去 upstream history 恢复真正
@@ -62,6 +76,8 @@
 如果 oracle 接受一个非 CVE 效果，而 patch 没修它，那么 fixed phase 也会触发，
 `fixed.triggered=true`，reward 0。**所以 pass2fail 本身挡住了大多数“任意 crash/500”。**
 只有下面三类例外需要管线额外处理。
+
+**修复位置：SYNTHESIZE + REVIEW prompt，不改代码。**
 
 ### 2.1 oracle 自证（vulnerable 侧信号不是提交物造成的）
 
@@ -141,7 +157,7 @@
 - compose 不要注入代理变量；最终交付镜像不要带代理；
 - 共享 agent 镜像放 `shared-images/`，低频镜像放任务 `images/`，不要打成一个巨包。
 
-### 3.2 当前差距（需要改管线）
+### 3.2 当前差距（这里需要改代码）
 
 | 差距 | 证据 | 改动 |
 |---|---|---|
@@ -163,6 +179,8 @@
 
 ## 4. `rename_results.py`：自动改名后的路径过期
 
+**这里需要改代码。**
+
 **它是什么**
 
 - 不是手工脚本；是 `pipeline/supervise.py:142` 在 batch 结束后自动调用的改名实现。
@@ -182,15 +200,30 @@
 
 ---
 
-## 5. main 到 target 的可见性（解释，不是问题）
+## 5. Review 必须检查可解性（prompt，不是代码）
 
-- **FILE-POV**：`main` 里有 target 的源码（例如 `linux041-im6-pow-main:v2` 的
-  `/opt/ImageMagick6-src`）；target 是一次性 CLI，没有 listener。agent 读源码、
-  构造 `input.bin`、提交。不是盲做，只是没有 live target shell。
-- **SVC**：`main` 和 `client` 在同一 compose 网络；instruction 写 `client:5000`
-  （`cve-2026-48544`），agent 直接 HTTP 打 target，和原 exploit 管线一样。
-- target 的文件系统不挂进 `main` 是有意隔离；gold 在 target 镜像里，agent 看不到。
-  所以这不是 agent 做题时的 hack 风险，而是导出产物卫生（§3.2）。
+**原则**
+
+verifier 设计得再好，如果 agent 的 `main` 里没有源码/工具、或者 SVC 的 target
+从 main 不可达，题就是不可做的；review 必须 `passed=false`。
+
+**review 怎么查**
+
+- **FILE-POV**：agent 只有 main + instruction；target 是一次性 runner，没有 live shell。
+  - `docker run --rm --network none <main> sh -c 'test -d <instruction 声称的源码路径>; command -v <工具>'`
+  - 如果 instruction 说“源码在 `/opt/...-src`”，main 里必须真的有；否则 reject。
+  - 不要求 target 可交互；要求 main 有构造输入所需的源码/分析工具。
+- **SVC**：main 必须能访问 target 的公共协议。
+  - 启动 public Compose，从 main 执行 `curl client:PORT/...` 或等价协议探测；
+  - instruction 必须写清楚 `client:PORT`；
+  - 如果 main 打不到 target，或 instruction 的 endpoint 不对，reject。
+- 任何“只能靠 host-only/private/未说明材料才能解”的题，reject。
+- review 可以启动 public Compose 做 main→client 探测；不要跑 private differential。
+
+**为什么放在 review**
+
+- 这是“题目是否可解”的判断，不是自动脚本能可靠判断的；
+- 不需要改 acceptance 代码；改 REVIEW prompt 即可。
 
 ---
 
