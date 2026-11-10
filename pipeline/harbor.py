@@ -963,13 +963,11 @@ def accept(workspace: Path, output: Path, task_id: str, route: dict[str, Any],
         load_archives(output / "bundle/shared-images")
         jobs = harbor_jobs or output / "jobs"
         name = re.sub(r"[^a-z0-9-]+", "-", delivery_id)[:90]
-        profile = bundle / "harbor-runtime-profile"
+        profile = (bundle / "harbor-runtime-profile").resolve()
         submission = contract["submission_mode"]
-        # Acceptance is a verifier check, not a solving run: the reference
-        # submission is already mounted read-only at /workspace/<submission>.
-        # Give the agent an explicit no-op prompt so it does not burn turns
-        # trying to solve the task and exit nonzero at max-turns.
-        accept_profile = output / "accept-profile"
+        # Harbor resolves bind sources from its own cwd, so every mount source
+        # must be absolute; a relative source silently becomes an empty dir.
+        accept_profile = (output / "accept-profile").resolve()
         if accept_profile.exists():
             shutil.rmtree(accept_profile)
         shutil.copytree(profile, accept_profile)
