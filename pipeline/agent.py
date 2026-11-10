@@ -54,14 +54,18 @@ def workspace_environment(workspace: Path, base: dict[str, str] | None = None) -
 
 def command(prompt: str, model: str, max_turns: int, network: Path,
             settings: Path | None = None, debug_file: Path | None = None) -> list[str]:
+    # The CLI runs with cwd=workspace, so every path argument must be absolute.
+    # A relative --settings otherwise resolves under workspace/results/... and
+    # Claude Code exits with "Settings file not found".
+    debug = Path(debug_file or "cli-debug.log").resolve()
     argv = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose",
             "--permission-mode", "bypassPermissions", "--setting-sources", "",
             "--strict-mcp-config", "--mcp-config", EMPTY_MCP,
             "--permission-prompts", "none", "--max-turns", str(max_turns),
-            "--model", model, "--debug-file", str(debug_file or "cli-debug.log"),
-            "--plugin-dir", str(network)]
+            "--model", model, "--debug-file", str(debug),
+            "--plugin-dir", str(Path(network).resolve())]
     if settings is not None:
-        argv += ["--settings", str(settings)]
+        argv += ["--settings", str(Path(settings).resolve())]
     return argv
 
 
@@ -456,6 +460,11 @@ def run(prompt: str, workspace: Path, output: Path, *, model: str,
     executable = os.environ.get("CLAUDE_BIN") or shutil.which("claude")
     if not executable or not Path(executable).is_file():
         raise RuntimeError("Claude Code is not installed; install version 2.1.228 or set CLAUDE_BIN")
+    # cwd=workspace for the CLI; keep all stage paths absolute so --settings,
+    # --debug-file, CLAUDE_CONFIG_DIR and HOME cannot be re-rooted under it.
+    workspace = workspace.resolve()
+    output = output.resolve()
+    network = Path(network).resolve()
     output.mkdir(parents=True, exist_ok=True)
     # Keep the exact initial prompt for SFT/reproduction. It contains task
     # evidence, never credentials.
