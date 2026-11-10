@@ -63,6 +63,15 @@ def docker_path() -> str:
     raise FileNotFoundError("host Docker CLI is required by the separate verifier")
 
 
+def _as_text(value: Any) -> str:
+    """TimeoutExpired carries bytes even when subprocess.run(text=True)."""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return str(value)
+
+
 def bounded_run(argv: list[str], *, cwd: Path | None = None, timeout: int = 600,
                 env: dict[str, str] | None = None) -> dict[str, Any]:
     started = time.monotonic()
@@ -72,7 +81,7 @@ def bounded_run(argv: list[str], *, cwd: Path | None = None, timeout: int = 600,
         output = (cp.stdout + cp.stderr)[-MAX_EVIDENCE:]
         code = cp.returncode
     except subprocess.TimeoutExpired as exc:
-        output = ((exc.stdout or "") + (exc.stderr or ""))[-MAX_EVIDENCE:]
+        output = (_as_text(exc.stdout) + _as_text(exc.stderr))[-MAX_EVIDENCE:]
         code = 124
     except Exception as exc:
         output, code = (f"{type(exc).__name__}: {exc}\n"
