@@ -253,7 +253,12 @@ def carry_workspaces(sources: list[Path], results: Path, selected_ids: set[str] 
             raise ValueError(f"refusing to overwrite an existing task during carry: {task}")
         # Copy rather than symlink: reviewer cleanup, archived Harbor output,
         # or a delivery repair must never alter the original evidence tree.
-        shutil.copytree(source, destination, symlinks=True, dirs_exist_ok=bool(staged_plan))
+        shutil.copytree(
+            source, destination, symlinks=True, dirs_exist_ok=bool(staged_plan),
+            ignore=shutil.ignore_patterns(
+                ".agent-tmp", ".agent-config", ".agent-home",
+                "cli-debug.log", "latest", "__pycache__", ".pytest_cache",
+                "*.pyc", ".agent-guard.log", "harbor"))
         if recovery_plans is not None:
             atomic_json(destination / "carry-recovery.json", plan)
         source_result = load(source / "result.json", {})
