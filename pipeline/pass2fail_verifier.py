@@ -23,6 +23,15 @@ from typing import Any
 
 MAX_SUBMISSION = 16 * 1024 * 1024
 MAX_EVIDENCE = 64 * 1024
+# These statuses mean grading did not complete (or the task itself is broken),
+# not that the agent submitted a wrong answer. Harbor must mark the trial
+# failed without a reward; writing 0 would turn an infrastructure error into a
+# negative training sample.
+NON_GRADING_STATUSES = {"infra_error", "target_unhealthy", "patch_failed", "patched_down"}
+
+
+class VerifierInfraError(RuntimeError):
+    """Grading could not produce a trustworthy 0/1 verdict."""
 FORBIDDEN_COMPOSE_KEYS = {"build", "privileged", "pid", "network_mode", "cap_add",
                           "cap_drop", "devices", "security_opt", "cgroup_parent", "ipc", "uts", "container_name"}
 COMPOSE_ENV = {
@@ -173,7 +182,11 @@ class Differential:
         uid, gid = int(parts[0]), int(parts[1] if len(parts) > 1 else parts[0])
         if not (0 <= uid < 65536 and 0 <= gid < 65536):
             raise ValueError("private target uid/gid is outside the Linux range")
-        with tarfile.open(self.work / "private-upload.tar", "w") as archive:
+        # GNU format avoids PAX extended headers: some target images ship
+        # BusyBox tar, which rejects Python's default PAX archive with
+        # "This does not look like a tar archive".
+        with tarfile.open(self.work / "private-upload.tar", "w",
+                          format=tarfile.GNU_FORMAT) as archive:
             for source in sorted(self.private.rglob("*")):
                 relative = source.relative_to(self.private)
                 info = archive.gettarinfo(str(source), arcname=str(relative))
@@ -187,26 +200,54 @@ class Differential:
                         archive.addfile(info, stream)
                 else:
                     archive.addfile(info)
-        with (self.work / "private-upload.tar").open("rb") as stream:
-            argv = [self.docker, "compose", "--project-name", project,
-                    "--project-directory", str(self.environment),
-                    "-f", str(self.environment / "docker-compose.yaml"),
-                    "exec", "-T", "--user", identity, "client", "sh", "-c",
-                    "mkdir -p /private && tar -xf - -C /private && chmod 700 /private"]
-            started = time.monotonic()
-            try:
-                cp = subprocess.run(argv, cwd=self.environment, env=COMPOSE_ENV, stdin=stream,
-                                    capture_output=True, text=True, errors="replace", timeout=120)
-                code, output = cp.returncode, (cp.stdout + cp.stderr)[-MAX_EVIDENCE:]
-            except subprocess.TimeoutExpired as exc:
-                output = ((exc.stdout or "") + (exc.stderr or ""))[-MAX_EVIDENCE:]
-                code = 124
-        return {"argv": argv[:-1] + ["<private tar>"], "returncode": code,
+        # Do not pipe the archive through `docker compose exec` stdin: the
+        # docker-group refresh wrapper can consume stdin before the exec, and
+        # the client then sees an empty stream. Copy the tar as a file, then
+        # extract it inside the target.
+        archive = self.work / "private-upload.tar"
+        started = time.monotonic()
+        copied = self.compose(project, "cp", str(archive),
+                              "client:/tmp/private-upload.tar", timeout=120)
+        if copied["returncode"]:
+            return {"argv": copied["argv"], "returncode": copied["returncode"],
+                    "output": copied["output"], "elapsed_sec": round(time.monotonic() - started, 2)}
+        executed = self.compose(
+            project, "exec", "-T", "--user", identity, "client", "sh", "-c",
+            "mkdir -p /private && tar -xf /tmp/private-upload.tar -C /private "
+            "&& chmod 700 /private && rm -f /tmp/private-upload.tar", timeout=120)
+        output = (copied["output"] + executed["output"])[-MAX_EVIDENCE:]
+        return {"argv": executed["argv"], "returncode": executed["returncode"],
                 "output": output, "elapsed_sec": round(time.monotonic() - started, 2)}
+
+    def _pristine_helper(self):
+        import importlib.util
+        path = Path(__file__).with_name("pristine_binds.py")
+        if not path.is_file():
+            return None
+        name = "_linux_userspace_pristine_" + hashlib.sha256(str(path.resolve()).encode()).hexdigest()[:20]
+        if name in sys.modules:
+            return sys.modules[name]
+        spec = importlib.util.spec_from_file_location(name, path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load pristine bind helper: {path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    def restore_pristine_binds(self) -> None:
+        task_dir = getattr(self, "task_dir", None)
+        environment = getattr(self, "environment", None)
+        if task_dir is None or environment is None:
+            return
+        helper = self._pristine_helper()
+        if helper is not None:
+            helper.extract_pristine_binds(task_dir, environment)
 
     def prepare(self) -> None:
         shutil.copytree(self.environment_source, self.environment)
         shutil.copytree(self.private_source, self.private)
+        self.restore_pristine_binds()
         # The shipped reference is reused in vulnerable/fixed jobs; never
         # persist a file with host-only permissions into that source tree.
         reference = self.private / f"reference_{self.contract['submission_mode']}"
@@ -223,8 +264,8 @@ class Differential:
             (self.runner / "run").mkdir(mode=0o755)
             (self.runner / "output").mkdir(mode=0o777)
             # The task healthcheck argv already points to the runner mount.
-            # Wrapping exec /opt/healthcheck/check.sh in another script at that
-            # same path causes self-recursion rather than a protocol probe.
+            # Wrapping exec /healthcheck.sh in another script at that same path
+            # causes self-recursion rather than a protocol probe.
             # Copy only this public normal-function check, never oracle/gold.
             public_health = self.runner / "public_healthcheck.sh"
             health_source = self.private / "healthcheck.sh"
@@ -290,13 +331,9 @@ class Differential:
 set -eu
 mkdir -p /run/pass2fail
 if [ "$1" = health ]; then
-    cp /opt/pass2fail/healthcheck.sh /private/healthcheck.sh
-    chmod 700 /private /private/healthcheck.sh
-    exec /private/healthcheck.sh
+    exec /healthcheck.sh
 fi
-cp /opt/pass2fail/healthcheck.sh /opt/pass2fail/public_runner.sh /private/
-chmod 700 /private /private/healthcheck.sh /private/public_runner.sh
-exec /private/public_runner.sh /run/pass2fail/input.bin
+exec /opt/pass2fail/public_runner.sh /run/pass2fail/input.bin
 '''
         (self.runner / "file-runner.sh").write_text(script, encoding="utf-8")
         (self.runner / "file-runner.sh").chmod(0o755)
@@ -304,6 +341,11 @@ exec /private/public_runner.sh /run/pass2fail/input.bin
         (self.runner / "public_runner.sh").write_text(
             "#!/bin/sh\nset -eu\nexec " + shlex.join(self.contract["public_runner"]["argv"]) + "\n", encoding="utf-8")
         (self.runner / "public_runner.sh").chmod(0o755)
+        # The FILE-POV healthcheck runs in client but is the reviewed public
+        # normal-function probe, not private oracle material. Expose it at the
+        # same /healthcheck.sh path used by the other branches.
+        shutil.copyfile(self.private / "healthcheck.sh", self.runner / "public_healthcheck.sh")
+        (self.runner / "public_healthcheck.sh").chmod(0o755)
         for name in ("healthcheck", "oracle", "solution"):
             source = self.private / f"{name}.sh"
             target = self.runner / f"{name}.sh"
@@ -325,7 +367,9 @@ exec /private/public_runner.sh /run/pass2fail/input.bin
         original["services"]["client"]["user"] = "0:0"
         target_image = target_service["image"]
         runner = self.contract["runner"]
-        runner_image = runner.get("image") or self.contract["images"]["agent"]
+        # The submission runner is always a separate container built from the
+        # main analysis image; task.json.runner.image must be null.
+        runner_image = self.contract["images"]["agent"]
         declared = set(self.contract["images"].values())
         if target_image not in declared or runner_image not in declared:
             raise ValueError("Compose uses an undeclared image")
@@ -341,7 +385,7 @@ exec /private/public_runner.sh /run/pass2fail/input.bin
         ] if self.contract["branch"] == "FILE-POV" else [
             f"{self.runner}/runner.py:/opt/pass2fail/runner.py:ro",
             f"{self.runner}/public_healthcheck.sh:{self.contract['healthcheck']['argv'][0]}:ro",
-            f"{self.environment}/task.json:/opt/pass2fail/config.json:ro",
+            f"{self.environment}/task.json:/opt/pass2fail/task.json:ro",
             f"{self.runner}/submission:/submission:ro",
             f"{self.runner}/run:/work:rw",
             f"{self.runner}/output:/output:rw",
@@ -370,7 +414,7 @@ exec /private/public_runner.sh /run/pass2fail/input.bin
                 "PYTHONDONTWRITEBYTECODE": "1",
                 "HOME": "/work",
                 "SUBMISSION": f"/submission/{self.contract['submission_mode']}",
-                "PASS2FAIL_CONFIG": "/opt/pass2fail/config.json",
+                "PASS2FAIL_TASK": "/opt/pass2fail/task.json",
             },
             "volumes": runner_volumes,
         })
@@ -378,6 +422,9 @@ exec /private/public_runner.sh /run/pass2fail/input.bin
             "test": ["CMD", "sh", "-c", "kill -0 1"],
             "interval": "2s", "timeout": "3s", "retries": 30,
         }
+        if self.contract["branch"] == "FILE-POV" and self.contract["healthcheck"]["argv"][0] == "/healthcheck.sh":
+            client_volumes = original["services"]["client"].setdefault("volumes", [])
+            client_volumes.append(f"{self.runner}/public_healthcheck.sh:/healthcheck.sh:ro")
         if self.contract["branch"] != "FILE-POV":
             # A custom public target network must also carry its private
             # submission runner. Compose's default network does not provide
@@ -440,7 +487,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--input")
 parser.add_argument("--health", action="store_true")
 args = parser.parse_args()
-config = json.loads(pathlib.Path("/opt/pass2fail/config.json").read_text())
+config = json.loads(pathlib.Path(os.environ.get("PASS2FAIL_TASK", "/opt/pass2fail/task.json")).read_text())
 work = pathlib.Path("/work")
 # Only SETUID/SETGID are present for this trusted root bootstrap. No untrusted
 # command runs until the contract's unprivileged uid/gid is restored; setuid
@@ -510,11 +557,17 @@ sys.exit(result["returncode"])
         path.write_text(script, encoding="utf-8")
         path.chmod(0o755)
 
+    def _health_argv(self) -> list[str]:
+        value = self.contract.get("healthcheck") or {}
+        argv = value.get("argv") if isinstance(value, dict) else None
+        return argv if isinstance(argv, list) and argv else ["/healthcheck.sh"]
+
     def phase(self, name: str) -> dict[str, Any]:
         project = f"{self.project}-{name}"
         self.active_project = project
         record: dict[str, Any] = {"project": project}
         try:
+            self.restore_pristine_binds()
             self._prepare_runner_mounts()
             up = self.compose(project, "up", "-d", "--force-recreate", "--no-build", "--wait",
                               timeout=self.contract["runner"]["health_timeout_sec"] + 120)
@@ -528,7 +581,7 @@ sys.exit(result["returncode"])
                 return record
             if self.contract["branch"] == "FILE-POV":
                 record["health"] = self.compose(
-                    project, "exec", "-T", "client", "/private/healthcheck.sh",
+                    project, "exec", "-T", "client", *self._health_argv(),
                     timeout=self.contract["runner"]["timeout_sec"] + 30)
             else:
                 # A health probe may have left a root-owned result after an
@@ -558,7 +611,7 @@ sys.exit(result["returncode"])
                     if record["restart"]["returncode"]:
                         record["error_stage"] = "restart"
                         return record
-                health_command = (("client", "/private/healthcheck.sh")
+                health_command = (("client", *self._health_argv())
                                   if self.contract["branch"] == "FILE-POV"
                                   else ("runner", "/opt/pass2fail/runner.py", "--health"))
                 record["patched_health"] = self.compose(
@@ -645,6 +698,7 @@ sys.exit(result["returncode"])
             spec.loader.exec_module(helper)
             record["ipam_release"] = helper.release_compose_subnets(project, "harbor", self.docker)
             self._restore_runner_mounts()
+            self.restore_pristine_binds()
             self.active_project = None
 
     @staticmethod
@@ -695,6 +749,12 @@ sys.exit(result["returncode"])
             self.active_project = None
 
 
+def _remove_reward_files(log_dir: Path) -> None:
+    """A grading failure must not leave a stale or placeholder reward behind."""
+    for name in ("reward.json", "reward.txt"):
+        (log_dir / name).unlink(missing_ok=True)
+
+
 def fresh_verify(task_dir: Path, submission: Path | None, log_dir: Path,
                  project: str = "pass2fail", timeout_sec: int | None = None,
                  private_dir: Path | None = None,
@@ -724,7 +784,21 @@ def fresh_verify(task_dir: Path, submission: Path | None, log_dir: Path,
                   "traceback": traceback.format_exc()[-MAX_EVIDENCE:],
                   "task_dir": str(task_dir.resolve()), "log_dir": str(log_dir.resolve()),
                   "project": project, "submission": str(submission.resolve()) if submission else None}
+        write_json(log_dir / "evidence.json", result)
+        _remove_reward_files(log_dir)
+        raise VerifierInfraError(result["error"]) from exc
+    finally:
+        # The verifier may have written into public ./ binds while bringing up
+        # its private target. Put the delivered task back even when grading
+        # raises, so the next trial starts from the sealed package.
+        _restore_public_binds(task_dir)
+
     write_json(log_dir / "evidence.json", result)
+    status = str(result.get("status") or "")
+    if status in NON_GRADING_STATUSES:
+        _remove_reward_files(log_dir)
+        detail = result.get("error") or f"grading stopped at {status}"
+        raise VerifierInfraError(f"grading did not complete: {detail}")
     write_json(log_dir / "reward.json", {"reward": float(result["reward"])})
     (log_dir / "reward.txt").write_text(f"{result['reward']}\n", encoding="utf-8")
     return float(result["reward"]), result
@@ -735,11 +809,69 @@ try:
     from harbor.verifier.base import BaseVerifier
 except ImportError:
     BaseVerifier = None
+    VerifierResult = None
 
 
-# Harbor loads bin.pass2fail_verifier:Pass2FailVerifier through the facade.
-# Keep fresh_verify here as the self-contained implementation; do not define a
-# second verifier class that imports in a different namespace or mounts Docker.
+def _restore_public_binds(task_dir: Path) -> None:
+    """Put writable ``./`` bind sources back from the sealed tar.
+
+    Harbor starts the player directly from ``task_dir/environment`` before the
+    verifier is called, so this entry/exit restore protects later trials rather
+    than the current player.  The pipeline's own Harbor wrapper restores before
+    the player starts; see ``pipeline/harbor.py::_harbor_run_fresh``.
+    """
+    import importlib.util
+    path = Path(__file__).with_name("pristine_binds.py")
+    if not path.is_file():
+        return
+    name = "_linux_userspace_pristine_" + hashlib.sha256(
+        str(path.resolve()).encode()).hexdigest()[:20]
+    try:
+        if name in sys.modules:
+            module = sys.modules[name]
+        else:
+            spec = importlib.util.spec_from_file_location(name, path)
+            if spec is None or spec.loader is None:
+                return
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            spec.loader.exec_module(module)
+        module.extract_pristine_binds(task_dir, task_dir / "environment")
+    except Exception:
+        # A package without writable binds or without the helper is valid; the
+        # verifier must still grade the current trial.
+        pass
+
+
+if BaseVerifier is not None:
+
+    class Pass2FailVerifier(BaseVerifier):
+        """separate 模式的判分类；Harbor 已销毁选手环境后才调用。
+
+        与旧管线相同：只有一个通用类，题目差异全部来自 ``task_dir`` 下的
+        ``tests/private/task.json`` 和私有目录，不在 verifier 代码里分题。
+        """
+
+        async def verify(self) -> VerifierResult:
+            import asyncio
+
+            task_dir = Path(self.task.paths.task_dir)
+            _restore_public_binds(task_dir)
+            try:
+                contract = load_contract(task_dir)
+                submission = collected_submission(
+                    Path(self.trial_paths.artifacts_dir), contract)
+                seed = str(getattr(self.trial_paths, "trial_dir", task_dir))
+                reward, _ = await asyncio.to_thread(
+                    fresh_verify,
+                    task_dir=task_dir,
+                    submission=submission,
+                    log_dir=Path(self.trial_paths.verifier_dir),
+                    project="lup" + hashlib.sha256(seed.encode()).hexdigest()[:16],
+                )
+            finally:
+                _restore_public_binds(task_dir)
+            return VerifierResult(rewards={"reward": reward})
 
 
 if __name__ == "__main__":

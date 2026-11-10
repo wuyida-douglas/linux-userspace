@@ -2,7 +2,7 @@
 
 把固定漏洞候选池中的 **CVE × 仓库 × 修复候选** 变成可审计的 Harbor 题包。
 主流程是：固定抽样（或全量）→ 定点 S3 下载与校验 → 路由 → 分支合成 →
-独立审查 → Harbor gold/null 与最终 bundle 差分验收。
+独立审查 → 两次 Harbor Agent 跑题 + Pass2Fail 验收。
 
 本 README 面向后续负责运行和 scaling 的工程同学。**当前是按操作更新的
 开发版，不是已完成多租户 scaling 的产品。** 运行前阅读第 2、9 节；输入
@@ -25,6 +25,12 @@ exploit 管线按 CVE 下载现成 `{source}_{CVE}/` 目录，并从题单 JSONL
 所有下载、格式检查、摘要与元数据精简都是 **Python 脚本** 完成的，不调用
 模型。`complete` 仅表示输入完整且格式合格，不表示补丁一定是该 CVE 的真实
 安全修复，更不表示题目通过。
+
+在**交付和跑题形式**上，新管线刻意与 `exploit` 对齐：`task.toml` 不写
+verifier 的 `import_path`，统一用 `--verifier <module>:Pass2FailVerifier`
+加 `PYTHONPATH` 从宿主加载一个**通用 verifier 类**。每道题的差异来自
+`task_dir` 下的 `tests/private/task.json` 和私有文件，不来自 verifier 代码。
+两条管线跑题时只是模块名和 `PYTHONPATH` 指向不同，命令形状完全一样。
 
 ## 2. 环境与安全边界
 
@@ -71,18 +77,30 @@ scaling 前必须由工程负责人明确每 attempt 的隔离方案（例如经
 
 ### 3.1 冻结候选池
 
-默认文件：
+默认生产池（经过 S3 可用性过滤）：
 
 ```text
-results/label-production-v1/candidates-kept.jsonl
+data/frozen-pool-20261109/candidates-kept-available-20261109.jsonl
 ```
+
+原始 LLM 打标输出保留在 `data/frozen-pool-20261109/candidates-kept.jsonl`
+（23,873 行），仅用于审计；`scripts/filter_pool_by_s3.py` 从它去掉两类
+**确认无法下载**的行：
+
+- S3 上既没有 `osv_<CVE>` / `cvelist_<CVE>`，也没有任何生态别名目录
+  （如 `osv_UBUNTU-CVE-...`）；
+- 别名目录存在，但没有与该行 candidate 匹配的候选。
+
+过滤结果：**22,138 行**，移除 1,735 行；其中 601 行通过别名恢复，
+1,730 行完全无目录，5 行别名目录不含候选。报告见
+`data/frozen-pool-20261109/pool-availability-20261109.json`。
 
 `pipeline.prepare` 在 S3 调用之前强制验证：
 
-- 23,873 个唯一 `instance_id`；
+- 22,138 个唯一 `instance_id`；
 - 每行 `metadata_label.label == keep`；
 - 文件 SHA-256 为
-  `1d9bdbd09a55a84fee01bd5ccf19027e0db2b8e1da37c91eaa653565c2c36142`。
+  `565bdf5914152b3a4f2a00f44c09cc85a38f1b85ae8d42bb833a72c38579e941`。
 
 它是已筛选的候选集合，不是漏洞可交付性的保证。候选池构建脚本位于
 `scripts/`，日常固定样本生产**不要重新随机筛选或改写候选池**。
@@ -122,13 +140,13 @@ cd /nvme/wuyida/新管线开发
 
 # 可选：只固定抽样，完全不访问 S3。
 .venv/bin/python -m pipeline.prepare \
-  --input results/label-production-v1/candidates-kept.jsonl \
+  --input data/frozen-pool-20261109/candidates-kept-available-20261109.jsonl \
   --output samples/my-fixed100-s20261120 \
   --count 100 --seed 20261120 --sample-only
 
 # 下载并预处理同一固定样本；workers 仅控制下载并发，最大 30。
 .venv/bin/python -m pipeline.prepare \
-  --input results/label-production-v1/candidates-kept.jsonl \
+  --input data/frozen-pool-20261109/candidates-kept-available-20261109.jsonl \
   --output samples/my-fixed100-s20261120 \
   --count 100 --seed 20261120 --workers 4
 ```
@@ -184,7 +202,7 @@ samples/my-fixed100-s20261120/
 ### 4.2 全量数据准备（scale-up 入口）
 
 `pipeline.prepare --all` 是给工程同学的一键全量入口：按冻结池原始顺序准备
-全部 23,873 条输入，不做随机抽样，也不再需要 `--count/--seed`。
+全部 22,138 条可用输入，不做随机抽样，也不再需要 `--count/--seed`。
 
 ```bash
 cd /nvme/wuyida/新管线开发
@@ -194,7 +212,7 @@ scripts/prepare_full_pool.sh samples/full-20261109 30
 
 # 等价的原生命令
 .venv/bin/python -m pipeline.prepare \
-  --input results/label-production-v1/candidates-kept.jsonl \
+  --input data/frozen-pool-20261109/candidates-kept-available-20261109.jsonl \
   --output samples/full-20261109 \
   --all --workers 30
 ```
@@ -223,6 +241,18 @@ ANTHROPIC_AUTH_TOKEN=<密钥>   # 或 ANTHROPIC_API_KEY
 
 不要将真实文件复制进文档。执行器固定为 Claude Code（`claude -p` 流式会话，
 可用 `CLAUDE_BIN` 指定可执行文件），默认模型 `glm-5.3`；模型名必须与实际网关支持一致。
+
+执行器给 Claude Code 设置：
+
+```text
+CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000
+CLAUDE_CODE_AUTO_COMPACT_WINDOW=800000
+CLAUDE_CODE_MAX_OUTPUT_TOKENS=65536
+```
+
+GLM-5.3 标准上下文是 1M；auto-compact 窗口留到 800k，避免贴着 1M 上限时
+`messages + max_output_tokens` 超限导致 400。若实际网关只支持更小窗口，必须
+按网关能力调低，否则会在请求层被拒绝，而不是在 Claude Code 里自动压缩。
 
 环境预检会检查 Docker/Compose/buildx、模型网关和基础镜像：
 
@@ -260,10 +290,11 @@ cd /nvme/wuyida/新管线开发
 ```
 
 `--batch-size` 是新题名额上限，`--concurrency` 是本监督器 worker 上限；
-携带恢复任务也共享并发额度，不能另开一批绕过限制。两者最大 30。
+携带恢复任务也共享并发额度，不能另开一批绕过限制。并发上限 40
+（`--batch-size` 仍最多 30 个新题位；携带题另占额度）。
 一个 results 目录只能属于一个样本，有 supervisor 锁，不能多个调度器
-同时写同一目录。需要严格固定样本配额时，使用第 8 节的
-`pipeline.iterate_batches` 协调器，它内部同样调用 supervisor。
+同时写同一目录。需要跨批迭代时，按第 6.3 节的 Agent 驱动流程直接启动
+supervisor；没有协调器。
 
 ### 6.1 四阶段分别做什么
 
@@ -272,22 +303,30 @@ cd /nvme/wuyida/新管线开发
 2. **合成**：按路由分支创建真实 target、公开工作站、gold、oracle 和
    官方修复。原始 `input/` 不修改，恢复证据写入 `delivery/project/`。
 3. **独立审查**：新会话读取冻结交付和合成轨迹，通过普通文件写入输出
-   `review.json`；控制器校验其布尔 `passed`、findings 和执行检查字段。
-4. **验收**：冻结审查通过的交付，导出预构建镜像，执行 Harbor gold、null
-   以及最终 bundle 的 vulnerable/fixed 差分。
+   `review.json`；控制器校验其布尔 `passed` 和非空 `evidence`。
+4. **验收**：冻结审查通过的交付，导出预构建镜像，用 Harbor 连续跑两次
+   Agent 跑题；每次都由 verifier 在干净 vulnerable/patched 环境中做
+   Pass2Fail，两次 reward 都是 1.0 才通过。
 
 严格通过必须同时有：
 
 ```text
 独立 review.passed = true
-Harbor gold.reward = 1.0
-Harbor null.reward = 0.0
-最终 bundle differential.status = passed
-最终 bundle differential.report.success = true
+acceptance_runs 恰好 2 次
+两次 acceptance_runs[].reward = 1.0
+每次 verifier 内部：
+  vulnerable.triggered = true，vulnerable.health.returncode = 0
+  fixed.triggered = false，fixed.solution.returncode = 0，
+  fixed.patched_health.returncode = 0
 ```
 
+vulnerable 阶段的 exploit/PoV 正常 crash（134/1/124）不算协议失败；oracle
+和 fixed 重建才是判定依据。第一次跑完后先按 `pristine-binds.tar` 恢复可写
+bind，再跑第二次；第二次必须在这个恢复后的题包上仍然 Pass2Fail。这样测的是
+“一次做题把题包写脏后能不能恢复干净”，而不是故意让第二次继承脏字节。
+
 不要只看 `result.json.status=passed`、Harbor 进程无异常或容器启动成功。
-详情见 [Harbor 交付与差分验证设计](doc/统一Harbor交付与差分验证设计.md)。
+详情见 [Harbor 验收设计](doc/Harbor验收设计.md)。
 
 ### 6.2 输出位置
 
@@ -297,7 +336,7 @@ results/<run>/<task-id>/
 ├── route/                      # 路由轨迹和结果
 ├── synthesis/                  # 合成轨迹和结果
 ├── review/                     # 独立审查轨迹
-├── harbor/                     # gold/null、导出和差分证据
+├── harbor/                     # 两次 Harbor Agent 验收、导出和 evidence
 └── workspace/
     ├── input/                  # 只读输入副本与备用候选索引
     ├── route.json
@@ -305,24 +344,64 @@ results/<run>/<task-id>/
     └── delivery/               # 接受审查的实际交付
 ```
 
+`delivery/task.json` 由控制器在冻结前生成，agent 不手写：branch/host_type 来自
+`route.json`，main/client 镜像来自公开 Compose，sidecar 由 Compose 服务列表
+派生，healthcheck/oracle/solution 使用固定路径；FILE-POV 的 `public_runner`
+写在 Compose 的 `client.x-public-runner`，runner 固定复用 `images.agent`。
+
+每个 `route/`、`synthesis/`、`review/` 阶段都保留完整原始流和可读轨迹：
+
+```text
+stdout.jsonl        # Claude Code 原始 stream-json（完整，含 compaction 事件）
+stderr.txt          # 子进程 stderr
+cli-debug.log       # Claude Code 自己的 debug 日志（每题每阶段独立）
+prompt.md           # 实际发送的初始 prompt（新运行；旧运行标注重建）
+trajectory.jsonl    # 小索引：turn/工具名/字符数，供 supervisor 计数
+tool-calls.jsonl    # 每次工具调用；每行第一个字段是北京时间
+live.chat.md        # 完整 thinking/正文/工具调用/工具返回/压缩事件
+sft.jsonl           # 结构化 messages，可直接用于 SFT
+background/         # 后台任务 output 文件副本
+background-tasks.jsonl  # 后台任务的 task_id/路径/归档位置
+```
+
+审查阶段读 `review-input/live.chat.md` 和 `review-input/tool-calls.jsonl`；
+`trajectory.jsonl` 只做调度索引，不承载全文；`conversation.md` 已删除，
+避免三份全文互相漂移。`tool-calls.jsonl` 里的 `description` 是 Claude Code
+给 Bash 命令生成的短说明，不是 shell 输出，也不是题目描述。
+
+**Autocompact 不会丢前面的轨迹**：`stdout.jsonl` 始终保留完整原始流；
+`live.chat.md` 和 `sft.jsonl` 按时间顺序追加 `compact_boundary` /
+`isCompactSummary` 事件，压缩前的 thinking、正文、工具调用和工具结果仍在。
+旧轨迹可用 `.venv/bin/python -m pipeline.compact_logs <stage-dir>` 重新生成。
+
 默认接受包发布到 `harbor_export/<YYYYMMDD>-production/`；不同 run 同日发布
 必须注意冲突。生产应为每批显式指定不同的 `--published-root`，例如
 `harbor_export/my-small-batch`。失败题不得因重试被发布。
 
-导出题目名会把完整仓库 URL 从内部 `task-id` 里去掉，并在末尾追加分支：
+导出题目名只保留公告 ID 和分支，不再带 `linux-014-` 前缀或 owner-repo：
 
 ```text
-linux-014-cve-2024-23346-materialsproject-pymatgen-file-pov
-linux-001-cve-2020-28483-gin-gonic-gin-svc-exploit-synthetic-host
+cve-2024-23346-file-pov
+cve-2020-28483-svc-exploit-synthetic-host
 ```
 
 后缀规则：SVC 用 `-svc-exploit-native-service` / `-svc-exploit-real-host` /
 `-svc-exploit-synthetic-host`，FILE 用 `-file-exploit` / `-file-pov`。
-每个导出题目录里的 `acceptance.json` 是本次验收证据的只读副本（Harbor
-gold/null 与最终 bundle 差分），不是运行依赖。
 
-**镜像 tag 必须每题唯一。** 导出只按该题 `task.json` 的 `images.target` /
-`images.agent` 精确 tag 做 `docker save`，不会从容器或工作区猜镜像；复用
+导出名现在只保留公告 ID 和分支，例如 `cve-2020-28483-file-pov`；结果目录
+在批次 terminal 后会由 supervisor 自动用同一规则整理，映射写入
+`batch-NNN/renames.json`。内部 `result.json.task_id` 不变。只有 supervisor
+崩溃导致未改名时，才需要手动补跑：
+
+```bash
+.venv/bin/python -m pipeline.rename_results results/<run>/batch-NNN
+```
+每个导出题目录里的 `acceptance.json` 是本次验收证据的只读副本
+（两次 Harbor Agent run 的 reward 与 verifier evidence），不是运行依赖。
+
+**镜像 tag 必须每题唯一。** 公开 Compose 的 `client` / `main` 镜像 tag 是
+权威来源，控制器据此生成 `task.json.images.target` / `images.agent`，导出
+只按这两个精确 tag 做 `docker save`，不会从容器或工作区猜镜像；复用
 `:latest` 或跨题同名 tag 会让后构建的镜像覆盖前者，导出仍“成功”但内容错。
 合成 Prompt 要求 tag 带 task id 或唯一 slug，并在所有修改完成后重新
 build/tag；修改只存在于容器可写层时必须 `docker commit` 成这题最终 tag。
@@ -330,8 +409,153 @@ build/tag；修改只存在于容器可写层时必须 `docker commit` 成这题
 多容器 target 按公开 Compose 的**每个服务镜像**分别保存（client 进
 `images/target.tar.gz`，sidecar 进 `images/<service>.tar.gz`）。`docker commit`
 是单容器操作，不会自动提交整个 Compose 项目：每个可写层里有必需修改的容器
-都要单独 commit 到自己的唯一 tag，并改对应服务的 `image`；卷内容不会被
+都要单独 commit 到自己的唯一 tag，并改对应服务的 `image`（client/main 改
+公开 Compose；控制器再从 Compose 生成 `task.json.images.target` /
+`images.agent`）。只 commit 但不更新引用的镜像不会被导出；卷内容也不会被
 commit 带走。
+
+卷和 bind 由管线单独封包，不依赖 commit：合成结束后、审查前，控制器把
+named/anonymous volume 复制到 `delivery/environment/init/volumes/` 并把
+Compose 改写为 `./` bind；导出时把所有可写 `./` bind 封进
+`pristine-binds.tar`，差分 verifier 在每个 phase 前后还原。合成期间不要
+`docker compose down -v` 删除卷数据。
+
+### 6.3 批量迭代 skill（Agent 驱动）
+
+`.cursor/skills/pipeline-iterate/SKILL.md` 是方法论，不是调度器：
+
+- Agent 自己用 `pipeline.supervise` 启动每一批；
+- 每 10 分钟用只读的 `scripts/report.py` 看每题成功/失败和剩余新题；
+- Agent 自己分析失败、修管线、跑测试、决定携带和下一批。
+
+没有 `iterate_batches` 协调器，没有 `start/approve/stop` 自动流程。
+
+```bash
+# 只读报告：当前结果 + 样本里还没用过的新题
+python3 .cursor/skills/pipeline-iterate/scripts/report.py \
+  --results results/<run> --sample samples/<batch>
+
+# Agent 挑 30 道后，直接启动 supervisor
+.venv/bin/python -m pipeline.supervise \
+  --sample samples/<batch> \
+  --results results/<run>/batch-001 \
+  --batch-size 30 --concurrency 30 \
+  --only <task-id-1> ... <task-id-30>
+```
+
+批次结束后 Agent 自己写 `doc/iteration-reports/<run>-batch-NNN.md`，修完
+代码和测试后手动开下一批。细节见该 skill 的 `SKILL.md`。
+
+### 6.4 交付后如何跑题 / 评测
+
+发布目录（`pipeline.supervise --published-root` 指定的位置）是
+`accepted_tasks_only` 的自包含交付包：
+
+```text
+<published>/
+├── task_id_all.jsonl         # 每行 {"task_id": "..."}
+├── bin/
+│   ├── load_image.py         # 加载单题/全部镜像，并恢复可写 bind
+│   ├── pass2fail_verifier.py # 通用 verifier 类
+│   └── pristine_binds.py
+├── shared-images/            # 多题共享的 agent/verifier 镜像
+├── manifest.json
+└── <task-id>/
+    ├── image-lock.json       # role/ref/archive 镜像索引
+    ├── images/               # 本题 target/sidecar/专用 agent 镜像
+    ├── harbor-runtime-profile/
+    │   ├── task.toml         # environment_mode=separate；不写 verifier import_path；不写超时
+    │   ├── environment/      # 公开 main + client
+    │   ├── pristine-binds.tar
+    │   └── bin/              # 本题 profile 自带的通用 verifier + helpers
+    └── acceptance.json
+```
+
+加载单题（镜像 + 预跑恢复）：
+
+```bash
+python3 <published>/bin/load_image.py --task <task-id>
+```
+
+`load_image.py` 会按 `image-lock.json` 加载 shared 和本题镜像，然后在返回前
+调用 `pristine_binds.py` 恢复该题的 `harbor-runtime-profile/environment`。
+这就是“做题前 wrapper”的预跑半边；如果要手动控制，可加 `--no-restore`。
+加载全部共享镜像用 `--shared-only`；不带 `--task` 会加载 shared + 所有任务。
+
+也可以让 `load_image.py` 直接包住一次跑题命令（前后各恢复一次）：
+
+```bash
+cd <published>/<task-id>/harbor-runtime-profile
+PYTHONPATH="$PWD" python3 <published>/bin/load_image.py --task <task-id> \
+  --run harbor run --path "$PWD" ... \
+  --verifier bin.pass2fail_verifier:Pass2FailVerifier
+```
+
+跑一道题（新管线）：
+
+```bash
+cd <published>/<task-id>/harbor-runtime-profile
+PYTHONPATH="$PWD" harbor run \
+  --path "$PWD" \
+  --agent <your-agent> \
+  --n-attempts 1 --n-concurrent 1 \
+  --jobs-dir <jobs> --job-name <unique-name> --yes \
+  --verifier bin.pass2fail_verifier:Pass2FailVerifier
+```
+
+`task.toml` 不设置 agent/verifier/build 超时；超时和模型配置由 Harbor
+`harbor_config.yaml` 或命令行控制，避免题目把外部评测的预算截断。
+
+`exploit` 老管线的形式完全一样，只是模块名和 `PYTHONPATH` 指向不同：
+
+```bash
+cd <exploit>/runtime-profile
+PYTHONPATH=<exploit-repo> harbor run \
+  --path "$PWD" \
+  --agent <your-agent> \
+  --n-attempts 1 --n-concurrent 1 \
+  --jobs-dir <jobs> --job-name <unique-name> --yes \
+  --verifier orchestrator.export.separate.pass2fail_verifier:Pass2FailVerifier
+```
+
+共同点：
+
+- `task.toml` 只声明 `environment_mode="separate"`，**不在 `[verifier]` 里写
+  `import_path`**；
+- verifier 是一个通用 `BaseVerifier` 类，由 `--verifier` 指定、由
+  `PYTHONPATH` 让宿主 Python 找到；
+- 同一宿主进程判多道题时，类只 import 一次；题目差异全部从
+  `task_dir/tests/private/task.json` 和私有目录读取，不靠“每题一份 verifier 代码”。
+
+判分语义：
+
+- agent 没提交/没打中 → verifier 返回 reward 0，判分完成；
+- 判分自身失败（target 起不来、oracle 异常、patch 无法应用等）→
+  `fresh_verify` 抛 `VerifierInfraError`，不写 reward，Harbor 记 failed；
+- `tests/test.sh` 只清空旧 reward，不再写占位 0；
+- `Pass2FailVerifier.verify()` 结束时会恢复 public `environment` 的可写 bind，
+  跑完题目不会把题包留在脏状态。
+
+并发和重跑：
+
+- **不同题目**可以并发：每题独立 `task_dir`、唯一镜像 tag、独立 Compose
+  project 和 IPAM；`--job-name` 也必须唯一。
+- **同一题目目录**不要并发：公开环境的可写 `./` bind 是同一份目录，两个
+  player 会互相踩。需要同题并发时，每个 trial 复制一份
+  `harbor-runtime-profile`。
+- 重跑或上次崩溃后，先恢复可写 bind（`load_image.py --task` 已自动做）：
+
+```bash
+cd <published>/<task-id>/harbor-runtime-profile
+PYTHONPATH="$PWD" python3 /path/to/<published>/bin/load_image.py --task <task-id> --root <published>
+```
+
+原因和三层恢复点见 [可写 Bind 恢复说明](doc/可写Bind恢复说明.md)。
+
+> 2026-11-10 之前导出的 `harbor_export/*` 是旧格式（`_runtime/`、无
+> `image-lock.json`/`task_id_all.jsonl`、`task.toml` 仍带超时、`test.sh`
+> 仍写占位 0）。新管线导出已按第二版格式生成；旧 bundle 需要重新导出或
+> 单独迁移后才能作为第二版交付物使用。
 
 ## 7. 失败边界、审查/验收续跑和历史证据
 
@@ -350,35 +574,36 @@ commit 带走。
 `carry-recovery.json`，实例身份一致；旧结果、轨迹、Harbor 证据和错误回执不得覆盖。
 路由/合成恢复计划不会自动派发。
 
-## 8. 批次协调器与 scaling 操作
+## 8. 跨批迭代（Agent 驱动）
 
-`pipeline.iterate_batches` 在 `pipeline.supervise` 之上负责：固定批次选择、
-监控、逐批归因、人工代码修复复核门禁、把明确的管线恢复任务带入下一批。
-它不是简单“失败后无限重启”的循环。
+没有协调器。每一批都是一个显式的 `pipeline.supervise` 调用，Agent 负责：
 
-每批结束生成 `batch-NNN-audit.json`。下一批前必须检查轨迹与代码缺陷，并把
-该审计的 `code_fix_review.approved` 设为 `true`；这是一项**人工/独立代码
-复核门禁**，不是自动测试或模型自批。严格验收数量要按第 6.1 节逐项统计。
+1. 用 `scripts/report.py --sample` 选出 30 道未使用的新题；
+2. 在 `results/<run>/batch-NNN` 启动 supervisor，记录 PID 和日志；
+3. 每 10 分钟看 `report.py`、`progress.json`、`supervisor.log`；
+4. 批次结束后自己分析失败、修管线、跑测试、写批次报告；
+5. 决定下一批：30 道新题 + review/harbor 类携带题。
 
-新生产建议先用第 6 节的显式题单监督器完成受控批次，再按审计结果编排
-下一批。`iterate_batches` 当前的 `number == 1` 路径需要接管已有的
-initial-results 和 initial supervisor，不是通用的从零启动接口：
+携带规则：
 
-```text
---sample <固定样本>
---output <协调器状态目录>
---initial-results <第一批结果目录>
---initial-supervisor-pid <当前第一批监督器 PID，无存活接管场景时不能乱填>
---initial-only <第一批固定 fresh ID...>
---initial-observed-only <已观察且禁止新派遣的旧位置...>
---batch-size 20 --concurrency 20 --target-size 100
---preserve-unavailable-inputs
+- `review` / `harbor` 恢复：`--carry-results <old task dir...>`，要求旧任务有
+  `workspace/route.json` 和完整的 `workspace/delivery`；
+- `route` / `synthesis` 失败：不要用 `--carry-results`；在新批次里从样本
+  输入重跑同一 task，当作 recovery，不算 fresh；
+- 携带题共享并发额度，不另开 supervisor 绕过限制。
+
+```bash
+.venv/bin/python -m pipeline.supervise \
+  --sample samples/<batch> \
+  --results results/<run>/batch-002 \
+  --batch-size 30 --concurrency 40 \
+  --only <30 fresh ids> <carried ids> \
+  --carry-results <old task dir 1> <old task dir 2>
 ```
 
-只有在接管现有生产时才传 `initial-carried-root`/`initial-carried` 等历史参数。
-**不要把当前一次实验的 PID、carry 列表或 selection 复制到新样本。** 工程
-scaling 前应把“从零新建第一批”和“接管既有第一批”拆成明确、独立的命令，
-并给批次完成、失败、停机和人工审批定义标准自动化接口。
+停止某批时只 `kill` 该批 supervisor 的 PID；先核对完整命令行，不要
+`pkill` 所有 python/claude。批次报告写在
+`doc/iteration-reports/<run>-batch-NNN.md`，由 Agent 维护。
 
 ## 9. 当前已知工程化缺口
 
@@ -390,7 +615,7 @@ scaling 前应把“从零新建第一批”和“接管既有第一批”拆成
   统一强制 `manifest.status=complete`，scaling 前必须补齐入口校验。
 - 路由、合成和分支纠错失败只保留证据供人工回捞，不再自动续跑；仅冻结交付
   的审查和 Harbor 基础设施验收有有界恢复。
-- 2026-11-09 的离线单元回归为 102 项通过；这不代表真实模型、Docker 或生产
+- 2026-11-10 的离线单元回归为 100 项通过；这不代表真实模型、Docker 或生产
   端到端验收已通过，恢复生产前仍需审查变更并做受控小规模验证。
 - 历史 gold 证据严格门禁仍需在恢复生产前完成复核。
 - 只有实际证据满足严格验收的题目才能发布和计数；fixture、候选数量、
@@ -401,7 +626,12 @@ scaling 前应把“从零新建第一批”和“接管既有第一批”拆成
 - [输入下载与预处理](doc/输入下载与预处理.md)：S3 对象、字段白名单、缓存、
   状态与 `alternate-candidates.json` 的详细解释。
 - [Prompt 索引与原文](doc/pipeline-prompts.md)：路由、通用合成、分支指南与审查。
-- [Harbor 交付与差分验证设计](doc/统一Harbor交付与差分验证设计.md)：交付和验收边界。
-- [开发交接](doc/管线开发交接.md)：历史开发状态；其中带日期的结果不是当前
-  生产完成度证明。
+- [SVC-EXPLOIT 分支全流程详解](doc/SVC-EXPLOIT分支全流程详解.md)：从原始数据到 Harbor 导出。
+- [FILE-EXPLOIT 分支全流程详解](doc/FILE-EXPLOIT分支全流程详解.md)：单文件未授权效果题的完整流程。
+- [FILE-POV 分支全流程详解](doc/FILE-POV分支全流程详解.md)：单文件 PoV、固定 runner 与精确 oracle。
+- [main 与 runner 镜像说明](doc/main与runner镜像说明.md)：main 镜像怎么选、runner 为什么独立、solution.sh 内的离线 build/replace。
+- [审查阶段可见内容与边界](doc/审查阶段可见内容与边界.md)：reviewer 能看到什么、三个分支检查重点、只读边界。
+- [Harbor 验收设计（两次 Agent 跑题）](doc/Harbor验收设计.md)：当前验收逻辑、两次运行、可写文件污染检测、结果字段、交付后如何跑题。
+- [可写 Bind 恢复说明](doc/可写Bind恢复说明.md)：为什么恢复、`pristine-binds.tar`、wrapper、三层恢复点和边界。
+- [文档索引](doc/README.md)：完整文档目录；旧版设计与开发交接已归档或移除。
 - [交付格式](docs/reference/交付格式.md)：Harbor 题包格式参考。

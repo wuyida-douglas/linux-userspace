@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from pipeline import run
 from pipeline.harbor import validate_public_services
-from pipeline.pass2fail_verifier import Differential, fresh_verify
+from pipeline.pass2fail_verifier import Differential, VerifierInfraError, fresh_verify
 from pipeline.prompts import REVIEW, SYNTHESIZE
 from pipeline.task_contract import load_task, normalize_declared_metadata, normalize_sidecars
 
@@ -31,7 +31,9 @@ class PublicContractTests(unittest.TestCase):
                              ("container_name", "shared-target"),
                              ("security_opt", ["seccomp=unconfined"]),
                              ("volumes", ["/tmp/data:/data:ro"]),
-                             ("volumes", ["shared:/data"])):
+                             ("volumes", ["shared:/data"]),
+                             ("environment", {"HTTP_PROXY": "http://proxy:3128"}),
+                             ("environment", {"no_proxy": "localhost"})):
             with self.subTest(key=key):
                 value = self.services()
                 value["client"][key] = setting
@@ -57,7 +59,7 @@ class PublicContractTests(unittest.TestCase):
         return {"schema_version": 1, "branch": "SVC-EXPLOIT", "host_type": "native_service",
                 "interaction": "protocol", "submission_mode": "exploit.py", "target_service": "client",
                 "images": {"agent": "agent:1", "target": "target:1"},
-                "healthcheck": {"argv": ["/opt/healthcheck/check.sh"]},
+                "healthcheck": {"argv": ["/healthcheck.sh"]},
                 "oracle": {"argv": ["/private/oracle.sh"]}, "solution": {"argv": ["/private/solution.sh"]},
                 "runner": {"image": None, "workdir": "/workspace", "user": user,
                            "timeout_sec": 60, "health_timeout_sec": 60, "command": []}}
@@ -73,7 +75,8 @@ class PublicContractTests(unittest.TestCase):
     def test_file_null_string_is_normalized_only_with_matching_route(self):
         task = self.contract("65534:65534")
         route = {"branch": "FILE-POV", "host_type": None}
-        task.update(branch="FILE-POV", host_type="null")
+        task.update(branch="FILE-POV", host_type="null",
+                    healthcheck={"argv": ["/healthcheck.sh"]})
         self.assertEqual(normalize_declared_metadata(task, route), [])
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -93,7 +96,8 @@ class PublicContractTests(unittest.TestCase):
                 run.normalize_delivery_metadata(delivery, root, root)
                 self.assertIsNone(json.loads((delivery / "task.json").read_text())["host_type"])
         mismatched = self.contract("65534:65534")
-        mismatched.update(branch="FILE-POV", host_type="null")
+        mismatched.update(branch="FILE-POV", host_type="null",
+                          healthcheck={"argv": ["/healthcheck.sh"]})
         self.assertEqual(normalize_declared_metadata(mismatched, {"branch": "SVC-EXPLOIT"}), [])
 
     def test_sidecar_objects_are_normalized_only_against_real_compose(self):
@@ -130,8 +134,8 @@ class PublicContractTests(unittest.TestCase):
             (task / "workspace/delivery/private/gold").mkdir()
             (task / "workspace/delivery/private/gold/exploit.py").write_text("print('test')\n")
             (task / "workspace/delivery/project").mkdir()
+            (task / "workspace/delivery/project/source-recovery.json").write_text("{}")
             (task / "workspace/delivery/instruction.md").write_text("Test task\n")
-            (task / "workspace/delivery/verification.json").write_text("{}")
             (task / "workspace/route.json").write_text(json.dumps(contract | {
                 "instance_id": "CVE-test::project", "accepted": True,
                 "reason": "The real native HTTP service exposes the target vulnerability.",
@@ -150,16 +154,15 @@ class PublicContractTests(unittest.TestCase):
                 contract = json.loads((workspace / "delivery/task.json").read_text())
                 called.append(contract["sidecar_services"])
                 (workspace / "review.json").write_text(json.dumps({
-                    "passed": False, "findings": [],
-                    "reason": "The test reviewer rejected the delivery.",
-                    "execution_checked": True}))
+                    "passed": False,
+                    "evidence": "The test reviewer rejected the delivery."}))
                 return {"status": "completed"}
             with patch("pipeline.agent.run", side_effect=review):
                 record = run.run_one(task, selection, root, args, {})
             self.assertEqual(called, [["mongo"]], record)
             self.assertEqual(record["failure_class"], "review_rejected", record)
             self.assertIsInstance(original_sidecars[0], dict)
-            self.assertTrue((task / "retry-evidence/metadata-normalization/task.json").is_file())
+            self.assertTrue((task / "retry-evidence/contract-build/task.json").is_file())
 
     def test_final_verifier_uses_the_frozen_full_contract(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -294,26 +297,33 @@ class OracleContractTests(unittest.TestCase):
         from pipeline.prompts import BRANCH_GUIDES, SYNTHESIZE
         for branch_only in ("ASAN_OPTIONS", "public_runner", "reroute-request.json",
                             'interaction="protocol"', 'interaction="interactive_file"',
-                            'interaction="file_pov"'):
+                            'interaction="file_pov"',
+                            "SVC-EXPLOIT", "FILE-EXPLOIT", "FILE-POV"):
             self.assertNotIn(branch_only, SYNTHESIZE)
         self.assertNotIn("SVC-EXPLOIT and FILE-EXPLOIT reference submission", SYNTHESIZE)
         self.assertIn("ASAN_OPTIONS", BRANCH_GUIDES["FILE-POV"])
         self.assertIn("public_runner", BRANCH_GUIDES["FILE-POV"])
         self.assertIn('interaction="protocol"', BRANCH_GUIDES["SVC-EXPLOIT"])
         self.assertIn('interaction="interactive_file"', BRANCH_GUIDES["FILE-EXPLOIT"])
-        for branch in ("SVC-EXPLOIT", "FILE-EXPLOIT"):
+        for branch, other in (("SVC-EXPLOIT", ("FILE-EXPLOIT", "FILE-POV")),
+                              ("FILE-EXPLOIT", ("SVC-EXPLOIT", "FILE-POV"))):
             guide = BRANCH_GUIDES[branch]
-            self.assertIn('"branch": "FILE-POV"', guide)
-            self.assertIn('"evidence":', guide)
-            self.assertNotIn("SVC guide's exact schema", guide)
+            self.assertIn("reroute-request.json", guide)
+            self.assertIn("evidence", guide)
+            for name in other:
+                self.assertNotIn(name, guide)
 
     
     def test_review_requires_an_ordinary_complete_json_file(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "review.json").write_text('{"passed": false, "findings": []}')
+            (root / "review.json").write_text('{"passed": false}')
             with self.assertRaisesRegex(ValueError, "review.json must contain exactly"):
                 run.review(root)
+            (root / "review.json").write_text(
+                '{"passed": false, "evidence": "oracle trusts submission stdout"}')
+            self.assertEqual(run.review(root),
+                             {"passed": False, "evidence": "oracle trusts submission stdout"})
 
     def test_runner_uses_path_lookup_for_portable_python(self):
         differential = self.differential()
@@ -446,14 +456,35 @@ class OracleContractTests(unittest.TestCase):
     def test_infrastructure_exception_has_traceback(self):
         with tempfile.TemporaryDirectory() as directory:
             log_dir = Path(directory) / "logs"
-            with patch("pipeline.pass2fail_verifier.load_contract", side_effect=PermissionError(13, "denied", "PKG-INFO")):
-                reward, result = fresh_verify(Path(directory), Path(directory) / "exploit.py", log_dir)
-            self.assertEqual(reward, 0.0)
-            self.assertEqual(result["status"], "infra_error")
-            self.assertIn("PermissionError", result["traceback"])
-            self.assertIn("PKG-INFO", result["traceback"])
+            with patch("pipeline.pass2fail_verifier.load_contract",
+                       side_effect=PermissionError(13, "denied", "PKG-INFO")):
+                with self.assertRaises(VerifierInfraError):
+                    fresh_verify(Path(directory), Path(directory) / "exploit.py", log_dir)
+            self.assertFalse((log_dir / "reward.json").exists())
+            self.assertFalse((log_dir / "reward.txt").exists())
             saved = json.loads((log_dir / "evidence.json").read_text())
-            self.assertEqual(saved["traceback"], result["traceback"])
+            self.assertEqual(saved["status"], "infra_error")
+            self.assertIn("PermissionError", saved["traceback"])
+            self.assertIn("PKG-INFO", saved["traceback"])
+
+    def test_infra_status_does_not_write_reward(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            submission = root / "exploit.py"
+            submission.write_text("print(1)\n")
+            log_dir = root / "logs"
+            with patch("pipeline.pass2fail_verifier.load_contract", return_value={}), \
+                    patch("pipeline.pass2fail_verifier.Differential") as differential, \
+                    patch("pipeline.pass2fail_verifier._restore_public_binds"):
+                differential.return_value.run.return_value = {
+                    "schema_version": 2, "reward": 0.0, "status": "infra_error",
+                    "success": False, "error": "target failed to start"}
+                with self.assertRaises(VerifierInfraError):
+                    fresh_verify(root, submission, log_dir)
+            self.assertFalse((log_dir / "reward.json").exists())
+            self.assertFalse((log_dir / "reward.txt").exists())
+            saved = json.loads((log_dir / "evidence.json").read_text())
+            self.assertEqual(saved["status"], "infra_error")
 
 
 class FileExploitSubmissionTests(unittest.TestCase):

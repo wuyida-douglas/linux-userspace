@@ -23,6 +23,7 @@ import random
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import urllib.error
 import urllib.parse
@@ -32,9 +33,13 @@ from typing import Any
 
 from .common import ID_RE, inventory, read_jsonl, repository_key, sha256, task_id, timestamp, write_json, write_jsonl
 
-DEFAULT_INPUT = Path(__file__).resolve().parents[1] / "results/label-production-v1/candidates-kept.jsonl"
-APPROVED_POOL_SHA256 = "1d9bdbd09a55a84fee01bd5ccf19027e0db2b8e1da37c91eaa653565c2c36142"
-APPROVED_POOL_SIZE = 23873
+DEFAULT_INPUT = Path(__file__).resolve().parents[1] / (
+    "data/frozen-pool-20261109/candidates-kept-available-20261109.jsonl")
+# The frozen 23,873-row labeling output is kept at candidates-kept.jsonl for
+# audit. This default is that pool minus rows with no source snapshot under any
+# exact or ecosystem-alias S3 directory (see pool-availability-20261109.json).
+APPROVED_POOL_SHA256 = "565bdf5914152b3a4f2a00f44c09cc85a38f1b85ae8d42bb833a72c38579e941"
+APPROVED_POOL_SIZE = 22138
 DEFAULT_REMOTE = "p_huawei_hdd1:private-data-3/DataWheel/en-code-osv-nvd/file"
 
 
@@ -44,6 +49,53 @@ def sample(path: Path, count: int, seed: int) -> list[dict[str, Any]]:
         raise ValueError(f"count must be 1..{len(rows)}")
     chosen = random.Random(seed).sample(rows, count)
     return [sample_from_row(row, index) for index, row in enumerate(chosen, 1)]
+
+
+def s3_canonical_id(value: str) -> str:
+    """Match the mirror's object naming for advisory identifiers.
+
+    The S3 crawl stores GHSA ids with an uppercase ``GHSA-`` prefix and a
+    lowercase suffix, while the catalog keeps the whole id uppercase.
+    """
+    if value.upper().startswith("GHSA-"):
+        return "GHSA-" + value[5:].lower()
+    return value
+
+
+def s3_alias_index(remote: str) -> dict[str, list[str]]:
+    """Map a CVE to the mirror's ecosystem-specific OSV directories.
+
+    Ubuntu, CURL and a few other sources publish CVE records under names such
+    as ``osv_UBUNTU-CVE-2022-37315``. The frozen catalog only carries the bare
+    CVE id, so without this index those snapshots look absent.
+    """
+    try:
+        listing = subprocess.run(
+            ["rclone", "lsf", remote, "--dirs-only", "--max-depth", "1"],
+            capture_output=True, text=True, check=True, timeout=180)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"warning: cannot build S3 alias index: {exc}", file=sys.stderr)
+        return {}
+    aliases: dict[str, list[str]] = {}
+    for line in listing.stdout.splitlines():
+        name = line.strip().rstrip("/")
+        match = re.match(r"^osv_[A-Za-z0-9_.]+-(CVE-\d{4}-\d+)$", name, re.I)
+        if match:
+            aliases.setdefault(match.group(1).upper(), []).append(name)
+    return aliases
+
+
+def select_candidate(meta: dict[str, Any], row: dict[str, Any]) -> dict[str, Any] | None:
+    """Prefer the exact catalog candidate, then the same upstream repository."""
+    candidates = meta.get("code", {}).get("candidates") or meta.get("candidates") or []
+    selected = next((x for x in candidates if x.get("candidate_id") == row["candidate_id"]), None)
+    if selected is None:
+        selected = next((x for x in candidates
+                         if repository_key(x.get("repo") or (x.get("prefix") or {}).get("repo")
+                                           or (x.get("fix") or {}).get("repo")) == repository_key(row["repo"])
+                         and (x.get("prefix") or {}).get("revision")
+                         and (x.get("fix") or {}).get("revision")), None)
+    return selected if selected and ID_RE.fullmatch(selected["candidate_id"]) else None
 
 
 def sample_from_row(row: dict[str, Any], index: int) -> dict[str, Any]:
@@ -86,9 +138,10 @@ def complete_instances(path: Path) -> set[str]:
             if row.get("status") == "complete" and row.get("integrity_ok") is not False}
 
 
-def safe_prepare(row: dict[str, Any], destination: Path, remote: str) -> dict[str, Any]:
+def safe_prepare(row: dict[str, Any], destination: Path, remote: str,
+                 aliases: dict[str, list[str]] | None = None) -> dict[str, Any]:
     try:
-        return prepare_one(row, destination, remote)
+        return prepare_one(row, destination, remote, aliases=aliases)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError,
             json.JSONDecodeError) as exc:
         return {key: row[key] for key in ("sample_id", "task_id", "instance_id", "canonical_id")} | {
@@ -96,7 +149,9 @@ def safe_prepare(row: dict[str, Any], destination: Path, remote: str) -> dict[st
 
 
 def top_up(source: Path, original: Path, destination: Path, count: int,
-           seed: int, workers: int, remote: str, *, retain_original: bool = True) -> int:
+           seed: int, workers: int, remote: str, *,
+           aliases: dict[str, list[str]] | None = None,
+           retain_original: bool = True) -> int:
     """Top up complete inputs, or explicitly sample only disjoint new instances."""
     if count < 1 or workers < 1:
         raise ValueError("top-up count and workers must be positive")
@@ -200,7 +255,7 @@ def top_up(source: Path, original: Path, destination: Path, count: int,
             partials_by_instance[item["instance_id"]] = item
     partials = list(partials_by_instance.values())
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        repaired = list(pool.map(lambda row: safe_prepare(row, destination / "tasks", remote), partials))
+        repaired = list(pool.map(lambda row: safe_prepare(row, destination / "tasks", remote, aliases), partials))
     for original_record, record in zip(partials, repaired):
         print(f"repair {record['status']} {record['canonical_id']}", flush=True)
         history.append(record)
@@ -246,7 +301,7 @@ def top_up(source: Path, original: Path, destination: Path, count: int,
         excluded.update(row["instance_id"] for row in candidates)
         print(f"top-up round {round_number}: {len(rows)} complete; checking {len(candidates)}", flush=True)
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            records = list(pool.map(lambda row: safe_prepare(row, destination / "tasks", remote), candidates))
+            records = list(pool.map(lambda row: safe_prepare(row, destination / "tasks", remote, aliases), candidates))
         for candidate, record in zip(candidates, records):
             print(f"[{record['sample_id']:03d}] {record['status']} {record['canonical_id']}", flush=True)
             previous_history = list(read_jsonl(history_path))
@@ -395,7 +450,8 @@ def copy(remote: str, destination: Path, *, directory: bool = False) -> None:
     direct_object_copy(remote, destination)
 
 
-def prepare_one(row: dict[str, Any], destination: Path, remote: str) -> dict[str, Any]:
+def prepare_one(row: dict[str, Any], destination: Path, remote: str,
+                aliases: dict[str, list[str]] | None = None) -> dict[str, Any]:
     record = {key: row[key] for key in ("sample_id", "task_id", "instance_id", "canonical_id")}
     task = destination / row["task_id"]
     if (task / "input/manifest.json").is_file():
@@ -426,11 +482,14 @@ def prepare_one(row: dict[str, Any], destination: Path, remote: str) -> dict[str
             # Reuse the saved source provenance; alternate crawls may disagree.
             meta = json.loads((task / "input/meta.json").read_text(encoding="utf-8"))
             selected = meta["candidate"]
-            provenance = [meta.get("source"), row.get("source_hint"), "osv", "cvelist"]
+            provenance = [meta.get("source_path"), meta.get("source"), row.get("source_hint"),
+                          "osv", "cvelist"]
             repaired = False
-            for source in dict.fromkeys(x for x in provenance if x in {"osv", "cvelist"}):
+            for directory in dict.fromkeys(x for x in provenance if x):
+                if directory in {"osv", "cvelist"}:
+                    directory = f"{directory}_{s3_canonical_id(row['canonical_id'])}"
                 try:
-                    base = f"{remote}/{source}_{row['canonical_id']}/candidates/{selected['candidate_id']}"
+                    base = f"{remote}/{directory}/candidates/{selected['candidate_id']}"
                     copy(base + "/fix.diff", task / "input/fix.diff")
                     repaired = True
                     break
@@ -453,42 +512,38 @@ def prepare_one(row: dict[str, Any], destination: Path, remote: str) -> dict[str
     try:
         selected = None
         source = None
+        source_base = None
         metadata_errors: list[str] = []
-        # The catalog records provenance order. Probe only exact objects for
-        # this CVE, never an entire bucket or all source snapshots.
+        # The catalog records provenance order. Probe exact objects first,
+        # then ecosystem-specific OSV aliases (for example UBUNTU-CVE-*).
+        probes = []
         for name in ["osv", row.get("source_hint"), "cvelist"]:
-            if name not in {"osv", "cvelist"}:
-                continue
+            if name in {"osv", "cvelist"}:
+                probes.append(f"{remote}/{name}_{s3_canonical_id(row['canonical_id'])}")
+        probes.extend(f"{remote}/{name}"
+                      for name in (aliases or {}).get(row["canonical_id"].upper(), []))
+        for base in dict.fromkeys(probes):
             try:
-                base = f"{remote}/{name}_{row['canonical_id']}"
                 copy(base + "/meta.json", staging / "meta.json")
                 meta_path = staging / "meta.json"
                 if meta_path.stat().st_size == 0:
                     raise ValueError("S3 metadata object is empty or absent")
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                candidates = meta.get("code", {}).get("candidates") or meta.get("candidates") or []
-                selected = next((x for x in candidates if x.get("candidate_id") == row["candidate_id"]), None)
-                # The catalog and a later S3 crawl may use different commit
-                # identifiers. Prefer an exact match, never mix repositories.
-                if selected is None:
-                    selected = next((x for x in candidates
-                                     if repository_key(x.get("repo") or (x.get("prefix") or {}).get("repo")
-                                                       or (x.get("fix") or {}).get("repo")) == repository_key(row["repo"])
-                                     and (x.get("prefix") or {}).get("revision")
-                                     and (x.get("fix") or {}).get("revision")), None)
-                if selected and ID_RE.fullmatch(selected["candidate_id"]):
-                    source = name
+                selected = select_candidate(meta, row)
+                if selected:
+                    source = base.rsplit("/", 1)[-1].split("_", 1)[0]
+                    source_base = base
                     break
             except (subprocess.CalledProcessError, subprocess.SubprocessError, OSError, ValueError,
                     RuntimeError,
                     json.JSONDecodeError, KeyError, TypeError) as exc:
-                metadata_errors.append(f"{name}: {type(exc).__name__}: {exc}")
+                metadata_errors.append(f"{base.rsplit('/', 1)[-1]}: {type(exc).__name__}: {exc}")
                 continue
-        if selected is None or source is None:
+        if selected is None or source is None or source_base is None:
             raise ValueError("no usable source snapshot for the selected instance; " +
                              " | ".join(metadata_errors))
         candidate_id = selected["candidate_id"]
-        base = f"{remote}/{source}_{row['canonical_id']}/candidates/{candidate_id}"
+        base = f"{source_base}/candidates/{candidate_id}"
         prefix = staging / "prefix"
         copy(base + "/prefix", prefix, directory=True)
         if not any(path.is_file() for path in prefix.rglob("*")):
@@ -515,7 +570,8 @@ def prepare_one(row: dict[str, Any], destination: Path, remote: str) -> dict[str
             "repo": row["repo"], "candidate_id": candidate_id,
             "catalog_candidate_id": row.get("candidate_id"),
             "candidate_selection": "exact" if candidate_id == row.get("candidate_id") else "same-upstream-snapshot-fallback",
-            "source": source, "vulnerability": row["vulnerability"],
+            "source": source, "source_path": source_base.rsplit("/", 1)[-1],
+            "vulnerability": row["vulnerability"],
             "candidate": selected, "old_tags": row["old_tags"],
         }
         input_dir = staging / "input"
@@ -570,14 +626,15 @@ def main() -> int:
     parser.add_argument("--top-up-from", type=Path,
                         help="preserve complete inputs from this sample and top up to --count")
     args = parser.parse_args()
-    # The 23,873-label pool is a frozen provenance boundary, not a filename
-    # hint. Historical 7,761-row regex subsets must fail before any S3 call.
+    # The approved pool is a frozen provenance boundary, not a filename
+    # hint. Historical regex subsets must fail before any S3 call.
     if sha256(args.input) != APPROVED_POOL_SHA256:
-        parser.error("input is not the approved 23,873 kept-candidate pool")
+        parser.error(f"input is not the approved {APPROVED_POOL_SIZE:,} kept-candidate pool")
     pool_rows = list(read_jsonl(args.input))
     if len(pool_rows) != APPROVED_POOL_SIZE or len({row["instance_id"] for row in pool_rows}) != APPROVED_POOL_SIZE \
             or any((row.get("metadata_label") or {}).get("label") != "keep" for row in pool_rows):
-        parser.error("candidate pool must contain exactly 23,873 unique keep labels")
+        parser.error(f"candidate pool must contain exactly {APPROVED_POOL_SIZE:,} unique keep labels")
+    aliases = {} if args.sample_only else s3_alias_index(args.remote)
     if args.top_up_from:
         if args.all:
             parser.error("--top-up-from cannot be combined with --all")
@@ -587,7 +644,8 @@ def main() -> int:
             parser.error("workers must be 1..30")
         return top_up(args.input, args.top_up_from, args.output,
                       args.count if args.count is not None else 100,
-                      args.seed, args.workers, args.remote, retain_original=not args.exclude_original)
+                      args.seed, args.workers, args.remote, aliases=aliases,
+                      retain_original=not args.exclude_original)
     args.output.mkdir(parents=True, exist_ok=True)
     selection = args.output / "selection.jsonl"
     count = args.count if args.count is not None else 100
@@ -630,7 +688,7 @@ def main() -> int:
     (args.output / "tasks").mkdir(exist_ok=True)
     def prepare_record(row: dict[str, Any]) -> dict[str, Any]:
         try:
-            return prepare_one(row, args.output / "tasks", args.remote)
+            return prepare_one(row, args.output / "tasks", args.remote, aliases=aliases)
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError,
                 json.JSONDecodeError) as exc:
             # One corrupt object or an unwritable cache must not erase the

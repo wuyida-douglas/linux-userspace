@@ -19,6 +19,8 @@ from typing import Any
 
 from . import agent
 from .common import ROOT, inventory, load_env, read_jsonl, timestamp, write_json
+from .contract_build import build_task_contract
+from .package_volumes import package_delivery_volumes
 from .prompts import REVIEW, ROUTE, branch_prompt
 from .task_contract import load_task, normalize_declared_metadata, normalize_sidecars, validate_route
 
@@ -38,20 +40,28 @@ DOCKER = threading.Lock()
 def review(workspace: Path) -> dict[str, Any]:
     """Collect the reviewer's ordinary JSON artifact after its session ends."""
     value = json.loads((workspace / "review.json").read_text(encoding="utf-8"))
-    if not isinstance(value, dict) or set(value) != {
+    if isinstance(value, dict) and set(value) == {"passed", "evidence"}:
+        if not isinstance(value["passed"], bool):
+            raise ValueError("review.json passed must be boolean")
+        if not isinstance(value["evidence"], str) or not value["evidence"].strip():
+            raise ValueError("review.json evidence must be a non-empty string")
+        return value
+    # Existing deliveries may still carry the older four-field review. Accept
+    # it only for resume/re-review; the new prompt emits the two-field shape.
+    if isinstance(value, dict) and set(value) == {
             "passed", "findings", "reason", "execution_checked"}:
-        raise ValueError("review.json must contain exactly passed, findings, reason and execution_checked")
-    if not isinstance(value["passed"], bool) or not isinstance(value["execution_checked"], bool):
-        raise ValueError("review.json passed and execution_checked must be boolean")
-    if not isinstance(value["findings"], list) \
-            or any(not isinstance(finding, dict) or set(finding) != {"severity", "evidence"}
-                   or finding["severity"] not in {"blocker", "major", "minor"}
-                   or not isinstance(finding["evidence"], str) or not finding["evidence"].strip()
-                   for finding in value["findings"]):
-        raise ValueError("review.json findings must contain severity and evidence")
-    if not isinstance(value["reason"], str) or not value["reason"].strip():
-        raise ValueError("review.json needs a concrete reason")
-    return value
+        if not isinstance(value["passed"], bool):
+            raise ValueError("legacy review.json passed must be boolean")
+        if not isinstance(value["reason"], str) or not value["reason"].strip():
+            raise ValueError("legacy review.json needs a concrete reason")
+        findings = value.get("findings") or []
+        evidence = value["reason"]
+        if isinstance(findings, list):
+            evidence += " " + "; ".join(
+                f"{item.get('severity', '')}: {item.get('evidence', '')}"
+                for item in findings if isinstance(item, dict) and item.get("evidence"))
+        return {"passed": value["passed"], "evidence": evidence.strip()}
+    raise ValueError("review.json must contain exactly passed and evidence")
 
 
 def route(workspace: Path, instance_id: str) -> dict[str, Any]:
@@ -59,8 +69,12 @@ def route(workspace: Path, instance_id: str) -> dict[str, Any]:
     for key in ("branch", "host_type"):
         if value.get(key) == "null":
             value[key] = None
-    if value.get("instance_id") != instance_id or not isinstance(value.get("accepted"), bool):
-        raise ValueError("route.json instance_id or accepted is invalid")
+    if value.get("instance_id") != instance_id:
+        raise ValueError(
+            f"route.json instance_id mismatch: expected {instance_id!r}, "
+            f"got {value.get('instance_id')!r}")
+    if not isinstance(value.get("accepted"), bool):
+        raise ValueError("route.json accepted must be boolean")
     if value["accepted"]:
         if value.get("branch") not in BRANCHES:
             raise ValueError("route.json has an invalid branch")
@@ -130,11 +144,27 @@ def normalize_delivery_metadata(delivery: Path, workspace: Path, output: Path) -
     if not task_path.is_file() or not compose_path.is_file():
         return
     task_value = json.loads(task_path.read_text(encoding="utf-8"))
-    compose_value = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
+    compose_value = yaml.safe_load(compose_path.read_text(encoding="utf-8")) or {}
     route_value = load_json(workspace / "route.json")
     repairs = normalize_declared_metadata(task_value, route_value)
+    compose_changed = False
+    services = compose_value.get("services") or {}
+    main_service = services.get("main") or {}
+    images = task_value.get("images") or {}
+    main_image = main_service.get("image")
+    if main_image != images.get("agent"):
+        if main_image == images.get("target"):
+            raise ValueError("main may never use the target image")
+        if not images.get("agent"):
+            raise ValueError("task.json has no analysis image for main")
+        # Harbor injects task.json.images.agent into main. A shared analysis
+        # tag or omitted image in the public Compose is packaging drift, not
+        # task semantics; make the contract explicit before freezing.
+        main_service["image"] = images["agent"]
+        compose_changed = True
+        repairs.append("canonicalized main.image to task.json.images.agent")
     if str(task_value.get("branch", "")).startswith("FILE-") \
-            and task_value.get("host_type") in {None, "null", "none", "linux-container"} \
+            and task_value.get("host_type") is not None \
             and route_value.get("branch") == task_value.get("branch") \
             and route_value.get("host_type") in {None, "null"}:
         task_value["host_type"] = None
@@ -147,8 +177,13 @@ def normalize_delivery_metadata(delivery: Path, workspace: Path, output: Path) -
     evidence.mkdir(parents=True, exist_ok=True)
     if not (evidence / "task.json").exists():
         shutil.copy2(task_path, evidence / "task.json")
+    if compose_changed and not (evidence / "docker-compose.yaml").exists():
+        shutil.copy2(compose_path, evidence / "docker-compose.yaml")
     task_value["sidecar_services"] = sidecars
     write_json(task_path, task_value)
+    if compose_changed:
+        compose_path.write_text(yaml.safe_dump(compose_value, sort_keys=False,
+                                                allow_unicode=True), encoding="utf-8")
     write_json(evidence / "repairs.json", {
         "repairs": repairs,
         "sidecar_services": sidecars,
@@ -162,7 +197,7 @@ def normalize_delivery_metadata(delivery: Path, workspace: Path, output: Path) -
 
 def frozen_delivery(delivery: Path) -> None:
     required = ["task.json", "private/healthcheck.sh", "private/oracle.sh", "private/solution.sh",
-                "private/gold", "instruction.md", "verification.json", "environment/docker-compose.yaml", "project"]
+                "private/gold", "instruction.md", "environment/docker-compose.yaml", "project"]
     for rel in required:
         if not (delivery / rel).exists():
             raise ValueError(f"missing delivery/{rel}")
@@ -173,6 +208,10 @@ def frozen_delivery(delivery: Path) -> None:
     contract = load_task(delivery / "task.json")
     route_value = json.loads((delivery.parent / "route.json").read_text(encoding="utf-8"))
     validate_route(contract, route_value, contract["images"]["agent"])
+    if route_value.get("recovery_required") is True and not (
+            delivery / "project/source-recovery.json").is_file():
+        raise ValueError(
+            "recovery_required=true requires delivery/project/source-recovery.json")
     compose = (delivery / "environment/docker-compose.yaml").read_text(encoding="utf-8")
     if not re.search(r"^\s{2}main:", compose, re.MULTILINE):
         raise ValueError("public Compose must have an explicit main agent service")
@@ -196,13 +235,26 @@ def frozen_delivery(delivery: Path) -> None:
         raise ValueError(f"missing reference {contract['submission_mode']}")
 
 
+DELIVERY_TRANSIENT_PARTS = {".git", ".agent-tmp", "__pycache__", ".pytest_cache"}
+
+
 def frozen_inventory(delivery: Path) -> dict[str, Any]:
-    """Hash everything that the independent reviewer approved."""
-    return inventory(delivery)
+    """Hash deliverable content, ignoring transient VCS/agent metadata.
+
+    A reviewer running ``git status``/``git diff`` updates ``.git/index`` and
+    may create ``.agent-tmp``. Those are not task content and must not turn a
+    valid review into a false "delivery modified" pipeline failure.
+    """
+    excluded = {
+        path.relative_to(delivery).as_posix()
+        for path in delivery.rglob("*")
+        if DELIVERY_TRANSIENT_PARTS.intersection(path.relative_to(delivery).parts)
+    }
+    return inventory(delivery, exclude=excluded)
 
 
 def assert_frozen(delivery: Path, expected: dict[str, Any]) -> None:
-    if inventory(delivery) != expected:
+    if frozen_inventory(delivery) != expected:
         raise ValueError("delivery changed after independent review; refusing Harbor acceptance")
 
 
@@ -229,6 +281,10 @@ def run_one(task: Path, selection: dict[str, Any], results: Path, args: argparse
     write_json(output / "result.json", record)
     try:
         if resumable:
+            record["volume_package"] = package_delivery_volumes(
+                workspace / "delivery", workspace)
+            record["contract"] = build_task_contract(
+                workspace / "delivery", workspace, output)
             normalize_delivery_metadata(workspace / "delivery", workspace, output)
             record["status"] = "reviewing" if not (workspace / "review.json").is_file() else "harbor"
             write_json(output / "result.json", record)
@@ -238,17 +294,20 @@ def run_one(task: Path, selection: dict[str, Any], results: Path, args: argparse
                 review_input = workspace / "review-input"
                 if review_input.exists():
                     shutil.rmtree(review_input)
-                shutil.copytree(workspace / "delivery", review_input / "delivery", symlinks=True)
-                if (workspace / "delivery/verification.json").is_file():
-                    shutil.copyfile(workspace / "delivery/verification.json", review_input / "self-check.json")
-                if (output / "synthesis/trajectory.jsonl").is_file():
-                    shutil.copyfile(output / "synthesis/trajectory.jsonl", review_input / "trajectory.jsonl")
+                review_input.mkdir()
+                if (output / "synthesis/live.chat.md").is_file():
+                    shutil.copyfile(output / "synthesis/live.chat.md", review_input / "live.chat.md")
+                if (output / "synthesis/tool-calls.jsonl").is_file():
+                    shutil.copyfile(output / "synthesis/tool-calls.jsonl", review_input / "tool-calls.jsonl")
                 if (workspace / "input/fix.diff").is_file():
                     shutil.copyfile(workspace / "input/fix.diff", review_input / "fix.diff")
+                review_before = frozen_inventory(workspace / "delivery")
                 record["review_agent"] = agent.run(REVIEW, workspace, output / "review",
                                                  model=args.model, credentials=credentials,
                                                  max_turns=args.review_turns, timeout=args.review_timeout,
                                                  network=ROOT / "config")
+                if frozen_inventory(workspace / "delivery") != review_before:
+                    raise ValueError("independent review modified the submitted delivery")
             review_value = review(workspace)
             if not isinstance(review_value.get("passed"), bool):
                 if args.review_delivery:
@@ -269,9 +328,10 @@ def run_one(task: Path, selection: dict[str, Any], results: Path, args: argparse
                         "resume-acceptance-" + timestamp().replace(":", "-") + "-" + str(os.getpid()))
                     previous.parent.mkdir(exist_ok=True)
                     os.rename(output / "harbor", previous)
-                record["harbor"] = harbor_accept(workspace, output / "harbor", task.name,
-                                                 route_value, args.verify_timeout,
-                                                 published_root=args.published_root)
+                record["harbor"] = harbor_accept(
+                    workspace, output / "harbor", task.name, route_value, args.verify_timeout,
+                    published_root=args.published_root, model=args.model,
+                    credentials=credentials, accept_turns=getattr(args, "accept_turns", 3))
                 assert_frozen(workspace / "delivery", approved)
             record.update(status="passed" if record["harbor"]["status"] == "passed" else "failed",
                           failure_class=None if record["harbor"]["status"] == "passed" else "harbor_failed")
@@ -337,6 +397,8 @@ def run_one(task: Path, selection: dict[str, Any], results: Path, args: argparse
                       reroute_request=json.loads((workspace / "reroute-request.json").read_text(encoding="utf-8")))
             return record
         delivery = workspace / "delivery"
+        record["volume_package"] = package_delivery_volumes(delivery, workspace)
+        record["contract"] = build_task_contract(delivery, workspace, output)
         normalize_delivery_metadata(delivery, workspace, output)
         frozen_delivery(delivery)
         if (workspace / "repair-request.json").is_file():
@@ -346,24 +408,25 @@ def run_one(task: Path, selection: dict[str, Any], results: Path, args: argparse
         review_input = workspace / "review-input"
         if review_input.exists():
             shutil.rmtree(review_input)
-        shutil.copytree(delivery, review_input / "delivery", symlinks=True)
-        if (delivery / "verification.json").is_file():
-            shutil.copyfile(delivery / "verification.json", review_input / "self-check.json")
-        trace = output / "synthesis/trajectory.jsonl"
+        review_input.mkdir()
+        trace = output / "synthesis/live.chat.md"
         if not trace.is_file():
-            archived_trace = output / "retry-evidence/synthesis/trajectory.jsonl"
+            archived_trace = output / "retry-evidence/synthesis/live.chat.md"
             if not archived_trace.is_file():
-                raise ValueError("completed synthesis has no durable trajectory for independent review")
+                raise ValueError("completed synthesis has no durable live.chat.md for independent review")
             shutil.copy2(archived_trace, trace)
-        shutil.copyfile(trace, review_input / "trajectory.jsonl")
+        shutil.copyfile(trace, review_input / "live.chat.md")
+        if (output / "synthesis/tool-calls.jsonl").is_file():
+            shutil.copyfile(output / "synthesis/tool-calls.jsonl", review_input / "tool-calls.jsonl")
         if (output / "synthesis/tool-logs").is_dir():
             shutil.copytree(output / "synthesis/tool-logs", review_input / "tool-logs")
         shutil.copyfile(workspace / "input/fix.diff", review_input / "fix.diff")
+        review_before = frozen_inventory(delivery)
         record["review_agent"] = agent.run(REVIEW, workspace, output / "review",
                                          model=args.model, credentials=credentials,
                                          max_turns=args.review_turns, timeout=args.review_timeout,
                                          network=ROOT / "config")
-        if inventory(delivery) != frozen_inventory(review_input / "delivery"):
+        if frozen_inventory(delivery) != review_before:
             raise ValueError("independent review modified the submitted delivery")
         review_value = review(workspace)
         record["review"] = review_value
@@ -382,9 +445,10 @@ def run_one(task: Path, selection: dict[str, Any], results: Path, args: argparse
         approved = frozen_inventory(delivery)
         write_json(output / "result.json", record)
         with DOCKER:
-            record["harbor"] = harbor_accept(workspace, output / "harbor", task.name,
-                                             route_value, args.verify_timeout,
-                                             published_root=args.published_root)
+            record["harbor"] = harbor_accept(
+                workspace, output / "harbor", task.name, route_value, args.verify_timeout,
+                published_root=args.published_root, model=args.model,
+                credentials=credentials, accept_turns=getattr(args, "accept_turns", 3))
             assert_frozen(delivery, approved)
         passed = record["harbor"]["status"] == "passed"
         record.update(status="passed" if passed else "failed",
@@ -433,17 +497,19 @@ def main() -> int:
     parser.add_argument("--route-from", type=Path,
                         help="run a fresh synthesis in a new workspace from an existing route.json")
     parser.add_argument("--timeout", type=int, default=18000)
-    parser.add_argument("--max-turns", type=int, default=300)
+    parser.add_argument("--max-turns", type=int, default=400)
     parser.add_argument("--route-timeout", type=int, default=1800)
     parser.add_argument("--route-turns", type=int, default=45)
     parser.add_argument("--review-timeout", type=int, default=3600)
     parser.add_argument("--review-turns", type=int, default=100)
     parser.add_argument("--verify-timeout", type=int, default=3600)
+    parser.add_argument("--accept-turns", type=int, default=3,
+                        help="max agent turns in each of the two Harbor acceptance runs")
     parser.add_argument("--published-root", type=Path, default=reported_published_root(),
                         help="accepted-only Harbor bundle; never contains failed tasks")
     args = parser.parse_args()
-    if not 1 <= args.concurrency <= 30:
-        parser.error("concurrency must be 1..30")
+    if not 1 <= args.concurrency <= 40:
+        parser.error("concurrency must be 1..40")
     if args.review_delivery and len(args.only or []) != 1:
         parser.error("--review-delivery requires exactly one --only task")
     credentials = load_env(args.env_file)

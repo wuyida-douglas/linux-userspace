@@ -17,6 +17,6 @@ fi
 
 echo "preparing full frozen pool -> $OUTPUT (workers=$WORKERS)"
 exec .venv/bin/python -m pipeline.prepare \
-  --input results/label-production-v1/candidates-kept.jsonl \
+  --input data/frozen-pool-20261109/candidates-kept-available-20261109.jsonl \
   --output "$OUTPUT" \
   --all --workers "$WORKERS"

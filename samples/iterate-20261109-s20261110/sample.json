@@ -1,10 +1,10 @@
 {
-  "seed": 20261107,
-  "count": 100,
-  "input": "results/label-production-v1/candidates-kept.jsonl",
+  "seed": 20261110,
+  "count": 200,
+  "input": "/nvme/wuyida/新管线开发/results/label-production-v1/candidates-kept.jsonl",
   "input_sha256": "1d9bdbd09a55a84fee01bd5ccf19027e0db2b8e1da37c91eaa653565c2c36142",
   "input_count": 23873,
   "label_policy": "metadata_label.label == keep; no additional filters",
   "sampling_policy": "random.Random(seed).sample(frozen_pool_order, count)",
-  "created_at": "2026-11-07T15:25:32Z"
+  "created_at": "2026-11-09T09:03:01Z"
 }

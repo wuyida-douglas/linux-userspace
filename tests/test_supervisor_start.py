@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 import unittest.mock
 from pathlib import Path
+
+# This suite asserts the supervisor's pre-rename task paths. Production keeps
+# automatic canonical+branch renaming enabled.
+os.environ.setdefault("PIPELINE_DISABLE_RESULT_RENAME", "1")
 
 from pipeline import supervise
 from pipeline.supervise import pipeline_worker_command, worker_start_error
@@ -200,8 +205,8 @@ class CarriedRecoveryTests(unittest.TestCase):
             base.joinpath("workspace/route.json").write_text("{}")
             base.joinpath("workspace/repair-request.json").write_text('{"reason": "stale metadata only"}')
             base.joinpath("workspace/review.json").write_text(json.dumps({
-                "passed": False, "reason": "oracle rejects a valid alternative exploit",
-                "findings": [{"severity": "major", "evidence": "private marker mismatch"}]}))
+                "passed": False,
+                "evidence": "oracle rejects a valid alternative exploit: private marker mismatch"}))
             base.joinpath("synthesis").mkdir()
             base.joinpath("synthesis/result.json").write_text('{"status": "completed"}')
             base.joinpath("result.json").write_text(json.dumps({
@@ -220,15 +225,29 @@ class CarriedRecoveryTests(unittest.TestCase):
 
 
 class StrictProtocolEvidenceTests(unittest.TestCase):
-    def test_oracle_cannot_mask_a_nonzero_gold_submission(self):
+    def test_strict_acceptance_requires_two_harbor_agent_runs(self):
+        row = {"status": "passed", "review": {"passed": True}, "harbor": {
+            "status": "passed",
+            "acceptance_runs": [{"reward": 1.0}, {"reward": 1.0}]}}
+        self.assertTrue(supervise.strictly_accepted(row))
+        row["harbor"]["acceptance_runs"][1]["reward"] = 0.0
+        self.assertFalse(supervise.strictly_accepted(row))
+        row["harbor"]["acceptance_runs"] = [{"reward": 1.0}]
+        self.assertFalse(supervise.strictly_accepted(row))
+
+    def test_strict_acceptance_uses_oracle_and_fixed_evidence(self):
         row = {"status": "passed", "review": {"passed": True}, "harbor": {
             "gold": {"reward": 1.0}, "null": {"reward": 0.0},
             "differential_from_final_bundle": {"status": "passed", "report": {
-                "success": True, "vulnerable": {"submission_result": {"returncode": 0}},
-                "fixed": {"submission_result": {"returncode": 1}}}}}}
-        self.assertFalse(supervise.strictly_accepted(row))
-        row["harbor"]["differential_from_final_bundle"]["report"]["fixed"]["submission_result"]["returncode"] = 0
+                "success": True,
+                "vulnerable": {"triggered": True, "health": {"returncode": 0},
+                               "submission_result": {"returncode": 134}},
+                "fixed": {"triggered": False, "solution": {"returncode": 0},
+                          "patched_health": {"returncode": 0},
+                          "submission_result": {"returncode": 1}}}}}}
         self.assertTrue(supervise.strictly_accepted(row))
+        row["harbor"]["differential_from_final_bundle"]["report"]["vulnerable"]["triggered"] = False
+        self.assertFalse(supervise.strictly_accepted(row))
 
 
 class HistoricalGoldDefectTests(unittest.TestCase):
@@ -348,7 +367,7 @@ class ReviewRetryBoundTests(unittest.TestCase):
             base.joinpath("synthesis/result.json").write_text('{"status": "completed"}')
             base.joinpath("result.json").write_text(json.dumps({
                 "status": "error", "failure_class": "pipeline",
-                "error": "ValueError: missing delivery/verification.json"}))
+                "error": "ValueError: missing delivery/instruction.md"}))
             (root / "supervisor-state.json").write_text(json.dumps({
                 "schema_version": 1, "children": {task: {
                     "retry_reason": "review_incomplete", "final_status": "error",
@@ -381,8 +400,8 @@ class SharedRecoveryAdoptionTests(unittest.TestCase):
             base.joinpath("workspace/route.json").write_text(json.dumps({
                 "instance_id": "CVE-test::old", "accepted": True}))
             base.joinpath("workspace/review.json").write_text(json.dumps({
-                "passed": False, "reason": "provenance record is false",
-                "findings": [{"severity": "major", "evidence": "wrong input description"}]}))
+                "passed": False,
+                "evidence": "provenance record is false: wrong input description"}))
             base.joinpath("synthesis").mkdir()
             base.joinpath("synthesis/result.json").write_text('{"status": "completed"}')
             base.joinpath("result.json").write_text(json.dumps({
@@ -467,17 +486,17 @@ class ExplicitCarryPlanTests(unittest.TestCase):
                 "mode": "route", "reason": "route_budget",
                 "trajectory": "route/trajectory.jsonl"}
 
-    def test_route_only_carry_preserves_source_without_launching_handoff(self):
+    def test_route_only_carry_preserves_source_and_copies_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = self.route_only_source(root)
             original = (source / "result.json").read_text()
-            with self.assertRaisesRegex(ValueError, "only review/Harbor"):
-                supervise.carry_workspaces([source], root / "new", {"task"},
-                                           {"task": self.route_handoff_plan()})
+            carried = supervise.carry_workspaces([source], root / "new", {"task"},
+                                                 {"task": self.route_handoff_plan()})
+            self.assertEqual(carried, {"task"})
             self.assertEqual((source / "result.json").read_text(), original)
             self.assertTrue((source / "route/trajectory.jsonl").is_file())
-            self.assertFalse((root / "new").exists())
+            self.assertTrue((root / "new/task/route/trajectory.jsonl").is_file())
 
     def test_route_only_carry_cannot_invent_a_route(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -486,28 +505,41 @@ class ExplicitCarryPlanTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "frozen route"):
                 supervise.carry_workspaces([source], root / "new", {"task"})
 
-    def test_completed_route_failure_requires_manual_recovery(self):
-        from pipeline.iterate_batches import classify
+    def test_synthesis_carry_copies_route_and_input(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = self.route_only_source(root)
             source.joinpath("workspace/route.json").write_text("{}")
-            row = json.loads((source / "result.json").read_text())
-            row["error"] = "ValueError: route failed a post-route contract check"
-            result = classify("task", row, root / "old")
-            self.assertEqual(result["classification"], "manual_recovery_required")
-            self.assertIsNone(result["recovery_reason"])
+            carried = supervise.carry_workspaces([source], root / "new", {"task"}, {"task": {
+                "schema_version": 1, "task_id": "task",
+                "instance_id": "CVE-test::project", "mode": "synthesis"}})
+            self.assertEqual(carried, {"task"})
+            self.assertTrue((root / "new/task/workspace/route.json").is_file())
+            self.assertTrue((root / "new/task/workspace/input/src").is_dir())
 
-    def test_synthesis_carry_is_rejected_before_copying(self):
+    def test_launch_passes_carried_route_and_synthesis_flags(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            source = self.route_only_source(root)
-            source.joinpath("workspace/route.json").write_text("{}")
-            with self.assertRaisesRegex(ValueError, "only review/Harbor"):
-                supervise.carry_workspaces([source], root / "new", {"task"}, {"task": {
-                    "schema_version": 1, "task_id": "task",
-                    "instance_id": "CVE-test::project", "mode": "synthesis"}})
-            self.assertFalse((root / "new").exists())
+            results = Path(directory)
+            workspace = results / "task/workspace"
+            with unittest.mock.patch.object(supervise.subprocess, "Popen") as popen:
+                popen.return_value.pid = 123
+                supervise.launch("task", Path("/sample"), results, 1, 1,
+                                 continue_synthesis=True, workspace_from=workspace,
+                                 concurrency=40)
+                argv = popen.call_args.args[0]
+                self.assertIn("--continue-synthesis", argv)
+                self.assertIn(str(workspace), argv)
+                self.assertIn("40", argv)
+            with unittest.mock.patch.object(supervise.subprocess, "Popen") as popen:
+                popen.return_value.pid = 123
+                supervise.launch("task", Path("/sample"), results, 1, 1,
+                                 route_from=results / "task/workspace/route.json")
+                self.assertIn("--route-from", popen.call_args.args[0])
+            with unittest.mock.patch.object(supervise.subprocess, "Popen") as popen:
+                popen.return_value.pid = 123
+                supervise.launch("task", Path("/sample"), results, 1, 1,
+                                 route_handoff=results / "task/route/trajectory.jsonl")
+                self.assertIn("--route-handoff-from", popen.call_args.args[0])
 
     def test_carry_without_explicit_plan_never_launches_an_empty_worker(self):
         with tempfile.TemporaryDirectory() as directory:

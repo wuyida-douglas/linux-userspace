@@ -40,7 +40,8 @@ def load_task(path) -> dict[str, Any]:
     submission = "input.bin" if branch == "FILE-POV" else "exploit.py"
     if value.get("submission_mode") != submission:
         raise ValueError(f"{branch} requires submission_mode={submission}")
-    if value.get("target_service") != "client":
+    value.setdefault("target_service", "client")
+    if value["target_service"] != "client":
         raise ValueError("target_service must be client")
     images = value.get("images")
     if not isinstance(images, dict) or not images.get("agent") or not images.get("target"):
@@ -50,16 +51,25 @@ def load_task(path) -> dict[str, Any]:
             raise ValueError(f"invalid prebuilt image reference: {kind}")
     if images["target"] == images["agent"]:
         raise ValueError("target and agent must be separately built images")
+    # One stable runtime path for every branch. The verifier mounts the reviewed
+    # delivery/private/healthcheck.sh at /healthcheck.sh; legacy task.json files
+    # that still name the old paths remain readable.
+    if value.get("healthcheck") is None:
+        value["healthcheck"] = {"argv": ["/healthcheck.sh"]}
     for key in ("healthcheck", "oracle", "solution"):
         argv(value.get(key), key)
-    if branch != "FILE-POV" and not value["healthcheck"]["argv"][0].startswith("/opt/healthcheck/"):
-        raise ValueError("healthcheck must name a public target entry; the verifier mounts its reviewed script under /opt/healthcheck")
+    health_entry = value["healthcheck"]["argv"][0]
+    legacy_entries = ({"/private/healthcheck.sh"} if branch == "FILE-POV"
+                      else {"/opt/healthcheck/check.sh"})
+    if health_entry not in {"/healthcheck.sh"} | legacy_entries:
+        raise ValueError("healthcheck must name /healthcheck.sh; the verifier mounts its reviewed script there")
     runner = value.get("runner")
     if not isinstance(runner, dict):
         raise ValueError("task.json.runner must be an object")
-    if runner.get("image") is not None and runner["image"] not in images.values():
-        raise ValueError("runner.image must be null or a declared image")
-    if runner.get("workdir", "/workspace") != "/workspace":
+    if runner.get("image") is not None:
+        raise ValueError("runner.image must be null; the submission runner uses images.agent")
+    runner.setdefault("workdir", "/workspace")
+    if runner["workdir"] != "/workspace":
         raise ValueError("runner.workdir must be /workspace")
     if not isinstance(runner.get("user"), str) or not runner["user"] or runner["user"] in {"root", "0", "0:0"}:
         raise ValueError("runner.user must be an explicit unprivileged uid/gid")
@@ -67,6 +77,11 @@ def load_task(path) -> dict[str, Any]:
         uid, _, gid = runner["user"].partition(":")
         if int(uid) == 0 or (gid and int(gid) == 0):
             raise ValueError("runner.user must not have uid 0 or gid 0")
+    runner.setdefault("timeout_sec", 300)
+    if runner.get("health_timeout_sec") is None:
+        runner["health_timeout_sec"] = runner.get("timeout_sec")
+    if value.get("restart_command") is None:
+        value["restart_command"] = []
     for key in ("timeout_sec", "health_timeout_sec"):
         if not isinstance(runner.get(key), int) or not 1 <= runner[key] <= 3600:
             raise ValueError(f"runner.{key} must be an integer in 1..3600")
@@ -143,6 +158,19 @@ def normalize_declared_metadata(task: dict[str, Any], route: dict[str, Any]) -> 
             and "public_runner" in task:
         task.pop("public_runner")
         repairs.append("removed public_runner reserved for FILE-POV")
+    runner = task.get("runner")
+    if isinstance(runner, dict) and runner.get("health_timeout_sec") is None:
+        timeout = runner.get("timeout_sec")
+        if isinstance(timeout, int) and not isinstance(timeout, bool) and 1 <= timeout <= 3600:
+            runner["health_timeout_sec"] = timeout
+            repairs.append("defaulted runner.health_timeout_sec to runner.timeout_sec")
+    if "restart_command" in task and task["restart_command"] is None:
+        task["restart_command"] = []
+        repairs.append("defaulted null restart_command to []")
+    expected_healthcheck = {"argv": ["/healthcheck.sh"]}
+    if task.get("healthcheck") != expected_healthcheck:
+        task["healthcheck"] = expected_healthcheck
+        repairs.append("derived healthcheck argv from branch")
     return repairs
 
 

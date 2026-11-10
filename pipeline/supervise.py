@@ -82,13 +82,27 @@ def worker_alive(pid: object) -> bool:
 
 def strictly_accepted(record: dict) -> bool:
     harbor = record.get("harbor") or {}
+    review_ok = (record.get("review") or {}).get("passed") is True
+    runs = harbor.get("acceptance_runs")
+    if runs is not None:
+        return (record.get("status") == "passed" and review_ok
+                and harbor.get("status") == "passed"
+                and isinstance(runs, list) and len(runs) == 2
+                and all(isinstance(run, dict) and run.get("reward") == 1.0 for run in runs))
+    # Historical records used one Harbor gold, one null and a factory
+    # differential. Keep reading them for resume/audit; new acceptance never
+    # writes these fields.
     differential = harbor.get("differential_from_final_bundle") or {}
     report = differential.get("report") or {}
-    protocol_ok = all(
-        (report.get(phase) or {}).get("submission_result", {}).get("returncode") == 0
-        for phase in ("vulnerable", "fixed"))
-    return (record.get("status") == "passed"
-            and (record.get("review") or {}).get("passed") is True
+    vulnerable = report.get("vulnerable") or {}
+    fixed = report.get("fixed") or {}
+    protocol_ok = (
+        vulnerable.get("triggered") is True
+        and (vulnerable.get("health") or {}).get("returncode") == 0
+        and fixed.get("triggered") is False
+        and (fixed.get("solution") or {}).get("returncode") == 0
+        and (fixed.get("patched_health") or {}).get("returncode") == 0)
+    return (record.get("status") == "passed" and review_ok
             and (harbor.get("gold") or {}).get("reward") == 1.0
             and (harbor.get("null") or {}).get("reward") == 0.0
             and differential.get("status") == "passed"
@@ -109,6 +123,32 @@ def latest_turn(path: Path) -> int:
         except OSError:
             pass
     return result
+
+
+TERMINAL_RESULT_STATUSES = {"passed", "failed", "rejected", "error", "timeout"}
+
+
+def rename_if_terminal(results: Path) -> dict[str, str]:
+    """After a batch is truly terminal, use canonical+branch directory names.
+
+    Never rename while a worker is alive or a route-only/synthesis task is still
+    resumable: supervisors address task dirs by the internal selection id.
+    """
+    if os.environ.get("PIPELINE_DISABLE_RESULT_RENAME"):
+        return {}
+    statuses = [load(path, {}).get("status") for path in results.glob("*/result.json")]
+    if not statuses or any(status not in TERMINAL_RESULT_STATUSES for status in statuses):
+        return {}
+    from .rename_results import rename_batch
+    try:
+        mapping = rename_batch(results)
+    except Exception as exc:  # naming must never turn a finished batch into a crash
+        print(f"warning: result-directory rename skipped: {exc}", flush=True)
+        return {}
+    if mapping:
+        print(f"renamed {len(mapping)} result directories to canonical+branch names",
+              flush=True)
+    return mapping
 
 
 def pipeline_worker_command(pid: int, proc_root: Path = Path("/proc")) -> list[str] | None:
@@ -184,12 +224,29 @@ def carry_workspaces(sources: list[Path], results: Path, selected_ids: set[str] 
         mode = plan.get("mode", "review")
         if recovery_plans is not None:
             if plan.get("schema_version") != 1 or plan.get("task_id") != task \
-                    or mode not in {"review", "harbor"}:
-                raise ValueError(f"only review/Harbor delivery carry is supported for {task}")
-        if not (source / "result.json").is_file() or not (source / "workspace/route.json").is_file():
-            raise ValueError(f"carried task lacks a frozen result and frozen route: {source}")
-        if not (source / "synthesis/result.json").is_file() or not (source / "workspace/delivery").is_dir():
-            raise ValueError(f"carried task lacks a completed delivery: {source}")
+                    or mode not in {"route", "route_handoff", "synthesis", "review", "harbor"}:
+                raise ValueError(f"unsupported carried recovery mode for {task}: {mode}")
+        if not (source / "result.json").is_file():
+            raise ValueError(f"carried task lacks a frozen result: {source}")
+        if mode in {"review", "harbor"}:
+            if not (source / "workspace/route.json").is_file():
+                raise ValueError(f"carried task lacks a frozen route: {source}")
+            if not (source / "synthesis/result.json").is_file() \
+                    or not (source / "workspace/delivery").is_dir():
+                raise ValueError(f"carried task lacks a completed delivery: {source}")
+        elif mode == "synthesis":
+            if not (source / "workspace/route.json").is_file() \
+                    or not (source / "workspace/input").is_dir():
+                raise ValueError(f"carried synthesis lacks a frozen route or input: {source}")
+        elif mode == "route_handoff":
+            if not (source / "route/trajectory.jsonl").is_file() \
+                    or not (source / "workspace/input").is_dir():
+                raise ValueError(f"carried route handoff lacks a trajectory or input: {source}")
+        elif mode == "route":
+            if not (source / "workspace/input").is_dir() \
+                    or not ((source / "workspace/route.json").is_file()
+                            or (source / "route/trajectory.jsonl").is_file()):
+                raise ValueError(f"carried route lacks input and route evidence: {source}")
         destination = results / task
         staged_plan = load(destination / "carry-recovery.json", {}) if destination.is_dir() else {}
         if destination.exists() and (recovery_plans is None or staged_plan != plan):
@@ -241,8 +298,12 @@ def launch(task: str, sample: Path, results: Path,
            published_root: Path | None = None, review_turns: int = 70,
            review_timeout: int = 3600, verify_timeout: int = 1800,
            review_delivery: bool = False,
+           continue_synthesis: bool = False,
+           workspace_from: Path | None = None,
+           route_from: Path | None = None,
+           route_handoff: Path | None = None,
            concurrency: int = 30) -> subprocess.Popen:
-    """Launch one new task or resume only its frozen review/Harbor tail."""
+    """Launch one new task or resume only its frozen route/synthesis/review tail."""
     command = [sys.executable, "-m", "pipeline.run", "--sample", str(sample),
                "--results", str(results), "--only", task, "--concurrency", str(concurrency),
                "--max-turns", str(turns), "--route-turns", "45",
@@ -254,6 +315,14 @@ def launch(task: str, sample: Path, results: Path,
         command.append("--review-delivery")
     elif resume_harbor:
         command.append("--resume")
+    elif continue_synthesis:
+        command.append("--continue-synthesis")
+        if workspace_from is not None:
+            command += ["--workspace-from", str(workspace_from)]
+    elif route_handoff is not None:
+        command += ["--route-handoff-from", str(route_handoff)]
+    elif route_from is not None:
+        command += ["--route-from", str(route_from)]
     log = results / task / "supervisor.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("a", encoding="utf-8") as output:
@@ -269,7 +338,7 @@ def main() -> int:
     parser.add_argument("--sample", type=Path, required=True)
     parser.add_argument("--results", type=Path, required=True)
     parser.add_argument("--concurrency", type=int, default=20)
-    parser.add_argument("--max-turns", type=int, default=300)
+    parser.add_argument("--max-turns", type=int, default=400)
     parser.add_argument("--timeout", type=int, default=18000)
     parser.add_argument("--review-turns", type=int, default=100)
     parser.add_argument("--review-timeout", type=int, default=3600)
@@ -291,13 +360,13 @@ def main() -> int:
     parser.add_argument("--batch-number", type=int, help="stable attribution number from the batch coordinator")
     parser.add_argument("--once", action="store_true", help="schedule available work and return")
     args = parser.parse_args()
-    if not 1 <= args.batch_size <= 30:
-        parser.error("--batch-size must be 1..30")
+    if not 1 <= args.batch_size <= 40:
+        parser.error("--batch-size must be 1..40")
     state_sample = load(args.results / "supervisor-state.json", {}).get("sample")
     if state_sample and Path(state_sample).resolve() != args.sample.resolve():
         parser.error("this results directory belongs to a different sample; choose a new results directory")
-    if not 1 <= args.concurrency <= 30:
-        parser.error("concurrency must be 1..30")
+    if not 1 <= args.concurrency <= 40:
+        parser.error("concurrency must be 1..40")
     selected_ids = set(args.only) if args.only else None
     if args.batch_selection and args.results not in args.batch_selection.parents:
         parser.error("--batch-selection must belong to this results directory")
@@ -779,7 +848,6 @@ def main() -> int:
             and Path(child["worker_results"]).resolve() == args.recovery_results.resolve()}
         # Model retries and handoffs are intentionally not supervised. Only a
         # frozen delivery may resume its independent review/Harbor tail.
-        manual_recovery_modes = {"route", "synthesis"}
         for task, recovery_root in shared_recovery_tasks.items():
             child = children.get(task, {})
             source_sample = load(recovery_root / "supervisor-state.json", {}).get("sample")
@@ -908,9 +976,19 @@ def main() -> int:
                 if (plan.get("schema_version") != 1 or plan.get("task_id") != task
                         or plan.get("instance_id") != record.get("instance_id")):
                     raise ValueError(f"invalid carried recovery plan for {task}")
-                if mode in manual_recovery_modes:
-                    children[task]["carry_blocked"] = "manual_recovery_required"
-                    completed.add(task)
+                if mode in {"route", "route_handoff", "synthesis"}:
+                    if mode == "synthesis" and not (args.results / task / "workspace/route.json").is_file():
+                        children[task]["carry_blocked"] = "frozen_route_missing"
+                        completed.add(task)
+                        continue
+                    if mode == "route_handoff" and not (args.results / task / "route/trajectory.jsonl").is_file():
+                        children[task]["carry_blocked"] = "route_trajectory_missing"
+                        completed.add(task)
+                        continue
+                    children[task].update(retry_reason="carry_" + mode,
+                                          carry_recovery_dispatched=True, repair_priority=1,
+                                          carry_blocked=None)
+                    candidates.append(task)
                     continue
                 if mode not in {"review", "harbor"}:
                     raise ValueError(f"unsupported carried recovery plan for {task}")
@@ -969,8 +1047,8 @@ def main() -> int:
                     and load(args.results / task / "review/result.json", {}).get("status") != "max_turns"):
                 # A finished delivery must never be rerouted merely because an
                 # earlier resume overwrote its status or archived its trace.
-                # Reconstruct review-input from the current delivery and launch
-                # the normal independent-review/Harbor tail of the same task.
+                # Rebuild the review evidence snapshot and launch the normal
+                # independent-review/Harbor tail of the same task.
                 children[task].update(retry_reason="review_incomplete",
                                       repair_priority=1)
                 candidates.append(task)
@@ -1641,6 +1719,18 @@ def main() -> int:
                 # retained for a later manual recovery, not another model vote.
                 completed.add(task)
                 continue
+            carry_continue = retry_reason == "carry_synthesis"
+            carry_workspace_from = args.results / task / "workspace" if carry_continue else None
+            carry_route_from = None
+            carry_route_handoff = None
+            if retry_reason == "carry_route":
+                route_path = args.results / task / "workspace/route.json"
+                if route_path.is_file():
+                    carry_route_from = route_path
+                else:
+                    carry_route_handoff = args.results / task / "route/trajectory.jsonl"
+            elif retry_reason == "carry_route_handoff":
+                carry_route_handoff = args.results / task / "route/trajectory.jsonl"
             child = launch(task, Path(child_state["source_sample"]) if task in shared_recovery_tasks
                            and child_state.get("source_sample") else args.sample,
                            worker_results, args.max_turns,
@@ -1649,6 +1739,10 @@ def main() -> int:
                            review_turns=args.review_turns, review_timeout=args.review_timeout,
                            verify_timeout=args.verify_timeout,
                            review_delivery=retry_reason in {"review_incomplete", "carry_review"},
+                           continue_synthesis=carry_continue,
+                           workspace_from=carry_workspace_from,
+                           route_from=carry_route_from,
+                           route_handoff=carry_route_handoff,
                            concurrency=args.concurrency)
             active[task] = child
             if child_state.get("pid") is None:
@@ -1690,12 +1784,14 @@ def main() -> int:
         state["updated_at"] = timestamp()
         atomic_json(state_path, state)
         if args.once:
+            rename_if_terminal(args.results)
             controller_lock.close()
             return 0
         routing = bool(args.from_pilot and any(
             load(args.from_pilot / row["task_id"] / "result.json", {}).get("status") == "routing"
             for row in selected))
         if not active and not routing and not external and not candidates:
+            rename_if_terminal(args.results)
             controller_lock.close()
             return 0
         time.sleep(60)

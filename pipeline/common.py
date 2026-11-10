@@ -76,6 +76,9 @@ def repository_key(value: str | None) -> str:
 
 
 URL_NOISE = re.compile(r"https?-(?:github|gitlab|bitbucket)-(?:com|org)-", re.I)
+CANONICAL_ID_RE = re.compile(
+    r"(?:cve-\d{4}-\d+|osv-\d{4}-\d+|ghsa-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4})",
+    re.I)
 
 
 def repo_short_name(repo: str | None) -> str:
@@ -114,18 +117,35 @@ def branch_suffix(branch: str, host_type: str | None) -> str:
     return re.sub(r"[^a-z0-9]+", "-", branch.lower()).strip("-") or "unknown"
 
 
-def export_task_id(task_id: str, branch: str, host_type: str | None) -> str:
-    """Strip legacy URL noise and append the branch/host_type suffix."""
-    base = URL_NOISE.sub("-", task_id.lower())
-    base = re.sub(r"[^a-z0-9-]+", "-", base)
-    base = re.sub(r"-{2,}", "-", base).strip("-")
+def canonical_slug(value: str | None) -> str:
+    """Extract CVE/OSV/GHSA identity, dropping pool indexes and repository noise."""
+    match = CANONICAL_ID_RE.search(str(value or ""))
+    return match.group(0).lower() if match else ""
+
+
+def display_task_id(value: str | None, branch: str, host_type: str | None) -> str:
+    """Human-facing task name: canonical advisory id + route branch only.
+
+    Examples: ``osv-2020-2098-file-pov``,
+    ``cve-2020-28483-svc-exploit-synthetic-host``.
+    """
+    base = canonical_slug(value)
+    if not base:
+        base = URL_NOISE.sub("-", str(value or "").lower())
+        base = re.sub(r"^linux-\d+-", "", base)
+        base = re.sub(r"[^a-z0-9-]+", "-", base)
+        base = re.sub(r"-{2,}", "-", base).strip("-")
     suffix = branch_suffix(branch, host_type)
-    if not base.endswith("-" + suffix):
-        base = f"{base}-{suffix}"
+    base = f"{base}-{suffix}" if base else suffix
     # Harbor ids are limited to 160 characters; the suffix must survive.
     if len(base) > 160:
         base = base[:160 - len(suffix) - 1].rstrip("-") + "-" + suffix
     return base
+
+
+def export_task_id(task_id: str, branch: str, host_type: str | None) -> str:
+    """Export name: canonical advisory id + branch/host_type suffix."""
+    return display_task_id(task_id, branch, host_type)
 
 
 def inventory(root: Path, exclude: set[str] | None = None) -> dict[str, Any]:

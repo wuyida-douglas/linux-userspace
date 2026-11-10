@@ -16,3 +16,5 @@ work/
 samples/*/tasks/
 samples/*/download-report.json
 samples/*/.staging-*/
+# Local audit records (generated; not pipeline code)
+_audit/
