@@ -503,7 +503,7 @@ def main() -> int:
     parser.add_argument("--review-timeout", type=int, default=3600)
     parser.add_argument("--review-turns", type=int, default=100)
     parser.add_argument("--verify-timeout", type=int, default=3600)
-    parser.add_argument("--accept-turns", type=int, default=3,
+    parser.add_argument("--accept-turns", type=int, default=8,
                         help="max agent turns in each of the two Harbor acceptance runs")
     parser.add_argument("--published-root", type=Path, default=reported_published_root(),
                         help="accepted-only Harbor bundle; never contains failed tasks")

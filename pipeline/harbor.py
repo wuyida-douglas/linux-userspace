@@ -939,7 +939,7 @@ def accept(workspace: Path, output: Path, task_id: str, route: dict[str, Any],
            timeout: int, harbor_jobs: Path | None = None,
            published_root: Path | None = None, *, model: str = "glm-5.3",
            credentials: dict[str, str] | None = None,
-           accept_turns: int = 3) -> dict[str, Any]:
+           accept_turns: int = 8) -> dict[str, Any]:
     delivery = workspace / "delivery"
     if output.exists():
         raise FileExistsError(f"refusing to overwrite acceptance directory {output}")
@@ -965,7 +965,22 @@ def accept(workspace: Path, output: Path, task_id: str, route: dict[str, Any],
         name = re.sub(r"[^a-z0-9-]+", "-", delivery_id)[:90]
         profile = bundle / "harbor-runtime-profile"
         submission = contract["submission_mode"]
-        reference = profile / "tests/private" / f"reference_{submission}"
+        # Acceptance is a verifier check, not a solving run: the reference
+        # submission is already mounted read-only at /workspace/<submission>.
+        # Give the agent an explicit no-op prompt so it does not burn turns
+        # trying to solve the task and exit nonzero at max-turns.
+        accept_profile = output / "accept-profile"
+        if accept_profile.exists():
+            shutil.rmtree(accept_profile)
+        shutil.copytree(profile, accept_profile)
+        (accept_profile / "instruction.md").write_text(
+            "# Reference acceptance\n\n"
+            f"The reference submission is already present read-only at "
+            f"`/workspace/{submission}`. Do not modify it, do not run task "
+            "work, and do not start any service. Reply with one line "
+            "confirming the file is present, then end.\n",
+            encoding="utf-8")
+        reference = accept_profile / "tests/private" / f"reference_{submission}"
         if not reference.is_file():
             raise ValueError(f"missing reference submission: {reference}")
         claude_bin, claude_version = claude_agent()
@@ -979,12 +994,12 @@ def accept(workspace: Path, output: Path, task_id: str, route: dict[str, Any],
         # write through a bind; restore the seal before the second run, then
         # require the same Pass2Fail on the restored package. This tests that
         # the bind design can recover from a dirty run, not that dirt is safe.
-        extract_pristine_binds(profile, profile / "environment")
+        extract_pristine_binds(accept_profile, accept_profile / "environment")
         for attempt in (1, 2):
             if attempt == 2:
-                extract_pristine_binds(profile, profile / "environment")
+                extract_pristine_binds(accept_profile, accept_profile / "environment")
             run = harbor_run(
-                profile, jobs, f"{name}-accept-{attempt}", timeout,
+                accept_profile, jobs, f"{name}-accept-{attempt}", timeout,
                 agent="claude-code", model=model, credentials=credentials,
                 mounts=mounts, max_turns=accept_turns, agent_version=claude_version)
             run["attempt"] = attempt
