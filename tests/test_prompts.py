@@ -23,6 +23,12 @@ class IsolationPromptTests(unittest.TestCase):
             with self.subTest(stage=name):
                 self.assertIn("ISOLATION", getattr(prompts, name))
 
+    def test_file_pov_oracle_receives_the_input_path(self):
+        from pipeline.prompts import branch_prompt
+        prompt = branch_prompt("FILE-POV")
+        self.assertIn("/run/pass2fail/input.bin", prompt)
+        self.assertIn("with that path as `$1`", prompt)
+
     def test_review_uses_two_decision_levels_and_a_two_key_output(self):
         from pipeline.prompts import REVIEW
         self.assertIn("exactly two decision", REVIEW)

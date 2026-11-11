@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 import re
-import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -165,16 +164,3 @@ def inventory(root: Path, exclude: set[str] | None = None) -> dict[str, Any]:
 
 def timestamp() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-
-def run_logged(command: list[str], log: Path, *, cwd: Path | None = None,
-               env: dict[str, str] | None = None, timeout: int = 3600) -> subprocess.CompletedProcess:
-    log.parent.mkdir(parents=True, exist_ok=True)
-    with log.open("w", encoding="utf-8") as handle:
-        try:
-            completed = subprocess.run(command, cwd=cwd, env=env, stdout=handle,
-                                       stderr=subprocess.STDOUT, timeout=timeout, check=False)
-        except subprocess.TimeoutExpired as exc:
-            handle.write(f"\nTimed out after {exc.timeout}s\n")
-            return subprocess.CompletedProcess(command, 124, "", "timeout")
-    return completed

@@ -40,6 +40,13 @@ class PublicContractTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     validate_public_services(value)
 
+    def test_public_assets_are_not_rejected_by_name_substrings(self):
+        value = self.services()
+        value["client"]["volumes"] = ["./fixed-assets:/assets:ro", "./private-data:/data:ro"]
+        value["client"]["healthcheck"] = {
+            "test": ["CMD-SHELL", "test -f /vault/private/ready"]}
+        validate_public_services(value)
+
     def test_static_ip_and_development_lease_do_not_enter_public_contract(self):
         value = self.services()
         value["client"]["networks"] = {"default": {"ipv4_address": "10.80.1.9"}}
@@ -318,10 +325,14 @@ class OracleContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "review.json").write_text('{"passed": false}')
-            with self.assertRaisesRegex(ValueError, "review.json must contain exactly"):
+            with self.assertRaisesRegex(ValueError, "review.json must include"):
                 run.review(root)
             (root / "review.json").write_text(
                 '{"passed": false, "evidence": "oracle trusts submission stdout"}')
+            self.assertEqual(run.review(root),
+                             {"passed": False, "evidence": "oracle trusts submission stdout"})
+            (root / "review.json").write_text(
+                '{"passed": false, "evidence": "oracle trusts submission stdout", "notes": "advisory"}')
             self.assertEqual(run.review(root),
                              {"passed": False, "evidence": "oracle trusts submission stdout"})
 

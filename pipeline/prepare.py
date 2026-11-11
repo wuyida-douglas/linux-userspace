@@ -132,12 +132,6 @@ def sample_all(path: Path) -> list[dict[str, Any]]:
         raise ValueError("candidate pool is empty")
     return [sample_from_row(row, index) for index, row in enumerate(rows, 1)]
 
-
-def complete_instances(path: Path) -> set[str]:
-    return {row["instance_id"] for row in read_jsonl(path)
-            if row.get("status") == "complete" and row.get("integrity_ok") is not False}
-
-
 def safe_prepare(row: dict[str, Any], destination: Path, remote: str,
                  aliases: dict[str, list[str]] | None = None) -> dict[str, Any]:
     try:

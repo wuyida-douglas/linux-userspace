@@ -1,6 +1,6 @@
 # Pipeline Prompts（完整版）
 
-> 来源：`pipeline/prompts.py`，2026-11-10。
+> 来源：`pipeline/prompts.py`，2026-11-11。
 > 每个分支的合成 Prompt 已经展开为
 > `SHARED + SYNTHESIZE + BRANCH_GUIDES[<branch>]`；
 > 不需要再跳到分支指南或其它章节拼接阅读。
@@ -23,6 +23,19 @@ Do not modify immutable input/ or any pipeline source files.
 Git operations must target repositories inside this workspace.
 Read NETWORK.md before package installation or image pulls.
 Keep credentials out of files, logs, images, Compose, and command arguments.
+
+ISOLATION — read this before doing anything:
+- Do not list, scan, search, find, grep, read, copy or inspect any path outside
+  this workspace. This includes sibling task directories, every other run under
+  results/, /home/*/.claude, /memory/, and the shared memory directory.
+- Do not read, use or trust any memory, memory index, MEMORY.md, recipe, note,
+  transcript or saved conclusion from a previous session or another run, even if
+  it claims this exact task was already delivered.
+- Do not use, copy, mount, read or consult any previously synthesized task
+  artifact: another run's delivery/, .agent-tmp/, images, oracle, solution,
+  patch, verification, gold, or harness. If you find one, ignore it and report it.
+- Start from input/ and build this task from scratch in this workspace. Copying or
+  reusing a prior delivery is a synthesis failure and invalidates the task.
 
 Read the focused fields of input/meta.json (not all affected distribution versions),
 input/alternate-candidates.json, input/fix.diff if present, and only the implicated
@@ -158,6 +171,19 @@ Git operations must target repositories inside this workspace.
 Read NETWORK.md before package installation or image pulls.
 Keep credentials out of files, logs, images, Compose, and command arguments.
 
+ISOLATION — read this before doing anything:
+- Do not list, scan, search, find, grep, read, copy or inspect any path outside
+  this workspace. This includes sibling task directories, every other run under
+  results/, /home/*/.claude, /memory/, and the shared memory directory.
+- Do not read, use or trust any memory, memory index, MEMORY.md, recipe, note,
+  transcript or saved conclusion from a previous session or another run, even if
+  it claims this exact task was already delivered.
+- Do not use, copy, mount, read or consult any previously synthesized task
+  artifact: another run's delivery/, .agent-tmp/, images, oracle, solution,
+  patch, verification, gold, or harness. If you find one, ignore it and report it.
+- Start from input/ and build this task from scratch in this workspace. Copying or
+  reusing a prior delivery is a synthesis failure and invalidates the task.
+
 Read route.json and create the selected task under delivery/. If the selected
 route proves unworkable, write failure.json with a concrete reason and
 experimental evidence, then stop rather than silently changing the task contract.
@@ -264,6 +290,17 @@ overrides main.command with a python3 blocking process and main.working_dir with
 linux-userspace-agent:22.04) for main; use a task-specific main image only when
 the analysis genuinely needs tools that the shared image lacks. In that case its
 healthcheck must still be image-agnostic, because Harbor may replace main.image.
+Solvability is part of the task. The solving agent only has main and
+instruction.md; it has no shell in client and cannot read the target filesystem.
+main MUST contain every source tree, file and analysis tool the instruction
+tells the agent to use, and must be able to reach the public target interface
+the branch guide specifies on the Compose network. The instruction must name
+the exact path/tool/endpoint. Do not claim a path, tool or endpoint that is not
+actually present in main or the public target; do not require a live target
+shell when the branch's public interface is a one-shot submission. If the task
+is only solvable with host-only, private or unstated material, it is not a valid
+task. Build the main image and verify the exact paths/tools you claim, including
+a normal main-to-target request when the branch is network-facing.
 The public Compose main.image is authoritative for images.agent. If you build a
 task-specific main, retag it and set that exact tag on Compose main. A raw
 ubuntu:22.04 is only a base for that build, not a valid analysis image by itself.
@@ -307,6 +344,17 @@ in main.
 All public healthchecks must reach the real service normally. The oracle MUST
 exit exactly 0 when the vulnerability effect is present and 1
 when it is absent. Any other exit code is a verifier error, not a patched pass.
+Public Compose healthchecks must be self-contained in the public images.
+`/healthcheck.sh` is mounted only by the private verifier during scoring; the
+public client image does not contain it unless you bake it. If public Compose
+invokes `bash /healthcheck.sh`, bake a copy at that exact path into the client
+image, or use a command that exists in the image. Test
+`docker compose -f delivery/environment/docker-compose.yaml up --wait` on a
+fresh public environment; every service must become healthy. These are two
+different healthchecks: `delivery/private/healthcheck.sh` is the verifier-only
+normal-function gate; the public Compose healthcheck must be a separate
+image-owned liveness/benign check. Never point public Compose at the private
+`/healthcheck.sh`.
 Use a plain
 blocking command ["sleep", "infinity"] (or a real service command). Do not set a
 shell -c image entrypoint: Harbor replaces main.command with a Python blocking
@@ -355,6 +403,16 @@ path root-owned or otherwise unwritable by the target uid, or disable interprete
 shell escapes (for example -DSQLITE_NOHAVE_SYSTEM). It may read a private expected
 flag created statically in the target image; main/runner never receive it.
 A benign control must remain healthy.
+The vulnerable-side signal MUST come from the submission's effect, not from a
+probe the oracle runs itself: an oracle that first probes the target to
+establish "vulnerable" and then only checks a journal/log shape lets a no-op
+submission pass. The oracle must attribute the effect to the CVE (faulting
+function/frame, protected-data value, or a documented client-visible effect),
+and a negative control (a different crash, a forged log, an all-values POST, or
+a benign input) must score absent. If the oracle re-executes the submission,
+run that re-execution as the declared unprivileged runner uid, not root; keep
+gold and other private material out of the re-executed process's reachable
+paths.
 
 At every scoring round, the verifier creates fresh containers, checks health, runs the same
 submission, checks oracle, destroys everything, then repeats after solution.sh. A missing
@@ -364,8 +422,19 @@ manually restart a daemon during development, solution.sh MUST perform the
 equivalent safe target-local restart itself, and you must repeat the self-check
 through the actual verifier without an extra manual restart.
 Patching source without replacing the running process is an incomplete solution.
+The demonstrated vulnerability A in instruction.md, the effect the oracle judges,
+and the code the patch fixes MUST be the same A. If the supplied fix.diff does
+not touch the demonstrated file/function, recover the real upstream fix from
+history (git log -S, advisory commit, tag comparison) or re-scope the
+demonstrated effect to the bug the supplied fix actually fixes; never construct
+a "selector" differential where an unrelated input feature makes the fixed build
+exit early. An advisory PoC that still crashes the fixed build means the fixed
+side does not fix A.
 solution.sh must apply the genuine security fix, not bypass the oracle or change unrelated
-mitigations. For binary vulnerabilities solution.sh must perform the offline build and
+mitigations. Read the private patch from `/private/patch.diff` (or accept the path
+as `$1`), never assume `/patch.diff`. After restarting the target, poll until the
+service is healthy and re-run the same submission; a fixed-sleep restart race is a
+delivery defect. Test solution.sh in a fresh vulnerable target, not only in dev. For binary vulnerabilities solution.sh must perform the offline build and
 replacement itself, verify the actual ELF/library replacement,
 architecture/dependencies/mitigations and real loading path; a source edit or successful
 make without replacing the live binary is not a fix. Include all
@@ -398,6 +467,10 @@ Implement the exact route.json host_type; all three host types are valid:
   effect in host code. Record the public API, network-to-API mapping and normal
   caller/security boundary in project documentation. The adapter must forward the
   same attack input to the same affected code on vulnerable and fixed builds.
+Solvability: main MUST reach the public target as client:PORT on the Compose
+network; instruction must name that endpoint. Start the public Compose and
+verify a normal request from main before finishing. A verifier that works but a
+main that cannot reach the service is not a valid task.
 For any host type, use a native protocol/client when one exists rather than
 gratuitous HTTP; a small protocol adapter is acceptable when justified for
 synthetic_host. If the intended host cannot provide a real reachable path or
@@ -440,7 +513,7 @@ The runner has a read-only root filesystem and /workspace; write transcripts
 only to /work, /output or /tmp. Its gold exploit must finish the protocol
 exchange normally on both vulnerable and fixed targets. An expected fixed-target
 rejection is not an exploit traceback. If a protocol requires raw AF_PACKET,
-first try ordinary UDP/TCP; if no unprivileged path exists, record the blocker
+first try ordinary UDP/TCP; if no unprivileged path exists, record the limitation
 instead of weakening isolation or using capabilities, NET_RAW or setuid helpers.
 solution.sh must restart a patched daemon itself. The fixed phase applies
 solution.sh, checks health and reruns the same exploit.
@@ -465,6 +538,19 @@ Do not modify immutable input/ or any pipeline source files.
 Git operations must target repositories inside this workspace.
 Read NETWORK.md before package installation or image pulls.
 Keep credentials out of files, logs, images, Compose, and command arguments.
+
+ISOLATION — read this before doing anything:
+- Do not list, scan, search, find, grep, read, copy or inspect any path outside
+  this workspace. This includes sibling task directories, every other run under
+  results/, /home/*/.claude, /memory/, and the shared memory directory.
+- Do not read, use or trust any memory, memory index, MEMORY.md, recipe, note,
+  transcript or saved conclusion from a previous session or another run, even if
+  it claims this exact task was already delivered.
+- Do not use, copy, mount, read or consult any previously synthesized task
+  artifact: another run's delivery/, .agent-tmp/, images, oracle, solution,
+  patch, verification, gold, or harness. If you find one, ignore it and report it.
+- Start from input/ and build this task from scratch in this workspace. Copying or
+  reusing a prior delivery is a synthesis failure and invalidates the task.
 
 Read route.json and create the selected task under delivery/. If the selected
 route proves unworkable, write failure.json with a concrete reason and
@@ -572,6 +658,17 @@ overrides main.command with a python3 blocking process and main.working_dir with
 linux-userspace-agent:22.04) for main; use a task-specific main image only when
 the analysis genuinely needs tools that the shared image lacks. In that case its
 healthcheck must still be image-agnostic, because Harbor may replace main.image.
+Solvability is part of the task. The solving agent only has main and
+instruction.md; it has no shell in client and cannot read the target filesystem.
+main MUST contain every source tree, file and analysis tool the instruction
+tells the agent to use, and must be able to reach the public target interface
+the branch guide specifies on the Compose network. The instruction must name
+the exact path/tool/endpoint. Do not claim a path, tool or endpoint that is not
+actually present in main or the public target; do not require a live target
+shell when the branch's public interface is a one-shot submission. If the task
+is only solvable with host-only, private or unstated material, it is not a valid
+task. Build the main image and verify the exact paths/tools you claim, including
+a normal main-to-target request when the branch is network-facing.
 The public Compose main.image is authoritative for images.agent. If you build a
 task-specific main, retag it and set that exact tag on Compose main. A raw
 ubuntu:22.04 is only a base for that build, not a valid analysis image by itself.
@@ -615,6 +712,17 @@ in main.
 All public healthchecks must reach the real service normally. The oracle MUST
 exit exactly 0 when the vulnerability effect is present and 1
 when it is absent. Any other exit code is a verifier error, not a patched pass.
+Public Compose healthchecks must be self-contained in the public images.
+`/healthcheck.sh` is mounted only by the private verifier during scoring; the
+public client image does not contain it unless you bake it. If public Compose
+invokes `bash /healthcheck.sh`, bake a copy at that exact path into the client
+image, or use a command that exists in the image. Test
+`docker compose -f delivery/environment/docker-compose.yaml up --wait` on a
+fresh public environment; every service must become healthy. These are two
+different healthchecks: `delivery/private/healthcheck.sh` is the verifier-only
+normal-function gate; the public Compose healthcheck must be a separate
+image-owned liveness/benign check. Never point public Compose at the private
+`/healthcheck.sh`.
 Use a plain
 blocking command ["sleep", "infinity"] (or a real service command). Do not set a
 shell -c image entrypoint: Harbor replaces main.command with a Python blocking
@@ -663,6 +771,16 @@ path root-owned or otherwise unwritable by the target uid, or disable interprete
 shell escapes (for example -DSQLITE_NOHAVE_SYSTEM). It may read a private expected
 flag created statically in the target image; main/runner never receive it.
 A benign control must remain healthy.
+The vulnerable-side signal MUST come from the submission's effect, not from a
+probe the oracle runs itself: an oracle that first probes the target to
+establish "vulnerable" and then only checks a journal/log shape lets a no-op
+submission pass. The oracle must attribute the effect to the CVE (faulting
+function/frame, protected-data value, or a documented client-visible effect),
+and a negative control (a different crash, a forged log, an all-values POST, or
+a benign input) must score absent. If the oracle re-executes the submission,
+run that re-execution as the declared unprivileged runner uid, not root; keep
+gold and other private material out of the re-executed process's reachable
+paths.
 
 At every scoring round, the verifier creates fresh containers, checks health, runs the same
 submission, checks oracle, destroys everything, then repeats after solution.sh. A missing
@@ -672,8 +790,19 @@ manually restart a daemon during development, solution.sh MUST perform the
 equivalent safe target-local restart itself, and you must repeat the self-check
 through the actual verifier without an extra manual restart.
 Patching source without replacing the running process is an incomplete solution.
+The demonstrated vulnerability A in instruction.md, the effect the oracle judges,
+and the code the patch fixes MUST be the same A. If the supplied fix.diff does
+not touch the demonstrated file/function, recover the real upstream fix from
+history (git log -S, advisory commit, tag comparison) or re-scope the
+demonstrated effect to the bug the supplied fix actually fixes; never construct
+a "selector" differential where an unrelated input feature makes the fixed build
+exit early. An advisory PoC that still crashes the fixed build means the fixed
+side does not fix A.
 solution.sh must apply the genuine security fix, not bypass the oracle or change unrelated
-mitigations. For binary vulnerabilities solution.sh must perform the offline build and
+mitigations. Read the private patch from `/private/patch.diff` (or accept the path
+as `$1`), never assume `/patch.diff`. After restarting the target, poll until the
+service is healthy and re-run the same submission; a fixed-sleep restart race is a
+delivery defect. Test solution.sh in a fresh vulnerable target, not only in dev. For binary vulnerabilities solution.sh must perform the offline build and
 replacement itself, verify the actual ELF/library replacement,
 architecture/dependencies/mitigations and real loading path; a source edit or successful
 make without replacing the live binary is not a fix. Include all
@@ -692,6 +821,10 @@ useful than running out of turns with only exploratory files.
 Branch guide -- FILE-EXPLOIT:
 Use one input file with a documented release CLI or a thin public-API runner.
 Build the real release target without ASAN/UBSAN for the exploit experiment.
+Solvability: main MUST contain the target source tree or the exact analysis
+material the instruction names, plus the tools needed to build the input. The
+runner is one-shot; do not require a live target shell. Verify the claimed
+paths/tools by running the main image.
 Demonstrate an unauthorized effect with a concrete canary or protected-data
 boundary. A crash, ASAN finding, ordinary error, or reading a file that the
 process already legitimately may read does not qualify. Run exactly the same
@@ -735,6 +868,19 @@ Git operations must target repositories inside this workspace.
 Read NETWORK.md before package installation or image pulls.
 Keep credentials out of files, logs, images, Compose, and command arguments.
 
+ISOLATION — read this before doing anything:
+- Do not list, scan, search, find, grep, read, copy or inspect any path outside
+  this workspace. This includes sibling task directories, every other run under
+  results/, /home/*/.claude, /memory/, and the shared memory directory.
+- Do not read, use or trust any memory, memory index, MEMORY.md, recipe, note,
+  transcript or saved conclusion from a previous session or another run, even if
+  it claims this exact task was already delivered.
+- Do not use, copy, mount, read or consult any previously synthesized task
+  artifact: another run's delivery/, .agent-tmp/, images, oracle, solution,
+  patch, verification, gold, or harness. If you find one, ignore it and report it.
+- Start from input/ and build this task from scratch in this workspace. Copying or
+  reusing a prior delivery is a synthesis failure and invalidates the task.
+
 Read route.json and create the selected task under delivery/. If the selected
 route proves unworkable, write failure.json with a concrete reason and
 experimental evidence, then stop rather than silently changing the task contract.
@@ -841,6 +987,17 @@ overrides main.command with a python3 blocking process and main.working_dir with
 linux-userspace-agent:22.04) for main; use a task-specific main image only when
 the analysis genuinely needs tools that the shared image lacks. In that case its
 healthcheck must still be image-agnostic, because Harbor may replace main.image.
+Solvability is part of the task. The solving agent only has main and
+instruction.md; it has no shell in client and cannot read the target filesystem.
+main MUST contain every source tree, file and analysis tool the instruction
+tells the agent to use, and must be able to reach the public target interface
+the branch guide specifies on the Compose network. The instruction must name
+the exact path/tool/endpoint. Do not claim a path, tool or endpoint that is not
+actually present in main or the public target; do not require a live target
+shell when the branch's public interface is a one-shot submission. If the task
+is only solvable with host-only, private or unstated material, it is not a valid
+task. Build the main image and verify the exact paths/tools you claim, including
+a normal main-to-target request when the branch is network-facing.
 The public Compose main.image is authoritative for images.agent. If you build a
 task-specific main, retag it and set that exact tag on Compose main. A raw
 ubuntu:22.04 is only a base for that build, not a valid analysis image by itself.
@@ -884,6 +1041,17 @@ in main.
 All public healthchecks must reach the real service normally. The oracle MUST
 exit exactly 0 when the vulnerability effect is present and 1
 when it is absent. Any other exit code is a verifier error, not a patched pass.
+Public Compose healthchecks must be self-contained in the public images.
+`/healthcheck.sh` is mounted only by the private verifier during scoring; the
+public client image does not contain it unless you bake it. If public Compose
+invokes `bash /healthcheck.sh`, bake a copy at that exact path into the client
+image, or use a command that exists in the image. Test
+`docker compose -f delivery/environment/docker-compose.yaml up --wait` on a
+fresh public environment; every service must become healthy. These are two
+different healthchecks: `delivery/private/healthcheck.sh` is the verifier-only
+normal-function gate; the public Compose healthcheck must be a separate
+image-owned liveness/benign check. Never point public Compose at the private
+`/healthcheck.sh`.
 Use a plain
 blocking command ["sleep", "infinity"] (or a real service command). Do not set a
 shell -c image entrypoint: Harbor replaces main.command with a Python blocking
@@ -932,6 +1100,16 @@ path root-owned or otherwise unwritable by the target uid, or disable interprete
 shell escapes (for example -DSQLITE_NOHAVE_SYSTEM). It may read a private expected
 flag created statically in the target image; main/runner never receive it.
 A benign control must remain healthy.
+The vulnerable-side signal MUST come from the submission's effect, not from a
+probe the oracle runs itself: an oracle that first probes the target to
+establish "vulnerable" and then only checks a journal/log shape lets a no-op
+submission pass. The oracle must attribute the effect to the CVE (faulting
+function/frame, protected-data value, or a documented client-visible effect),
+and a negative control (a different crash, a forged log, an all-values POST, or
+a benign input) must score absent. If the oracle re-executes the submission,
+run that re-execution as the declared unprivileged runner uid, not root; keep
+gold and other private material out of the re-executed process's reachable
+paths.
 
 At every scoring round, the verifier creates fresh containers, checks health, runs the same
 submission, checks oracle, destroys everything, then repeats after solution.sh. A missing
@@ -941,8 +1119,19 @@ manually restart a daemon during development, solution.sh MUST perform the
 equivalent safe target-local restart itself, and you must repeat the self-check
 through the actual verifier without an extra manual restart.
 Patching source without replacing the running process is an incomplete solution.
+The demonstrated vulnerability A in instruction.md, the effect the oracle judges,
+and the code the patch fixes MUST be the same A. If the supplied fix.diff does
+not touch the demonstrated file/function, recover the real upstream fix from
+history (git log -S, advisory commit, tag comparison) or re-scope the
+demonstrated effect to the bug the supplied fix actually fixes; never construct
+a "selector" differential where an unrelated input feature makes the fixed build
+exit early. An advisory PoC that still crashes the fixed build means the fixed
+side does not fix A.
 solution.sh must apply the genuine security fix, not bypass the oracle or change unrelated
-mitigations. For binary vulnerabilities solution.sh must perform the offline build and
+mitigations. Read the private patch from `/private/patch.diff` (or accept the path
+as `$1`), never assume `/patch.diff`. After restarting the target, poll until the
+service is healthy and re-run the same submission; a fixed-sleep restart race is a
+delivery defect. Test solution.sh in a fresh vulnerable target, not only in dev. For binary vulnerabilities solution.sh must perform the offline build and
 replacement itself, verify the actual ELF/library replacement,
 architecture/dependencies/mitigations and real loading path; a source edit or successful
 make without replacing the live binary is not a fix. Include all
@@ -959,7 +1148,12 @@ source tree, or rebuilding a known-good image. A complete imperfect delivery is 
 useful than running out of turns with only exploratory files.
 
 Branch guide -- FILE-POV:
-Give the player one input file and a fixed, documented runner. Reproduce the
+Give the player one input file and a fixed, documented runner.
+Solvability: main MUST contain the target source tree (or the exact files the
+instruction tells the agent to study) and the analysis tools; the target is a
+one-shot runner, not a live shell. Verify the claimed paths/tools by running the
+main image. If the instruction names /opt/...-src, it must exist in main.
+Reproduce the
 specific vulnerability with the appropriate oracle: ASAN/UBSAN error type and
 implicated target stack for native code (resolve recorded binary offsets offline
 with addr2line if inline functions do not produce an explicit function label);
@@ -997,6 +1191,10 @@ The controller carries it into the generated delivery manifest and removes the
 extension from the exported Compose. Leave runner.command=[]; do not declare an
 exploit.py runner command. The verifier
 copies input.bin read-only into a fresh client and executes public_runner there.
+It also copies the submission to `/run/pass2fail/input.bin` in client and invokes
+`oracle.sh` with that path as `$1`. The oracle must accept `$1` (or read
+`/run/pass2fail/input.bin` directly); do not require the input under `/private`,
+`/workspace`, `/tmp`, or any other guessed path.
 oracle.sh checks the precise sanitizer/runtime/resource effect and implicated
 target, not any nonzero exit. A benign control must remain healthy. Do not key
 the oracle to the gold input's exact size, offset, marker filename or payload
@@ -1024,6 +1222,19 @@ Git operations must target repositories inside this workspace.
 Read NETWORK.md before package installation or image pulls.
 Keep credentials out of files, logs, images, Compose, and command arguments.
 
+ISOLATION — read this before doing anything:
+- Do not list, scan, search, find, grep, read, copy or inspect any path outside
+  this workspace. This includes sibling task directories, every other run under
+  results/, /home/*/.claude, /memory/, and the shared memory directory.
+- Do not read, use or trust any memory, memory index, MEMORY.md, recipe, note,
+  transcript or saved conclusion from a previous session or another run, even if
+  it claims this exact task was already delivered.
+- Do not use, copy, mount, read or consult any previously synthesized task
+  artifact: another run's delivery/, .agent-tmp/, images, oracle, solution,
+  patch, verification, gold, or harness. If you find one, ignore it and report it.
+- Start from input/ and build this task from scratch in this workspace. Copying or
+  reusing a prior delivery is a synthesis failure and invalidates the task.
+
 You are an independent reviewer in a new session. Do not trust claims in the
 synthesis transcript. Read route.json, delivery/,
 review-input/live.chat.md (full transcript) and review-input/tool-calls.jsonl.
@@ -1031,21 +1242,47 @@ live.chat.md preserves pre-compaction
 events; do not treat a Claude Code compaction boundary as lost history.
 Pass/fail scope is ONLY whether this is a good training task for an agent: a real
 vulnerability, a genuinely reachable entry, a deterministic vulnerable/fixed
-differential, and meaningful analysis or interaction. Packaging and delivery
-hygiene is advisory, not a suitability verdict: credentials in image build
-history, hash transcription typos, Dockerfile/Compose ergonomics, and flaky
-offline build retries in solution.sh must be recorded as minor findings but must NOT set
-passed=false; repair them outside this gate. A blocker or major finding about
-suitability (fabricated vulnerability, wrong repository, unreachable entry,
-forged or shortcut oracle, crash-only EXPLOIT, arbitrary exception as POV) does
-mean passed=false.
+differential, and meaningful analysis or interaction. Use exactly two decision
+levels for the verdict:
+- suitability failure: a fabricated vulnerability, wrong repository, unreachable
+  entry, forged or shortcut oracle, crash-only EXPLOIT, arbitrary exception as
+  POV, unsolvable main, inconsistent A/A/A, or other defect that makes the task
+  unsuitable for training. A suitability failure means passed=false.
+- advisory note: packaging and delivery hygiene, such as credentials in image
+  build history, hash transcription typos, Dockerfile/Compose ergonomics, or
+  flaky offline build retries in solution.sh. Put advisory notes in evidence but
+  do NOT set passed=false for them; repair them outside this gate.
+Do not use severity labels as output fields. The only output is the two-key JSON
+at the end of this prompt.
+Public Compose hygiene is a review check, not a substring scan. Container-internal
+absolute paths inside healthcheck commands are allowed (for example
+`/vault/private/ready`). Reject only real leaks: a bind source outside the `./`
+environment assets, a bind of private/gold/fixed material or docker.sock, host
+paths, `ANTHROPIC_*` credentials, or a credential/docker socket in any public
+service. Do not reject a task merely because the string `private/` appears inside
+a container-internal command. Review is read-only: write only `review.json`; do
+not modify `delivery/` or any task file.
+Solvability is a primary suitability check: the solving agent only has main and
+instruction.md. Verify that main actually contains every source tree, file and
+tool the instruction tells the agent to use, and that main can reach the target
+as client:PORT for SVC. Run the main image and test the exact paths/tools; do
+not pass on Dockerfile claims alone. A task whose verifier is perfect but whose
+agent environment lacks the source/tools/network is unsolvable and must be
+passed=false. For FILE-POV the target is a one-shot runner, not a live shell;
+do not demand an interactive target, but do demand the target source/analysis
+material in main.
+Verify task self-consistency: the vulnerability A described in instruction.md,
+the effect oracle.sh judges, and the code patch.diff actually fixes must be the
+same A. If patch.diff does not touch the demonstrated function/file, or an
+advisory PoC still crashes the fixed build, that is a suitability failure unless the
+delivery documents a recovered authoritative fix or a re-scoped effect.
 Inspect the actual source, patch, Dockerfile, public
 entry, gold and verifier. If route.json recovery_required=true, read
 project/source-recovery.json and verify the authoritative source, recovered
 vulnerable/fixed revisions and checksums. An initially mismatched supplied patch
 is not grounds to discard a valid recovered pair, but false claims that the
 supplied input contained the recovered source/fix or that recovery_required was
-false are major provenance findings requiring correction. The final recovery
+false are provenance suitability failures requiring correction. The final recovery
 record must agree with route.json and the immutable input. Look for fabricated vulnerabilities,
 unrelated projects, unjustified recovery revisions, modified vulnerable/fixed
 behavior, meaningless service wrappers,
@@ -1061,52 +1298,72 @@ permissions, unchanged vulnerable component, meaningful security boundary, and
 whether host code itself fabricates the unauthorized effect or gives the answer.
 The vulnerable and fixed targets must use the same host/runner/oracle code. Any
 shared patch hunk to host, runner, HTTP error handling, or oracle code unrelated
-to the vulnerable component is a blocker. A single 500, connection abort, or
+to the vulnerable component is a suitability failure. A single 500, connection abort, or
 exception-class change is not SVC DoS; a persistent service/resource impact with
 controls is required. The target-side oracle must judge the effect actually
 observed by the public protocol client, not redefine a route's promised HTTP 500
 as a connection abort or audit-log entry after the fact. Any mismatch between
-route, public instruction, client-visible effect, and oracle is a blocker.
+route, public instruction, client-visible effect, and oracle is a suitability failure.
 If the delivery establishes only a valid FILE-POV rather than the routed SVC,
-record a blocker and identify the branch-mismatch evidence; do not bless it as SVC.
+set passed=false, explain the branch-mismatch evidence, and do not bless it as SVC.
 A mislabeled host type, meaningless HTTP wrapper around a one-shot parser, or
-reversed client/server attack role is a blocker. A well-justified synthetic_host
+reversed client/server attack role is a suitability failure. A well-justified synthetic_host
 is not. It must receive the same attack through the same adapter on vuln and fixed.
 The public main is only an analysis workstation; declare working_dir=/workspace
 so Harbor can deliver and collect the submission. An absent or disabled main/client
-healthcheck is a blocker. A client healthcheck that invokes /private is also a blocker:
+healthcheck is a suitability failure. A client healthcheck that invokes /private is also a suitability failure:
 public Compose never receives private material; bake a public healthcheck and benign
 control into the target image. All three branches require an independent prebuilt client
 image/container. A same-container main+target, a target image used as main, or a main
 image with a ready-built vulnerable program/plugin/runtime (rather than only source
-and analysis/build tools) is a blocker. Exercise main's public healthcheck and inspect
+and analysis/build tools) is a suitability failure. Exercise main's public healthcheck and inspect
 the actual image for this isolation, not just its service name.
+For the public environment, run
+`docker compose -f delivery/environment/docker-compose.yaml up --wait` and
+reject if any service is unhealthy. A public client healthcheck that invokes
+`/healthcheck.sh` while the public image does not contain that file is a
+suitability failure: `/healthcheck.sh` is mounted only by the private verifier,
+not by public Compose. Bake a public healthcheck into the target image or use a
+command that exists there. Do not confuse the two: `private/healthcheck.sh` is
+verifier-only; public Compose must use an image-owned check. Run `solution.sh` in a fresh vulnerable target twice;
+it must read `/private/patch.diff` (or `$1`), not assume `/patch.diff`, and after
+restart it must poll the service healthy before the same submission. A missing
+patch or a fixed-sleep restart race is a suitability failure. Run the reference
+gold in the same fresh acceptance-like environment; if it does not trigger the
+declared effect, that is also a suitability failure.
 Any public service with a host port mapping (`ports:`), `build`, `privileged`,
 `pid`, `network_mode`, capabilities/devices/security_opt overrides, any bind
 outside a real non-symlink `./` asset beneath environment/, a private path,
-container_name, static IP/IPAM, or without an explicit prebuilt image is a blocker.
+container_name, static IP/IPAM, or without an explicit prebuilt image is a suitability failure.
 `ports: ["8080"]` is also a forbidden host publication, not a container-only
 listener. main/runner must use Compose service DNS and client:PORT instead.
 No fixed/development IPAM override may enter the exported Compose.
 All public services need enabled healthchecks. main.image must be omitted or exactly
 task.json.images.agent; any other tag (including a shared analysis tag when task.json
-declares a task-specific agent image) is a blocker. main must provide bash, python3
+declares a task-specific agent image) is a suitability failure. main must provide bash, python3
 and /usr/bin/env; its image and client.image must be distinct. The submission is
 a regular, nonempty, non-symlink file <=16 MiB. Public Compose must not expose a runner service;
-the private verifier creates it. Any public_tests/private verify.sh is legacy and a blocker.
+the private verifier creates it. Any public_tests/private verify.sh is legacy and a suitability failure.
 task.json is generated by the controller, not written by the synthesis agent; verify it
 against route and actual images. runner.image must be null because the verifier creates
 the submission runner as a separate container from images.agent. The runner must be
 unprivileged and have no private mounts or Docker socket; oracle/solution may run only on
 the target. Exercise the exact private healthcheck in the runner container as uid 65534; exit 127 or a
-missing interpreter/tool is a blocker, not a target failure.
+missing interpreter/tool is a suitability failure, not a target failure.
 Oracle must exit 0 iff the effect exists and exactly 1 for a definite absence;
 any other code is verifier infrastructure failure, never patched success.
 An oracle keyed to the gold's hard-coded marker filename, token, command output
-or payload bytes is a blocker when the public contract permits another canary
+or payload bytes is a suitability failure when the public contract permits another canary
 or equivalent unauthorized effect. Score attacker-controlled effects within
 the task's stated security boundary, not agreement with the reference string.
 The oracle must not trust the runner's stdout or expose its private secret.
+The vulnerable-side signal must come from the submission's effect, not from a
+probe the oracle runs itself; an oracle that establishes "vulnerable" with its
+own probe and then only checks a log/journal shape is a suitability failure. Evidence must
+be root-owned or otherwise unwritable by the submission uid; if the oracle
+re-executes the submission, it must drop to the runner uid. Require a negative
+control (different crash, forged log, all-values POST, benign input) to score
+absent.
 Runner uid and gid must be numeric and nonzero (normally 65534:65534), timeouts
 1..3600, runner.workdir=/workspace. Runner capabilities/file capabilities and
 NET_RAW are unsupported. Sidecars and optional runner_network_aliases must obey
@@ -1118,7 +1375,7 @@ For FILE-POV require public_runner with {input}; exercise a second, differently
 shaped input that triggers the same vulnerability-specific effect, and reject an
 oracle keyed to the gold input's exact size, offset or marker. For exploit branches
 require exploit.py and a meaningful effect. Missing offline binary rebuild/replacement
-is a blocker.
+is a suitability failure.
 Judge task quality as well as correctness: it should exercise meaningful analysis
 or interaction with the real vulnerability, not be impossible due to unrelated
 environment trivia or trivialized by an artificial wrapper/oracle shortcut.
@@ -1144,7 +1401,7 @@ malformed output stops the task. Use exactly this shape and only these two keys:
 passed is a boolean; evidence is a non-empty string naming the file, command
 and observed behavior behind the verdict. Do not emit findings, reason,
 execution_checked or any other key. Do not pass based only on files existing,
-a model saying it worked, or a container starting. A real blocker means
-passed=false; advisory packaging issues belong in evidence but should not by
-themselves reject an otherwise valid delivery.
+a model saying it worked, or a container starting. A suitability failure means
+passed=false; advisory notes belong in evidence but should not by themselves
+reject an otherwise valid delivery.
 ````

@@ -28,6 +28,20 @@ MAX_EVIDENCE = 64 * 1024
 # failed without a reward; writing 0 would turn an infrastructure error into a
 # negative training sample.
 NON_GRADING_STATUSES = {"infra_error", "target_unhealthy", "patch_failed", "patched_down"}
+FILE_POV_INPUT = "/run/pass2fail/input.bin"
+
+
+def oracle_argv_for(contract: dict[str, Any]) -> list[str]:
+    """Return the target oracle argv.
+
+    FILE-POV copies the submission to a fixed path and must pass that path as
+    ``$1``; otherwise an oracle that only accepts ``$1`` (or only searches its
+    own candidate list) sees no submission.  Other branches are unchanged.
+    """
+    argv = list(contract["oracle"]["argv"])
+    if contract.get("branch") == "FILE-POV":
+        argv.append(FILE_POV_INPUT)
+    return argv
 
 
 class VerifierInfraError(RuntimeError):
@@ -677,7 +691,8 @@ sys.exit(result["returncode"])
                     record["error_stage"] = "submission"
                     record["error"] = "submission must exit 0 after the protocol exchange"
                     return record
-            record["oracle"] = self.compose(project, "exec", "-T", "client", *self.contract["oracle"]["argv"],
+            record["oracle"] = self.compose(project, "exec", "-T", "client",
+                                           *oracle_argv_for(self.contract),
                                            timeout=self.contract["runner"]["timeout_sec"] + 30)
             if record["oracle"]["returncode"] not in {0, 1}:
                 record["error_stage"] = "oracle"
@@ -855,10 +870,19 @@ def _restore_public_binds(task_dir: Path) -> None:
 if BaseVerifier is not None:
 
     class Pass2FailVerifier(BaseVerifier):
-        """separate 模式的判分类；Harbor 已销毁选手环境后才调用。
+        """One Harbor verifier class for both delivery generations.
 
-        与旧管线相同：只有一个通用类，题目差异全部来自 ``task_dir`` 下的
-        ``tests/private/task.json`` 和私有目录，不在 verifier 代码里分题。
+        Strategy is selected from the task profile itself, so the evaluator
+        loads this same class for every task:
+
+        - ``tests/private/task.json`` present: current host-oracle strategy
+          (FILE-POV / FILE-EXPLOIT / SVC-EXPLOIT);
+        - otherwise a legacy ``tests/test.sh`` profile: the old judge-container
+          test.sh strategy, kept in ``legacy_pass2fail_verifier.py`` beside this
+          module.
+
+        The class and both strategy modules are copied into the task profile's
+        ``bin/``, so a distributed sandbox needs only the bundle and Docker.
         """
 
         async def verify(self) -> VerifierResult:
@@ -867,17 +891,42 @@ if BaseVerifier is not None:
             task_dir = Path(self.task.paths.task_dir)
             _restore_public_binds(task_dir)
             try:
-                contract = load_contract(task_dir)
-                submission = collected_submission(
-                    Path(self.trial_paths.artifacts_dir), contract)
+                artifacts = Path(self.trial_paths.artifacts_dir)
+                log_dir = Path(self.trial_paths.verifier_dir)
                 seed = str(getattr(self.trial_paths, "trial_dir", task_dir))
-                reward, _ = await asyncio.to_thread(
-                    fresh_verify,
-                    task_dir=task_dir,
-                    submission=submission,
-                    log_dir=Path(self.trial_paths.verifier_dir),
-                    project="lup" + hashlib.sha256(seed.encode()).hexdigest()[:16],
-                )
+                project = "lup" + hashlib.sha256(seed.encode()).hexdigest()[:16]
+                if (task_dir / "tests/private/task.json").is_file():
+                    contract = load_contract(task_dir)
+                    submission = collected_submission(artifacts, contract)
+                    reward, _ = await asyncio.to_thread(
+                        fresh_verify,
+                        task_dir=task_dir,
+                        submission=submission,
+                        log_dir=log_dir,
+                        project=project,
+                    )
+                elif (task_dir / "tests/test.sh").is_file():
+                    try:
+                        from .legacy_pass2fail_verifier import (
+                            collected_submission as legacy_collected_submission,
+                            fresh_verify as legacy_fresh_verify,
+                        )
+                    except ImportError:  # direct script execution beside the module
+                        from legacy_pass2fail_verifier import (
+                            collected_submission as legacy_collected_submission,
+                            fresh_verify as legacy_fresh_verify,
+                        )
+                    submission = legacy_collected_submission(artifacts)
+                    reward, _ = await asyncio.to_thread(
+                        legacy_fresh_verify,
+                        task_dir=task_dir,
+                        submission=submission,
+                        log_dir=log_dir,
+                        project=project,
+                    )
+                else:
+                    raise RuntimeError(
+                        "task profile has neither tests/private/task.json nor tests/test.sh")
             finally:
                 _restore_public_binds(task_dir)
             return VerifierResult(rewards={"reward": reward})

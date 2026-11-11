@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 from pipeline.common import sha256
+from pipeline.legacy_pass2fail_verifier import fresh_verify as legacy_fresh_verify
 from pipeline.harbor import (
     merge_shared_images,
     publish_bundle,
@@ -80,6 +81,8 @@ class BundleValidationTests(unittest.TestCase):
         task = root / "task"
         images = task / "images"
         images.mkdir(parents=True)
+        (root / "bin").mkdir()
+        (root / "bin/load_image.py").write_text("#!/usr/bin/env python3\n", encoding="utf-8")
         shared = root / "shared-images"
         shared.mkdir()
         (images / "target.tar.gz").write_bytes(b"target")
@@ -140,6 +143,18 @@ class BundleValidationTests(unittest.TestCase):
                 validate_bundle_archives(task, root)
 
 
+class BundleBinTests(unittest.TestCase):
+    def test_bin_contains_only_load_image(self):
+        from pipeline.harbor import ensure_bundle_bin
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ensure_bundle_bin(root)
+            self.assertTrue((root / "bin/load_image.py").is_file())
+            self.assertTrue((root / "bin/legacy_pass2fail_verifier.py").is_file())
+            self.assertTrue(callable(legacy_fresh_verify))
+            self.assertFalse((root / "bin/load_shared_images.py").exists())
+
+
 class PublishBundleTests(unittest.TestCase):
     def test_publish_merges_shared_agent_archive(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -155,6 +170,8 @@ class PublishBundleTests(unittest.TestCase):
             }), encoding="utf-8")
             shared = staging / "shared-images"
             shared.mkdir()
+            (staging / "bin").mkdir()
+            (staging / "bin/load_image.py").write_text("#!/usr/bin/env python3\n", encoding="utf-8")
             (shared / "agent.tar.gz").write_bytes(b"agent")
             _write_manifest(shared / "agent.tar.manifest.json", shared / "agent.tar.gz", "agent:1")
             root_shared = root / "shared-images"

@@ -16,11 +16,40 @@
 
 Harbor 版本要求 **0.22.0**；宿主机需要可用的 Docker，且 `harbor` 在 `PATH` 中。
 
+verifier 是**自包含的一套**。每道题的 `harbor-runtime-profile/bin/` 里同时有：
+
+```text
+bin/pass2fail_verifier.py           # 唯一的 Harbor verifier 类
+bin/legacy_pass2fail_verifier.py    # 老 test.sh 判分策略
+bin/pristine_binds.py               # 可写 bind 恢复
+bin/docker_ipam.py
+bin/task_contract.py
+```
+
+评测机不需要 clone 本仓库，也不需要把 `PYTHONPATH` 指向本仓库；只需要交付包、Docker 和 Harbor。所有题都用同一个：
+
+```bash
+--verifier bin.pass2fail_verifier:Pass2FailVerifier
+```
+
+类会按 profile 自己选策略：
+
+- 有 `tests/private/task.json`：host-oracle 策略，当前 FILE-POV / FILE-EXPLOIT / SVC-EXPLOIT 三个分支；
+- 没有 `task.json`、但有 `tests/test.sh`：legacy test.sh 策略，老 exploit 题，在 judge 容器里执行 `test.sh`。
+
+新题的 `tests/test.sh` 只是占位 no-op；老题的 `tests/test.sh` 是真正判分入口。两种策略最终都由同一个 `Pass2FailVerifier` 返回 reward。
+
 ---
 
 ## 1. 加载镜像
 
-在 bundle 根目录执行：
+shared 镜像只需要在 host 上预加载一次（或在评测系统启动时预置），不要每题重复 load：
+
+```bash
+python3 bin/load_image.py --shared-only
+```
+
+之后每道题只加载本题自己的 `images/`：
 
 ```bash
 python3 bin/load_image.py --task <task-id>
@@ -28,9 +57,11 @@ python3 bin/load_image.py --task <task-id>
 
 它会：
 
-- 按 `<task-id>/image-lock.json` 加载本题和共享镜像；
+- 按 `<task-id>/image-lock.json` 只加载本题 `images/` 下的镜像，跳过 `../shared-images/...`；
 - 校验 tar 的 `sha256` 和加载后的 image ID；
 - 在返回前恢复本题 `harbor-runtime-profile/environment` 下的可写 bind。
+
+如果 host 没有预加载 shared，而本题引用了 shared agent/verifier，运行时会因为镜像不存在而失败。确实需要每题都 load shared 时，可以显式加 `--include-shared`。
 
 如果本题没有可写 bind，最后会打印 `restored writable binds ...: False`，这是正常的。
 
@@ -79,7 +110,7 @@ python3 <bundle>/bin/load_image.py \
 | `--ae` | 模型 API 凭据；不要写进 Compose 或题包 |
 | `--jobs-dir` | Harbor 结果目录 |
 | `--job-name` | 本次运行名，单题内唯一即可 |
-| `--verifier` | 本题的通用 Pass2Fail verifier 类 |
+| `--verifier` | 统一的自包含 `Pass2FailVerifier`；按 profile 自动选 host-oracle 或 legacy test.sh 策略 |
 | `--verifier-timeout-multiplier` | 题包里不写超时；这里给 verifier 留足时间（默认 600s × 6） |
 
 **评测时不要挂参考 PoC。** 合成阶段末尾的自动验收会额外把
@@ -155,6 +186,8 @@ jobs/<job-name>/
 | `ModuleNotFoundError: bin.pass2fail_verifier` | 没设 `PYTHONPATH`，且没有用 `load_image.py --run` |
 | main 里没有 `claude` | 忘了 `--mounts` 挂载本机 `claude` 二进制 |
 | 适配器尝试联网安装 Claude Code | `--ak version=` 和挂载 binary 的 `--version` 不一致 |
-| 所有题都是 0 或没有 reward | 没传 `--verifier`，Harbor 回退到 `tests/test.sh`；该脚本在 separate 模式下不判分 |
+| 所有新题都是 0 或没有 reward | 没传 `--verifier`，Harbor 回退到新题的占位 `tests/test.sh`；该脚本不判分。老题有 `tests/test.sh` 策略，但仍应显式传 `--verifier` |
+| `ModuleNotFoundError: bin.legacy_pass2fail_verifier` | profile 不是新导出的；`bin/` 缺 legacy 策略模块。重新导出或补该文件 |
+| 运行时报 shared 镜像不存在 | host 没有预加载 `shared-images/`；先跑 `load_image.py --shared-only`，或临时给 `--task` 加 `--include-shared` |
 | 模型 API 连不上 | 没传 `--ae ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL`，或 Compose 里写死了代理 |
 | 第二次跑题看到上一次的残留 | 没有用 `load_image.py --task` / `--run` 恢复可写 bind |

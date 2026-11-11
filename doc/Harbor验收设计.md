@@ -375,8 +375,9 @@ Agent 模式对三个分支相同；区别只在 Harbor 收集的文件名和 ve
 python3 <bundle>/bin/load_image.py --task <task-id>
 ```
 
-`load_image.py` 按 `image-lock.json` 加载 shared 和本题镜像；`--shared-only`
-只加载共享镜像，不带 `--task` 会加载全部任务。`--no-restore` 可关闭自动恢复。
+`load_image.py --task` 只加载本题 `images/` 里的镜像；`shared-images/` 由 host
+一次性 `--shared-only` 预加载，不随每题重复加载。不带 `--task` 会先加载 shared，
+再加载全部任务；`--no-restore` 可关闭自动恢复。
 它还可以用 `--run` 包住一次 `harbor run`，在命令前后各恢复一次：
 
 ```bash
@@ -453,13 +454,18 @@ PYTHONPATH="$PWD" python3 bin/pristine_binds.py "$PWD"
 
 区别只在类的交付位置：
 
-| | 新管线 | exploit |
+| | 新管线（统一后） | exploit |
 |---|---|---|
-| 类位置 | 每个 `harbor-runtime-profile/bin/` 里有一份通用类 | 仓库级 `orchestrator/export/separate/pass2fail_verifier.py` |
+| 类位置 | `harbor-runtime-profile/bin/pass2fail_verifier.py` + 同目录 `legacy_pass2fail_verifier.py` | 仓库级 `orchestrator/export/separate/pass2fail_verifier.py` |
 | `PYTHONPATH` | 指向 `<task>/harbor-runtime-profile` | 指向 exploit 仓库 |
 | `--verifier` | `bin.pass2fail_verifier:Pass2FailVerifier` | `orchestrator.export.separate.pass2fail_verifier:Pass2FailVerifier` |
 | 题目差异来源 | `task_dir/tests/private/task.json` + 私有文件 | 同一份 runtime 包 + private 文件 |
 
+新管线现在把老 exploit 的 `test.sh` 判分也收进了同一个 `Pass2FailVerifier`：
+profile 里有 `tests/private/task.json` 时走 host-oracle；没有 `task.json`、
+但有 `tests/test.sh` 时走 `legacy_pass2fail_verifier.py` 的 judge-container
+策略。类文件和 legacy 策略都复制进 `harbor-runtime-profile/bin/`，评测机不需要
+本仓库，适合分布式沙箱。
+
 也就是说，两条管线的跑题命令形状完全一样，只是模块名和 `PYTHONPATH`
-指向不同；不存在“新管线用 task.toml import_path、exploit 用 `--verifier`”
-这种两套逻辑。
+指向不同；新管线内部已经是一套类，老 exploit 题可以直接使用同一套策略。

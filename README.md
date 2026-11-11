@@ -477,10 +477,11 @@ python3 .cursor/skills/pipeline-iterate/scripts/report.py \
 python3 <published>/bin/load_image.py --task <task-id>
 ```
 
-`load_image.py` 会按 `image-lock.json` 加载 shared 和本题镜像，然后在返回前
-调用 `pristine_binds.py` 恢复该题的 `harbor-runtime-profile/environment`。
-这就是“做题前 wrapper”的预跑半边；如果要手动控制，可加 `--no-restore`。
-加载全部共享镜像用 `--shared-only`；不带 `--task` 会加载 shared + 所有任务。
+`load_image.py --task` 只加载该题 `images/` 下的本地镜像，不再重复加载
+`shared-images/`；shared 镜像由 host 用 `--shared-only` 一次性预加载（或由评测
+系统预先 load），它只承担存储/传输复用。加载后会在返回前调用 `pristine_binds.py`
+恢复该题的 `harbor-runtime-profile/environment`，这就是“做题前 wrapper”的预跑半边；
+如果要手动控制，可加 `--no-restore`。不带 `--task` 会先加载 shared，再加载所有任务。
 
 也可以让 `load_image.py` 直接包住一次跑题命令（前后各恢复一次）：
 
@@ -505,6 +506,11 @@ PYTHONPATH="$PWD" harbor run \
 
 `task.toml` 不设置 agent/verifier/build 超时；超时和模型配置由 Harbor
 `harbor_config.yaml` 或命令行控制，避免题目把外部评测的预算截断。
+
+新管线现在把老 `exploit` 的 `test.sh` 判分也收进了同一个 `Pass2FailVerifier`：
+profile 有 `tests/private/task.json` 时走 host-oracle，没有 `task.json`、但有
+`tests/test.sh` 时走随包携带的 `legacy_pass2fail_verifier.py`。因此老题也可以
+直接用 `bin.pass2fail_verifier:Pass2FailVerifier`，不需要另起一个类。
 
 `exploit` 老管线的形式完全一样，只是模块名和 `PYTHONPATH` 指向不同：
 

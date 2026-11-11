@@ -14,11 +14,11 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import anthropic
 
-from .common import read_jsonl, timestamp, write_json, write_jsonl
+from .common import timestamp, write_json
 
 LABEL_PROMPT_V1 = """You are a metadata triage classifier for containerizable Linux userspace vulnerability tasks.
 Decide whether each CVE-repository instance is WORTH A SOURCE/PATCH ROUTING REVIEW, not whether a working exploit already exists. You see metadata only. Never claim that compilation, a patch mapping or an exploit has been verified.
@@ -327,7 +327,3 @@ def gt_specs(rows: list[dict[str, Any]]) -> list[tuple[str, str, list[dict[str, 
 def gt_prompt(kind: str) -> str:
     role = kind.removeprefix("gt-")
     return GT_PROMPT + "\nYOUR INDEPENDENT REVIEW ROLE:\n" + GT_ROLES[role]
-
-
-def load_rows(path: Path) -> list[dict[str, Any]]:
-    return list(read_jsonl(path))

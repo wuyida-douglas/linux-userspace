@@ -28,6 +28,18 @@ Git 操作必须针对本工作区内的仓库。
 安装软件包或拉取镜像之前，先阅读 NETWORK.md。
 不要让凭据出现在文件、日志、镜像、Compose 和命令参数中。
 
+隔离要求 —— 在做任何事之前先读：
+- 不要列出、扫描、搜索、find、grep、读取、复制或检查本工作区以外的任何路径。
+  包括同级任务目录、results/ 下的其他运行、/home/*/.claude、/memory/
+  以及共享 memory 目录。
+- 不要读取、使用或相信任何来自之前会话或其他运行的 memory、memory 索引、
+  MEMORY.md、recipe、笔记、轨迹或已保存结论，即使它声称这个任务已经交付。
+- 不要使用、复制、挂载、读取或参考任何之前合成的任务产物：其他运行的
+  delivery/、.agent-tmp/、镜像、oracle、solution、patch、verification、
+  gold 或 harness。如果发现，忽略并报告。
+- 从 input/ 开始，在本工作区从零构建。复制或复用之前的交付属于合成失败，
+  该任务无效。
+
 阅读 input/meta.json 中聚焦的字段（而不是全部受影响发行版版本）、
 input/alternate-candidates.json、input/fix.diff（如果存在），
 以及 input/src/ 下仅与漏洞相关的源文件。
@@ -164,6 +176,18 @@ FILE 回退和恢复规则。
 Git 操作必须针对本工作区内的仓库。
 安装软件包或拉取镜像之前，先阅读 NETWORK.md。
 不要让凭据出现在文件、日志、镜像、Compose 和命令参数中。
+
+隔离要求 —— 在做任何事之前先读：
+- 不要列出、扫描、搜索、find、grep、读取、复制或检查本工作区以外的任何路径。
+  包括同级任务目录、results/ 下的其他运行、/home/*/.claude、/memory/
+  以及共享 memory 目录。
+- 不要读取、使用或相信任何来自之前会话或其他运行的 memory、memory 索引、
+  MEMORY.md、recipe、笔记、轨迹或已保存结论，即使它声称这个任务已经交付。
+- 不要使用、复制、挂载、读取或参考任何之前合成的任务产物：其他运行的
+  delivery/、.agent-tmp/、镜像、oracle、solution、patch、verification、
+  gold 或 harness。如果发现，忽略并报告。
+- 从 input/ 开始，在本工作区从零构建。复制或复用之前的交付属于合成失败，
+  该任务无效。
 
 阅读 route.json，并在 delivery/ 下创建所选任务。如果所选路由被证明
 不可行，写入 failure.json，给出具体原因和实验证据，
@@ -473,6 +497,18 @@ Git 操作必须针对本工作区内的仓库。
 安装软件包或拉取镜像之前，先阅读 NETWORK.md。
 不要让凭据出现在文件、日志、镜像、Compose 和命令参数中。
 
+隔离要求 —— 在做任何事之前先读：
+- 不要列出、扫描、搜索、find、grep、读取、复制或检查本工作区以外的任何路径。
+  包括同级任务目录、results/ 下的其他运行、/home/*/.claude、/memory/
+  以及共享 memory 目录。
+- 不要读取、使用或相信任何来自之前会话或其他运行的 memory、memory 索引、
+  MEMORY.md、recipe、笔记、轨迹或已保存结论，即使它声称这个任务已经交付。
+- 不要使用、复制、挂载、读取或参考任何之前合成的任务产物：其他运行的
+  delivery/、.agent-tmp/、镜像、oracle、solution、patch、verification、
+  gold 或 harness。如果发现，忽略并报告。
+- 从 input/ 开始，在本工作区从零构建。复制或复用之前的交付属于合成失败，
+  该任务无效。
+
 阅读 route.json，并在 delivery/ 下创建所选任务。如果所选路由被证明
 不可行，写入 failure.json，给出具体原因和实验证据，
 然后停止，而不是暗中改变任务契约。
@@ -742,6 +778,18 @@ capabilities、setuid 辅助程序、NET_RAW 或特权 runner。
 Git 操作必须针对本工作区内的仓库。
 安装软件包或拉取镜像之前，先阅读 NETWORK.md。
 不要让凭据出现在文件、日志、镜像、Compose 和命令参数中。
+
+隔离要求 —— 在做任何事之前先读：
+- 不要列出、扫描、搜索、find、grep、读取、复制或检查本工作区以外的任何路径。
+  包括同级任务目录、results/ 下的其他运行、/home/*/.claude、/memory/
+  以及共享 memory 目录。
+- 不要读取、使用或相信任何来自之前会话或其他运行的 memory、memory 索引、
+  MEMORY.md、recipe、笔记、轨迹或已保存结论，即使它声称这个任务已经交付。
+- 不要使用、复制、挂载、读取或参考任何之前合成的任务产物：其他运行的
+  delivery/、.agent-tmp/、镜像、oracle、solution、patch、verification、
+  gold 或 harness。如果发现，忽略并报告。
+- 从 input/ 开始，在本工作区从零构建。复制或复用之前的交付属于合成失败，
+  该任务无效。
 
 阅读 route.json，并在 delivery/ 下创建所选任务。如果所选路由被证明
 不可行，写入 failure.json，给出具体原因和实验证据，
@@ -1032,6 +1080,18 @@ exploit.py 运行器命令。验证器把 input.bin 以只读方式复制进
 Git 操作必须针对本工作区内的仓库。
 安装软件包或拉取镜像之前，先阅读 NETWORK.md。
 不要让凭据出现在文件、日志、镜像、Compose 和命令参数中。
+
+隔离要求 —— 在做任何事之前先读：
+- 不要列出、扫描、搜索、find、grep、读取、复制或检查本工作区以外的任何路径。
+  包括同级任务目录、results/ 下的其他运行、/home/*/.claude、/memory/
+  以及共享 memory 目录。
+- 不要读取、使用或相信任何来自之前会话或其他运行的 memory、memory 索引、
+  MEMORY.md、recipe、笔记、轨迹或已保存结论，即使它声称这个任务已经交付。
+- 不要使用、复制、挂载、读取或参考任何之前合成的任务产物：其他运行的
+  delivery/、.agent-tmp/、镜像、oracle、solution、patch、verification、
+  gold 或 harness。如果发现，忽略并报告。
+- 从 input/ 开始，在本工作区从零构建。复制或复用之前的交付属于合成失败，
+  该任务无效。
 
 你是在全新会话中的独立审查者。不要相信合成记录中的说法。
 阅读 route.json、delivery/、review-input/live.chat.md

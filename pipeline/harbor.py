@@ -145,8 +145,6 @@ def validate_public_services(services: dict[str, Any]) -> None:
             if not isinstance(raw_source, str):
                 raise ValueError(f"public Compose service {name} volume source must be a string")
             source = volume_source(volume)
-            if any(part in source for part in ("private", "gold", "fixed", "docker.sock")):
-                raise ValueError(f"public Compose service {name} contains a private mount")
             if not source.startswith("./"):
                 raise ValueError(f"public Compose service {name} may bind only ./ assets inside environment/")
 
@@ -174,8 +172,6 @@ def read_public_compose(delivery: Path, contract: dict[str, Any]) -> dict[str, A
     for name, service in services.items():
         for volume in service.get("volumes") or []:
             source = volume_source(volume)
-            if any(part in source for part in ("private", "gold", "fixed", "docker.sock")):
-                raise ValueError(f"public Compose service {name} contains a private mount")
             if source.startswith("./"):
                 safe_asset(path.parent, source[2:])
     for image in {service["image"] for service in services.values()}:
@@ -324,6 +320,7 @@ exit 0
     (profile / "config/bin").mkdir(parents=True)
     shutil.copy2(ROOT / "config/bin/docker", profile / "config/bin/docker")
     for source, name in ((ROOT / "pipeline/pass2fail_verifier.py", "pass2fail_verifier.py"),
+                         (ROOT / "pipeline/legacy_pass2fail_verifier.py", "legacy_pass2fail_verifier.py"),
                          (ROOT / "pipeline/docker_ipam.py", "docker_ipam.py"),
                          (ROOT / "pipeline/pristine_binds.py", "pristine_binds.py"),
                          (ROOT / "pipeline/task_contract.py", "task_contract.py"),
@@ -371,6 +368,7 @@ def ensure_bundle_bin(output: Path) -> None:
     bin_dir = output / "bin"
     bin_dir.mkdir(exist_ok=True)
     for source, name in ((ROOT / "pipeline/pass2fail_verifier.py", "pass2fail_verifier.py"),
+                         (ROOT / "pipeline/legacy_pass2fail_verifier.py", "legacy_pass2fail_verifier.py"),
                          (ROOT / "pipeline/bin/__init__.py", "__init__.py"),
                          (ROOT / "pipeline/docker_ipam.py", "docker_ipam.py"),
                          (ROOT / "pipeline/pristine_binds.py", "pristine_binds.py"),
@@ -385,7 +383,7 @@ def ensure_bundle_bin(output: Path) -> None:
 Usage:
   python3 bin/load_image.py --task <task-id> [--root <bundle>]
   python3 bin/load_image.py --task <task-id> --run harbor run ...
-  python3 bin/load_image.py --shared-only
+  python3 bin/load_image.py --shared-only   # one-time shared preload
   python3 bin/load_image.py                 # shared images + every task
 
 The restore step is the pre-run half of the writable-bind wrapper: the player
@@ -409,6 +407,8 @@ def parse_args():
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--shared-only", action="store_true",
                         help="Load only shared-images/*.tar.gz")
+    parser.add_argument("--include-shared", action="store_true",
+                        help="Also load ../shared-images entries from image-lock; normally preload once with --shared-only")
     parser.add_argument("--no-restore", action="store_true",
                         help="Do not restore writable ./ binds after loading")
     parser.add_argument("--run", nargs=argparse.REMAINDER,
@@ -488,12 +488,28 @@ def restore_binds(task_dir: Path) -> None:
     print(f"restored writable binds for {task_dir.name}: {restored}")
 
 
-def load_task(task_dir: Path, restore: bool, root: Path | None = None) -> None:
+def is_shared_entry(task_dir: Path, entry: dict) -> bool:
+    """An entry outside the task directory is a preloaded shared image."""
+    archive = entry.get("archive")
+    if not isinstance(archive, str) or not archive:
+        return False
+    try:
+        (task_dir / archive).resolve().relative_to(task_dir.resolve())
+    except (OSError, ValueError):
+        return True
+    return False
+
+
+def load_task(task_dir: Path, restore: bool, root: Path | None = None,
+              include_shared: bool = False) -> None:
     print(f"task: {task_dir.name}")
     if not (task_dir / "image-lock.json").is_file() and root is not None:
         # Legacy bundle: shared images are not listed in images/manifest.json.
         load_shared(root)
     for entry in task_entries(task_dir):
+        if not include_shared and is_shared_entry(task_dir, entry):
+            print(f"skipping shared image {entry.get('ref')} (preload once with --shared-only)")
+            continue
         load_entry(task_dir, entry)
     if restore:
         restore_binds(task_dir)
@@ -529,7 +545,7 @@ def main() -> int:
             if not args.task:
                 raise ValueError("--run requires --task")
             task_dir = find_task(root, args.task)
-            load_task(task_dir, not args.no_restore, root)
+            load_task(task_dir, not args.no_restore, root, include_shared=args.include_shared)
             command = list(args.run)
             if command and command[0] == "--":
                 command = command[1:]
@@ -546,14 +562,15 @@ def main() -> int:
                 if not args.no_restore:
                     restore_binds(task_dir)
         if args.task:
-            load_task(find_task(root, args.task), not args.no_restore, root)
+            load_task(find_task(root, args.task), not args.no_restore, root,
+                      include_shared=args.include_shared)
             return 0
         load_shared(root)
         for task_dir in sorted(root.iterdir()):
             if not task_dir.is_dir():
                 continue
             if (task_dir / "image-lock.json").is_file() or (task_dir / "images/manifest.json").is_file():
-                load_task(task_dir, not args.no_restore, root)
+                load_task(task_dir, not args.no_restore, root, include_shared=False)
         return 0
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -565,18 +582,6 @@ if __name__ == "__main__":
 '''
     (bin_dir / "load_image.py").write_text(loader, encoding="utf-8")
     (bin_dir / "load_image.py").chmod(0o755)
-    shared_loader = '''#!/usr/bin/env python3
-"""Compatibility shim: load only shared-images via load_image.py."""
-import runpy
-import sys
-from pathlib import Path
-
-script = Path(__file__).with_name("load_image.py")
-sys.argv = [str(script), "--shared-only", "--root", str(Path(__file__).resolve().parents[1])]
-runpy.run_path(str(script), run_name="__main__")
-'''
-    (bin_dir / "load_shared_images.py").write_text(shared_loader, encoding="utf-8")
-    (bin_dir / "load_shared_images.py").chmod(0o755)
 
 
 def export(delivery: Path, destination: Path, task_id: str, route: dict[str, Any],
@@ -969,6 +974,8 @@ def merge_shared_images(source: Path, destination: Path) -> None:
 
 def validate_bundle_archives(task_dir: Path, root: Path) -> None:
     """Validate the Feishu delivery invariants for one published task."""
+    if not (root / "bin/load_image.py").is_file():
+        raise FileNotFoundError(f"bundle has no bin/load_image.py: {root}")
     lock_path = task_dir / "image-lock.json"
     if not lock_path.is_file():
         raise FileNotFoundError(f"published task has no image-lock.json: {task_dir}")
@@ -1087,6 +1094,7 @@ def publish_bundle(staging: Path, root: Path, task_id: str, acceptance: dict[str
         # moving the whole directory only when it is absent loses that file.
         merge_shared_images(staging / "shared-images", root / "shared-images")
         _merge_tree(staging / "bin", root / "bin")
+        (root / "bin/load_shared_images.py").unlink(missing_ok=True)
         # Keep the exact evidence in the sealed task directory. The outer
         # acceptance directory is intentionally rotated on every retry, so a
         # host path in manifest.json would become stale and make an otherwise

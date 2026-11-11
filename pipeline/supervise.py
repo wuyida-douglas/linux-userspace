@@ -8,7 +8,6 @@ run.py's Docker lock so acceptance does not contend with factory builds.
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
 import json
 import os
 import shlex
@@ -19,7 +18,7 @@ import threading
 import time
 from pathlib import Path
 
-from .common import ROOT, inventory, load_env, read_jsonl, timestamp, write_json
+from .common import read_jsonl, timestamp, write_json
 from .run import route as validate_route, reported_published_root
 
 
