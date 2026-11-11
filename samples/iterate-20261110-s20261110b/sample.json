@@ -1,0 +1,10 @@
+{
+  "seed": 20261110,
+  "count": 400,
+  "input": "data/frozen-pool-20261109/candidates-kept-available-20261109.jsonl",
+  "input_sha256": "565bdf5914152b3a4f2a00f44c09cc85a38f1b85ae8d42bb833a72c38579e941",
+  "input_count": 22138,
+  "label_policy": "metadata_label.label == keep; no additional filters",
+  "sampling_policy": "random.Random(seed).sample(frozen_pool_order, count)",
+  "created_at": "2026-11-10T20:04:52Z"
+}
