@@ -112,8 +112,15 @@ def validate_public_services(services: dict[str, Any]) -> None:
             if isinstance(attachment, dict) and any(attachment.get(key) for key in ("ipv4_address", "ipv6_address")):
                 raise ValueError(f"public Compose service {name} must not pin {logical} static IP")
     for name, service in services.items():
-        if not isinstance(service, dict) or not isinstance(service.get("image"), str) or not service["image"]:
+        if not isinstance(service, dict):
+            raise ValueError(f"public Compose service {name} must be a mapping")
+        image = service.get("image")
+        # main may omit image: Harbor injects the reviewed agent image. Every
+        # other service must name a prebuilt image explicitly.
+        if name != "main" and (not isinstance(image, str) or not image):
             raise ValueError(f"public Compose service {name} needs a prebuilt image")
+        if name == "main" and image is not None and (not isinstance(image, str) or not image):
+            raise ValueError("public Compose main.image must be a nonempty string when set")
         if service.get("ports"):
             raise ValueError(f"public Compose service {name} must use isolated networks, not host ports")
         for key in FORBIDDEN_COMPOSE_KEYS | {"container_name"}:
@@ -672,6 +679,7 @@ def export(delivery: Path, destination: Path, task_id: str, route: dict[str, Any
                 write_json(runtime / f"{archive.stem}.manifest.json", {"schema_version": 1, "archive": metadata})
             if inspect_image(image)["image_id"] != metadata["image_id"]:
                 raise RuntimeError(f"runtime tag is missing or differs from frozen archive: {image}")
+            scan_image_hygiene(image, archive, scan_layers=False)
         ensure_bundle_bin(bundle_root)
 
     # image-lock.json is the external delivery index (the official second
@@ -733,6 +741,12 @@ def export(delivery: Path, destination: Path, task_id: str, route: dict[str, Any
                            shared_records.get("verifier")))
     write_json(destination / "image-lock.json", {
         "schema_version": 1, "task": task_id, "images": lock})
+
+    for record in archives:
+        scan_image_hygiene(record["image"], images / record["file"],
+                           scan_layers=record["image"] == target_image)
+    if bundle_root is not None:
+        validate_bundle_archives(destination, bundle_root)
 
     return {"schema_version": 1, "task_id": task_id, "created_at": timestamp(),
             "branch": contract["branch"], "host_type": contract.get("host_type"),
@@ -886,6 +900,170 @@ def _harbor_run_fresh(profile: Path, jobs: Path, name: str, timeout: int,
             "reward": float(reward), "result": str(report_path), "agent": agent}
 
 
+PROXY_CREDENTIAL_RE = re.compile(r"https?://[^/\s:@]+:[^/\s@]+@")
+FORBIDDEN_LAYER_PATH_RE = re.compile(
+    r"(^|/)(private|gold)(/|$)|"
+    r"(^|/)(patch\.diff|fix\.diff|solution\.sh|oracle\.sh|healthcheck\.sh|"
+    r"gold-input[^/]*|exploit\.car)(/|$)"
+)
+
+
+def _merge_tree(source: Path, destination: Path) -> None:
+    """Merge a shared directory without dropping files already published."""
+    if not source.is_dir():
+        return
+    destination.mkdir(parents=True, exist_ok=True)
+    for path in sorted(source.rglob("*")):
+        relative = path.relative_to(source)
+        target = destination / relative
+        if path.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            if path.read_bytes() != target.read_bytes():
+                shutil.copy2(path, target)
+        else:
+            shutil.copy2(path, target)
+
+
+def merge_shared_images(source: Path, destination: Path) -> None:
+    """Merge shared-images by file, never skip the whole directory.
+
+    The old publish path moved shared-images only when the root did not already
+    have one. A task using the shared agent archive could then reference
+    ../shared-images/agent.tar.gz while the root only contained the verifier
+    archive. Merge per file and reject a same-named archive with a different
+    digest instead of silently mixing two runtimes.
+    """
+    if not source.is_dir():
+        return
+    destination.mkdir(parents=True, exist_ok=True)
+    for path in sorted(source.iterdir()):
+        if path.is_dir():
+            merge_shared_images(path, destination / path.name)
+            continue
+        target = destination / path.name
+        if path.name.endswith(".tar.gz"):
+            if target.exists():
+                if digest_file(path) != digest_file(target):
+                    raise ValueError(
+                        f"shared image archive differs from already published copy: {target}")
+            else:
+                shutil.copy2(path, target)
+        elif path.name.endswith(".manifest.json"):
+            value = json.loads(path.read_text(encoding="utf-8"))
+            record = value.get("archive") or {}
+            archive = destination / str(record.get("file") or "")
+            if record.get("file") and archive.is_file() and record.get("sha256"):
+                if digest_file(archive) != record["sha256"]:
+                    raise ValueError(
+                        f"shared image manifest does not match archive: {archive}")
+            shutil.copy2(path, target)
+        else:
+            if target.exists() and path.read_bytes() != target.read_bytes():
+                shutil.copy2(path, target)
+            elif not target.exists():
+                shutil.copy2(path, target)
+
+
+def validate_bundle_archives(task_dir: Path, root: Path) -> None:
+    """Validate the Feishu delivery invariants for one published task."""
+    lock_path = task_dir / "image-lock.json"
+    if not lock_path.is_file():
+        raise FileNotFoundError(f"published task has no image-lock.json: {task_dir}")
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    entries = lock.get("images")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError(f"image-lock.json has no images: {lock_path}")
+    for entry in entries:
+        archive = entry.get("archive")
+        ref = entry.get("ref")
+        if not isinstance(archive, str) or not archive or not isinstance(ref, str) or not ref:
+            raise ValueError(f"image-lock entry needs ref and archive: {entry!r}")
+        path = (task_dir / archive).resolve()
+        if not path.is_file() or path.stat().st_size == 0:
+            raise FileNotFoundError(f"image archive is missing or empty: {path}")
+        if entry.get("sha256") and digest_file(path) != entry["sha256"]:
+            raise ValueError(f"image archive digest differs from image-lock: {path}")
+
+    images_manifest = task_dir / "images/manifest.json"
+    images_dir = task_dir / "images"
+    if images_manifest.is_file():
+        records = json.loads(images_manifest.read_text(encoding="utf-8")).get("archives", [])
+        listed = {str(record.get("file")) for record in records}
+        actual = {path.name for path in images_dir.glob("*.tar.gz")}
+        if listed != actual:
+            raise ValueError(
+                f"images/manifest.json and image archives differ: {images_dir}")
+        for record in records:
+            path = images_dir / str(record.get("file"))
+            if not path.is_file() or digest_file(path) != record.get("sha256"):
+                raise ValueError(f"image archive differs from manifest: {path}")
+
+    profile = task_dir / "harbor-runtime-profile"
+    for path in task_dir.rglob("*"):
+        if path.is_file() and path.name.startswith("Dockerfile"):
+            raise ValueError(f"delivery must not contain a Dockerfile: {path}")
+    if profile.is_dir():
+        toml_path = profile / "task.toml"
+        if toml_path.is_file():
+            import tomllib
+            config = tomllib.loads(toml_path.read_text(encoding="utf-8"))
+            for section in ("verifier", "agent", "environment"):
+                if "timeout_sec" in (config.get(section) or {}):
+                    raise ValueError(f"task.toml must not set [{section}] timeout_sec")
+                mode = (config.get(section) or {}).get("network_mode")
+                if mode not in (None, "public"):
+                    raise ValueError(
+                        f"task.toml [{section}] network_mode must be public, got {mode!r}")
+            verifier_environment = (config.get("verifier") or {}).get("environment") or {}
+            if "timeout_sec" in verifier_environment:
+                raise ValueError(
+                    "task.toml must not set [verifier.environment] timeout_sec")
+            if verifier_environment.get("network_mode") not in (None, "public"):
+                raise ValueError(
+                    "task.toml [verifier.environment] network_mode must be public")
+        compose_path = profile / "environment/docker-compose.yaml"
+        if compose_path.is_file():
+            value = yaml.safe_load(compose_path.read_text(encoding="utf-8")) or {}
+            validate_public_services(value.get("services") or {})
+
+
+def scan_docker_archive(archive: Path) -> None:
+    """Scan docker-save layer members for private delivery material."""
+    with tarfile.open(archive, "r:gz") as outer:
+        for member in outer:
+            if not member.isfile() or not member.name.endswith(".tar"):
+                continue
+            stream = outer.extractfile(member)
+            if stream is None:
+                continue
+            try:
+                layer = tarfile.open(fileobj=stream, mode="r|*")
+            except tarfile.TarError:
+                continue
+            with layer:
+                for item in layer:
+                    name = item.name.lstrip("./")
+                    if FORBIDDEN_LAYER_PATH_RE.search("/" + name):
+                        raise ValueError(
+                            f"target image contains private delivery material: /{name} "
+                            f"in {archive}")
+
+
+def scan_image_hygiene(image: str, archive: Path, *, scan_layers: bool) -> None:
+    """Reject proxy credentials baked into an image; optionally scan layers."""
+    cp = subprocess.run(docker_argv(["docker", "image", "inspect", image]),
+                        capture_output=True, text=True, timeout=60)
+    if cp.returncode:
+        raise RuntimeError(f"image is missing while checking delivery hygiene: {image}")
+    if PROXY_CREDENTIAL_RE.search(cp.stdout):
+        raise ValueError(f"image contains a proxy credential: {image}")
+    if scan_layers:
+        scan_docker_archive(archive)
+
+
 def publish_bundle(staging: Path, root: Path, task_id: str, acceptance: dict[str, Any]) -> None:
     """Atomically publish an accepted task and serialize the shared index."""
     import fcntl
@@ -897,13 +1075,18 @@ def publish_bundle(staging: Path, root: Path, task_id: str, acceptance: dict[str
         if temporary.exists():
             shutil.rmtree(temporary)
         temporary.mkdir(parents=True)
-        for name in ("bin", "shared-images", task_id):
-            source = staging / name
-            if source.is_dir():
-                shutil.copytree(source, temporary / name, symlinks=True)
+        source_task = staging / task_id
+        if not source_task.is_dir():
+            raise FileNotFoundError(f"staged task directory is missing: {source_task}")
+        shutil.copytree(source_task, temporary / task_id, symlinks=True)
         destination = root / task_id
         if destination.exists():
             raise FileExistsError(f"refusing to overwrite published task: {destination}")
+        # Keep shared material additive. A root may already have the verifier
+        # archive while this task is the first to need the shared agent archive;
+        # moving the whole directory only when it is absent loses that file.
+        merge_shared_images(staging / "shared-images", root / "shared-images")
+        _merge_tree(staging / "bin", root / "bin")
         # Keep the exact evidence in the sealed task directory. The outer
         # acceptance directory is intentionally rotated on every retry, so a
         # host path in manifest.json would become stale and make an otherwise
@@ -912,10 +1095,12 @@ def publish_bundle(staging: Path, root: Path, task_id: str, acceptance: dict[str
         shutil.copy2(acceptance, evidence)
         evidence.chmod(0o444)
         os.rename(temporary / task_id, destination)
-        for name in ("bin", "shared-images"):
-            if not (root / name).exists():
-                os.rename(temporary / name, root / name)
         shutil.rmtree(temporary)
+        try:
+            validate_bundle_archives(destination, root)
+        except Exception:
+            shutil.rmtree(destination, ignore_errors=True)
+            raise
         entries = []
         manifest_path = root / "manifest.json"
         if manifest_path.exists():

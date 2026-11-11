@@ -465,7 +465,7 @@ The runner has a read-only root filesystem and /workspace; write transcripts
 only to /work, /output or /tmp. Its gold exploit must finish the protocol
 exchange normally on both vulnerable and fixed targets. An expected fixed-target
 rejection is not an exploit traceback. If a protocol requires raw AF_PACKET,
-first try ordinary UDP/TCP; if no unprivileged path exists, record the blocker
+first try ordinary UDP/TCP; if no unprivileged path exists, record the limitation
 instead of weakening isolation or using capabilities, NET_RAW or setuid helpers.
 solution.sh must restart a patched daemon itself. The fixed phase applies
 solution.sh, checks health and reruns the same exploit.
@@ -581,14 +581,18 @@ live.chat.md preserves pre-compaction
 events; do not treat a Claude Code compaction boundary as lost history.
 Pass/fail scope is ONLY whether this is a good training task for an agent: a real
 vulnerability, a genuinely reachable entry, a deterministic vulnerable/fixed
-differential, and meaningful analysis or interaction. Packaging and delivery
-hygiene is advisory, not a suitability verdict: credentials in image build
-history, hash transcription typos, Dockerfile/Compose ergonomics, and flaky
-offline build retries in solution.sh must be recorded as minor findings but must NOT set
-passed=false; repair them outside this gate. A blocker or major finding about
-suitability (fabricated vulnerability, wrong repository, unreachable entry,
-forged or shortcut oracle, crash-only EXPLOIT, arbitrary exception as POV) does
-mean passed=false.
+differential, and meaningful analysis or interaction. Use exactly two decision
+levels for the verdict:
+- suitability failure: a fabricated vulnerability, wrong repository, unreachable
+  entry, forged or shortcut oracle, crash-only EXPLOIT, arbitrary exception as
+  POV, unsolvable main, inconsistent A/A/A, or other defect that makes the task
+  unsuitable for training. A suitability failure means passed=false.
+- advisory note: packaging and delivery hygiene, such as credentials in image
+  build history, hash transcription typos, Dockerfile/Compose ergonomics, or
+  flaky offline build retries in solution.sh. Put advisory notes in evidence but
+  do NOT set passed=false for them; repair them outside this gate.
+Do not use severity labels as output fields. The only output is the two-key JSON
+at the end of this prompt.
 Solvability is a primary suitability check: the solving agent only has main and
 instruction.md. Verify that main actually contains every source tree, file and
 tool the instruction tells the agent to use, and that main can reach the target
@@ -601,7 +605,7 @@ material in main.
 Verify task self-consistency: the vulnerability A described in instruction.md,
 the effect oracle.sh judges, and the code patch.diff actually fixes must be the
 same A. If patch.diff does not touch the demonstrated function/file, or an
-advisory PoC still crashes the fixed build, that is a blocker unless the
+advisory PoC still crashes the fixed build, that is a suitability failure unless the
 delivery documents a recovered authoritative fix or a re-scoped effect.
 Inspect the actual source, patch, Dockerfile, public
 entry, gold and verifier. If route.json recovery_required=true, read
@@ -609,7 +613,7 @@ project/source-recovery.json and verify the authoritative source, recovered
 vulnerable/fixed revisions and checksums. An initially mismatched supplied patch
 is not grounds to discard a valid recovered pair, but false claims that the
 supplied input contained the recovered source/fix or that recovery_required was
-false are major provenance findings requiring correction. The final recovery
+false are provenance suitability failures requiring correction. The final recovery
 record must agree with route.json and the immutable input. Look for fabricated vulnerabilities,
 unrelated projects, unjustified recovery revisions, modified vulnerable/fixed
 behavior, meaningless service wrappers,
@@ -625,55 +629,55 @@ permissions, unchanged vulnerable component, meaningful security boundary, and
 whether host code itself fabricates the unauthorized effect or gives the answer.
 The vulnerable and fixed targets must use the same host/runner/oracle code. Any
 shared patch hunk to host, runner, HTTP error handling, or oracle code unrelated
-to the vulnerable component is a blocker. A single 500, connection abort, or
+to the vulnerable component is a suitability failure. A single 500, connection abort, or
 exception-class change is not SVC DoS; a persistent service/resource impact with
 controls is required. The target-side oracle must judge the effect actually
 observed by the public protocol client, not redefine a route's promised HTTP 500
 as a connection abort or audit-log entry after the fact. Any mismatch between
-route, public instruction, client-visible effect, and oracle is a blocker.
+route, public instruction, client-visible effect, and oracle is a suitability failure.
 If the delivery establishes only a valid FILE-POV rather than the routed SVC,
-record a blocker and identify the branch-mismatch evidence; do not bless it as SVC.
+set passed=false, explain the branch-mismatch evidence, and do not bless it as SVC.
 A mislabeled host type, meaningless HTTP wrapper around a one-shot parser, or
-reversed client/server attack role is a blocker. A well-justified synthetic_host
+reversed client/server attack role is a suitability failure. A well-justified synthetic_host
 is not. It must receive the same attack through the same adapter on vuln and fixed.
 The public main is only an analysis workstation; declare working_dir=/workspace
 so Harbor can deliver and collect the submission. An absent or disabled main/client
-healthcheck is a blocker. A client healthcheck that invokes /private is also a blocker:
+healthcheck is a suitability failure. A client healthcheck that invokes /private is also a suitability failure:
 public Compose never receives private material; bake a public healthcheck and benign
 control into the target image. All three branches require an independent prebuilt client
 image/container. A same-container main+target, a target image used as main, or a main
 image with a ready-built vulnerable program/plugin/runtime (rather than only source
-and analysis/build tools) is a blocker. Exercise main's public healthcheck and inspect
+and analysis/build tools) is a suitability failure. Exercise main's public healthcheck and inspect
 the actual image for this isolation, not just its service name.
 Any public service with a host port mapping (`ports:`), `build`, `privileged`,
 `pid`, `network_mode`, capabilities/devices/security_opt overrides, any bind
 outside a real non-symlink `./` asset beneath environment/, a private path,
-container_name, static IP/IPAM, or without an explicit prebuilt image is a blocker.
+container_name, static IP/IPAM, or without an explicit prebuilt image is a suitability failure.
 `ports: ["8080"]` is also a forbidden host publication, not a container-only
 listener. main/runner must use Compose service DNS and client:PORT instead.
 No fixed/development IPAM override may enter the exported Compose.
 All public services need enabled healthchecks. main.image must be omitted or exactly
 task.json.images.agent; any other tag (including a shared analysis tag when task.json
-declares a task-specific agent image) is a blocker. main must provide bash, python3
+declares a task-specific agent image) is a suitability failure. main must provide bash, python3
 and /usr/bin/env; its image and client.image must be distinct. The submission is
 a regular, nonempty, non-symlink file <=16 MiB. Public Compose must not expose a runner service;
-the private verifier creates it. Any public_tests/private verify.sh is legacy and a blocker.
+the private verifier creates it. Any public_tests/private verify.sh is legacy and a suitability failure.
 task.json is generated by the controller, not written by the synthesis agent; verify it
 against route and actual images. runner.image must be null because the verifier creates
 the submission runner as a separate container from images.agent. The runner must be
 unprivileged and have no private mounts or Docker socket; oracle/solution may run only on
 the target. Exercise the exact private healthcheck in the runner container as uid 65534; exit 127 or a
-missing interpreter/tool is a blocker, not a target failure.
+missing interpreter/tool is a suitability failure, not a target failure.
 Oracle must exit 0 iff the effect exists and exactly 1 for a definite absence;
 any other code is verifier infrastructure failure, never patched success.
 An oracle keyed to the gold's hard-coded marker filename, token, command output
-or payload bytes is a blocker when the public contract permits another canary
+or payload bytes is a suitability failure when the public contract permits another canary
 or equivalent unauthorized effect. Score attacker-controlled effects within
 the task's stated security boundary, not agreement with the reference string.
 The oracle must not trust the runner's stdout or expose its private secret.
 The vulnerable-side signal must come from the submission's effect, not from a
 probe the oracle runs itself; an oracle that establishes "vulnerable" with its
-own probe and then only checks a log/journal shape is a blocker. Evidence must
+own probe and then only checks a log/journal shape is a suitability failure. Evidence must
 be root-owned or otherwise unwritable by the submission uid; if the oracle
 re-executes the submission, it must drop to the runner uid. Require a negative
 control (different crash, forged log, all-values POST, benign input) to score
@@ -689,7 +693,7 @@ For FILE-POV require public_runner with {input}; exercise a second, differently
 shaped input that triggers the same vulnerability-specific effect, and reject an
 oracle keyed to the gold input's exact size, offset or marker. For exploit branches
 require exploit.py and a meaningful effect. Missing offline binary rebuild/replacement
-is a blocker.
+is a suitability failure.
 Judge task quality as well as correctness: it should exercise meaningful analysis
 or interaction with the real vulnerability, not be impossible due to unrelated
 environment trivia or trivialized by an artificial wrapper/oracle shortcut.
@@ -715,7 +719,7 @@ malformed output stops the task. Use exactly this shape and only these two keys:
 passed is a boolean; evidence is a non-empty string naming the file, command
 and observed behavior behind the verdict. Do not emit findings, reason,
 execution_checked or any other key. Do not pass based only on files existing,
-a model saying it worked, or a container starting. A real blocker means
-passed=false; advisory packaging issues belong in evidence but should not by
-themselves reject an otherwise valid delivery.
+a model saying it worked, or a container starting. A suitability failure means
+passed=false; advisory notes belong in evidence but should not by themselves
+reject an otherwise valid delivery.
 """

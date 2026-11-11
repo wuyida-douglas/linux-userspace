@@ -23,6 +23,16 @@ class IsolationPromptTests(unittest.TestCase):
             with self.subTest(stage=name):
                 self.assertIn("ISOLATION", getattr(prompts, name))
 
+    def test_review_uses_two_decision_levels_and_a_two_key_output(self):
+        from pipeline.prompts import REVIEW
+        self.assertIn("exactly two decision", REVIEW)
+        self.assertIn("suitability failure", REVIEW)
+        self.assertIn("advisory note", REVIEW)
+        self.assertIn("only these two keys", REVIEW)
+        for legacy in ("blocker", "major", "minor"):
+            with self.subTest(legacy=legacy):
+                self.assertNotIn(legacy, REVIEW)
+
 
 if __name__ == "__main__":
     unittest.main()
