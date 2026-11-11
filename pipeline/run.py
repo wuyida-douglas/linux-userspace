@@ -491,8 +491,8 @@ def main() -> int:
     parser.add_argument("--max-turns", type=int, default=400)
     parser.add_argument("--route-timeout", type=int, default=1800)
     parser.add_argument("--route-turns", type=int, default=60)
-    parser.add_argument("--review-timeout", type=int, default=3600)
-    parser.add_argument("--review-turns", type=int, default=100)
+    parser.add_argument("--review-timeout", type=int, default=5400)
+    parser.add_argument("--review-turns", type=int, default=140)
     parser.add_argument("--verify-timeout", type=int, default=3600)
     parser.add_argument("--accept-turns", type=int, default=8,
                         help="max agent turns in each of the two Harbor acceptance runs")

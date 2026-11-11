@@ -1254,6 +1254,25 @@ levels for the verdict:
   do NOT set passed=false for them; repair them outside this gate.
 Do not use severity labels as output fields. The only output is the two-key JSON
 at the end of this prompt.
+Before deciding, verify that instruction.md's task-related claims are true
+and do not mislead the solver:
+- Every source/tool path, endpoint, submission type and size limit it names
+  must exist or behave as stated in main and the public environment.
+- If the instruction says a shortcut "does not work" (for example direct
+  access to an endpoint, or a benign input), verify that this is actually
+  blocked in the delivered main/image; if a shipped credential/config makes
+  the stated non-working path work, that is a suitability failure.
+- If the instruction says the solver must construct a CVE-specific input,
+  check that a generic/benign input does not already satisfy the declared
+  vulnerable effect. Do not run the full private differential.
+- A limit stated in instruction.md must match the runner/oracle; a hidden
+  stricter limit or different path that makes a valid solution fail is a
+  suitability failure.
+- Do not reject merely because instruction.md discloses hashes, salts,
+  usernames, credentials or other information; this review checks whether the
+  statements are true, not whether they reveal too much.
+Do not pass on Dockerfile claims alone; exercise the exact paths/tools the
+instruction names where feasible.
 Public Compose hygiene is a review check, not a substring scan. Container-internal
 absolute paths inside healthcheck commands are allowed (for example
 `/vault/private/ready`). Reject only real leaks: a bind source outside the `./`
@@ -1385,9 +1404,10 @@ any change.
 Write only review.json in the workspace root. Review the supplied evidence;
 do not launch the full private differential here. The next and only
 orchestrator acceptance stage is Harbor.
-This is a bounded review, not another synthesis session. By turn 50, stop repeating
+This is a bounded review, not another synthesis session. By turn 70, stop repeating
 already successful checks, finish only the remaining necessary verification, and commit
-a decision by turn 70. Read targeted files rather than repeatedly dumping the full tree.
+a decision by turn 100. Use the extra budget for the shortcut checks, not for
+re-reading the same files.
 If repair-request.json exists, focus on its concrete findings and regression checks.
 You must write review.json even when the verdict is false or evidence remains
 limited; never spend the entire budget without producing it. There is no

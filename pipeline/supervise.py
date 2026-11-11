@@ -18,7 +18,7 @@ import threading
 import time
 from pathlib import Path
 
-from .common import read_jsonl, timestamp, write_json
+from .common import display_task_id, read_jsonl, timestamp, write_json
 from .run import route as validate_route, reported_published_root
 
 
@@ -127,26 +127,31 @@ def latest_turn(path: Path) -> int:
 TERMINAL_RESULT_STATUSES = {"passed", "failed", "rejected", "error", "timeout"}
 
 
-def rename_if_terminal(results: Path) -> dict[str, str]:
-    """After a batch is truly terminal, use canonical+branch directory names.
+def write_display_index(results: Path) -> dict[str, str]:
+    """Write canonical display names without renaming result directories.
 
-    Never rename while a worker is alive or a route-only/synthesis task is still
-    resumable: supervisors address task dirs by the internal selection id.
+    Result directories stay keyed by the internal selection id so a worker or
+    supervisor can always find them. This index is the human/export-facing
+    name map (canonical advisory id + route branch), and it never invalidates
+    paths stored in result.json or acceptance.json.
     """
-    if os.environ.get("PIPELINE_DISABLE_RESULT_RENAME"):
-        return {}
     statuses = [load(path, {}).get("status") for path in results.glob("*/result.json")]
     if not statuses or any(status not in TERMINAL_RESULT_STATUSES for status in statuses):
         return {}
-    from .rename_results import rename_batch
-    try:
-        mapping = rename_batch(results)
-    except Exception as exc:  # naming must never turn a finished batch into a crash
-        print(f"warning: result-directory rename skipped: {exc}", flush=True)
-        return {}
+    mapping: dict[str, str] = {}
+    for result_path in sorted(results.glob("*/result.json")):
+        result = load(result_path, {})
+        route = load(result_path.parent / "workspace/route.json", {})
+        branch = route.get("branch")
+        if not branch:
+            continue
+        instance = route.get("instance_id") or result.get("instance_id") or result_path.parent.name
+        mapping[result_path.parent.name] = display_task_id(
+            instance, branch, route.get("host_type"))
     if mapping:
-        print(f"renamed {len(mapping)} result directories to canonical+branch names",
-              flush=True)
+        write_json(results / "display-names.json", {
+            "schema_version": 1, "mapping": mapping})
+        print(f"wrote display names for {len(mapping)} result directories", flush=True)
     return mapping
 
 
@@ -299,8 +304,8 @@ def carry_workspaces(sources: list[Path], results: Path, selected_ids: set[str] 
 def launch(task: str, sample: Path, results: Path,
            turns: int, timeout: int,
            resume_harbor: bool = False,
-           published_root: Path | None = None, review_turns: int = 70,
-           review_timeout: int = 3600, verify_timeout: int = 1800,
+           published_root: Path | None = None, review_turns: int = 140,
+           review_timeout: int = 5400, verify_timeout: int = 1800,
            review_delivery: bool = False,
            continue_synthesis: bool = False,
            workspace_from: Path | None = None,
@@ -344,8 +349,8 @@ def main() -> int:
     parser.add_argument("--concurrency", type=int, default=20)
     parser.add_argument("--max-turns", type=int, default=400)
     parser.add_argument("--timeout", type=int, default=18000)
-    parser.add_argument("--review-turns", type=int, default=100)
-    parser.add_argument("--review-timeout", type=int, default=3600)
+    parser.add_argument("--review-turns", type=int, default=140)
+    parser.add_argument("--review-timeout", type=int, default=5400)
     parser.add_argument("--verify-timeout", type=int, default=1800)
     parser.add_argument("--published-root", type=Path, default=reported_published_root())
     parser.add_argument("--route-only", action="store_true")
@@ -1788,14 +1793,14 @@ def main() -> int:
         state["updated_at"] = timestamp()
         atomic_json(state_path, state)
         if args.once:
-            rename_if_terminal(args.results)
+            write_display_index(args.results)
             controller_lock.close()
             return 0
         routing = bool(args.from_pilot and any(
             load(args.from_pilot / row["task_id"] / "result.json", {}).get("status") == "routing"
             for row in selected))
         if not active and not routing and not external and not candidates:
-            rename_if_terminal(args.results)
+            write_display_index(args.results)
             controller_lock.close()
             return 0
         time.sleep(60)

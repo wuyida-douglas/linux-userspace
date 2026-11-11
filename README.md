@@ -388,14 +388,11 @@ cve-2020-28483-svc-exploit-synthetic-host
 后缀规则：SVC 用 `-svc-exploit-native-service` / `-svc-exploit-real-host` /
 `-svc-exploit-synthetic-host`，FILE 用 `-file-exploit` / `-file-pov`。
 
-导出名现在只保留公告 ID 和分支，例如 `cve-2020-28483-file-pov`；结果目录
-在批次 terminal 后会由 supervisor 自动用同一规则整理，映射写入
-`batch-NNN/renames.json`。内部 `result.json.task_id` 不变。只有 supervisor
-崩溃导致未改名时，才需要手动补跑：
-
-```bash
-.venv/bin/python -m pipeline.rename_results results/<run>/batch-NNN
-```
+导出名现在只保留公告 ID 和分支，例如 `cve-2020-28483-file-pov`。结果目录
+**保持内部 task id，不做改名**；批次 terminal 后 supervisor 只写
+`batch-NNN/display-names.json`，记录 `内部目录 -> 展示名` 的映射，导出和报表
+使用展示名。这样 `result.json` / `acceptance.json` 里的绝对路径不会因为改名失效。
+内部 `result.json.task_id` 不变。
 每个导出题目录里的 `acceptance.json` 是本次验收证据的只读副本
 （两次 Harbor Agent run 的 reward 与 verifier evidence），不是运行依赖。
 
