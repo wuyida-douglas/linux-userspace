@@ -66,11 +66,15 @@ def previous_requeues(task: Path) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("results", type=Path)
+    parser.add_argument("--only", nargs="*", help="explicit task ids (manual retry only)")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     results = args.results.resolve()
     flipped: list[str] = []
+    wanted = set(args.only or [])
     for record_path in sorted(results.glob("*/result.json")):
+        if wanted and record_path.parent.name not in wanted:
+            continue
         record = load(record_path)
         if record.get("status") != "error":
             continue
