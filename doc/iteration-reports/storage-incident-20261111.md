@@ -248,3 +248,24 @@ PIPELINE_KEEP_RESOURCES=1 ...
 2. 整批结束：`docker builder prune --filter until=1h`、`docker volume prune`、TMPDIR 24 小时前的 `pip-unpack-*`。
 
 均可在 `synthesize_batch` 用 `--no-prune-cache` 关闭缓存清理；`PIPELINE_KEEP_RESOURCES=1` 关闭 per-task 清理。
+
+### 批次运行期间的周期性清理
+
+长时间批次会持续产生匿名卷和 TMPDIR 垃圾，因此 coordinator 在运行期间每 **3 小时**执行一次 `volume prune` + TMPDIR 清理（`_housekeeping_loop`），不等待批次结束：
+
+- `docker volume prune --force`：只删未被运行中容器引用的卷，不会影响在跑的任务；
+- TMPDIR：删除 24 小时前的 `pip-unpack-*`、`pip-req-build-*` 和 `claude-*` 会话输出；
+- **build cache 不在其中**：prune 会持有 containerd 内容存储锁并拖死验收，只在批次结束（无 worker）时执行。
+
+### 2000 道题的容量预估
+
+| 项目 | 数量级 |
+|---|---:|
+| results（每题 input + delivery + 轨迹） | ~260G |
+| harbor_export（每题交付包 ~400MB） | ~800G |
+| samples | 162G |
+| 80 并发运行期镜像/容器/卷 | ~150–300G |
+| build cache（批次结束前） | 受构建量影响，最多数百 G |
+| **合计峰值** | **约 1.5–1.8T / 3.5T** |
+
+结论：3.5T 的 NVMe 足够跑完 2000 题，前提是 per-task 清理持续生效、且不要在高负载时手工全量 prune。
