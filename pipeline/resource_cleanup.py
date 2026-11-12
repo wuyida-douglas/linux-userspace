@@ -292,7 +292,7 @@ def prune_unused_volumes(dry_run: bool = False) -> dict[str, Any]:
 
 
 def prune_temp_leftovers(older_than_hours: int = 24, dry_run: bool = False) -> dict[str, Any]:
-    """Drop old pip/build unpack directories from the shared TMPDIR."""
+    """Drop old pip/build unpack directories and agent session output."""
     import tempfile
     import time as _time
     root = Path(tempfile.gettempdir())
@@ -301,7 +301,8 @@ def prune_temp_leftovers(older_than_hours: int = 24, dry_run: bool = False) -> d
     cutoff = _time.time() - older_than_hours * 3600
     removed = []
     for path in root.iterdir():
-        if not (path.name.startswith("pip-unpack-") or path.name.startswith("pip-req-build-")):
+        if not (path.name.startswith("pip-unpack-") or path.name.startswith("pip-req-build-")
+                or (path.name.startswith("claude-") and path.is_dir())):
             continue
         try:
             if path.stat().st_mtime >= cutoff:

@@ -286,6 +286,23 @@ def receipt_for(results: Path, wave: list[str], batch_number: int) -> Path:
     return path
 
 
+def _housekeeping_loop(stop, interval_sec: int = 3 * 3600) -> None:
+    """Cheap, lock-free cleanup while the supervisor keeps the queue full.
+
+    Anonymous volumes and old pip/build unpack directories accumulate during a
+    long batch and cost nothing to reclaim. Build-cache pruning is deliberately
+    not done here: it holds the containerd content-store lock and would stall
+    live acceptances; that prune only runs when the batch has no worker.
+    """
+    from .resource_cleanup import prune_temp_leftovers, prune_unused_volumes
+    while not stop.wait(interval_sec):
+        try:
+            prune_unused_volumes()
+            prune_temp_leftovers(24)
+        except Exception:
+            pass
+
+
 def run_wave(args: argparse.Namespace, wave: list[str], number: int,
              batch_number: int, published_root: Path | None,
              label: str = "initial") -> int:
@@ -310,10 +327,17 @@ def run_wave(args: argparse.Namespace, wave: list[str], number: int,
         command += ["--published-root", str(published_root)]
     log_path = args.results / "logs" / f"synthesize-{label}-batch-{number:04d}.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    import threading
+    stop = threading.Event()
+    housekeeping = threading.Thread(target=_housekeeping_loop, args=(stop,), daemon=True)
+    housekeeping.start()
     with log_path.open("a", encoding="utf-8") as log:
         log.write(f"\n[{timestamp()}] wave {number}: {len(wave)} task(s)\n")
         log.flush()
-        completed = subprocess.run(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
+        try:
+            completed = subprocess.run(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
+        finally:
+            stop.set()
     if completed.returncode != 0:
         raise SystemExit(f"supervisor wave {number} exited {completed.returncode}; see {log_path}")
     return 0
