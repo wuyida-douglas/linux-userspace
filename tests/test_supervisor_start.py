@@ -398,6 +398,39 @@ class ReviewRetryBoundTests(unittest.TestCase):
                              "review_attempt_completed")
 
 
+class AutoRetryFailedTests(unittest.TestCase):
+    def test_failed_harbor_task_is_not_requeued_automatically(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task = "linux-050"
+            base = root / task
+            base.joinpath("workspace/delivery").mkdir(parents=True)
+            base.joinpath("workspace/route.json").write_text("{}")
+            base.joinpath("workspace/review.json").write_text('{"passed": true}')
+            base.joinpath("synthesis").mkdir()
+            base.joinpath("synthesis/result.json").write_text('{"status": "completed"}')
+            base.joinpath("result.json").write_text(json.dumps({
+                "status": "failed", "failure_class": "harbor_failed",
+                "harbor": {"gold": {"reward": 1.0}, "null": {"reward": 0.0},
+                           "differential_from_final_bundle": {
+                               "status": "error", "report": {"status": "infra_error"}}},
+            }))
+            (root / "selection.jsonl").write_text(json.dumps({
+                "task_id": task, "instance_id": "CVE-test::project"}) + "\n")
+            (root / "supervisor-state.json").write_text(json.dumps({
+                "schema_version": 1, "children": {}, "scheduled": []}))
+            with unittest.mock.patch.object(supervise, "launch") as launch, \
+                    unittest.mock.patch.object(supervise, "pipeline_worker_command", return_value=None), \
+                    unittest.mock.patch.object(supervise.subprocess, "run",
+                                               return_value=unittest.mock.Mock(stdout="", returncode=0)):
+                with unittest.mock.patch("sys.argv", ["supervise", "--sample", str(root),
+                                                       "--results", str(root), "--once"]):
+                    self.assertEqual(supervise.main(), 0)
+            launch.assert_not_called()
+            state = json.loads((root / "supervisor-state.json").read_text())
+            self.assertEqual(state["children"][task]["retry_blocked"], "auto_retry_disabled", state)
+
+
 class SharedRecoveryAdoptionTests(unittest.TestCase):
     def test_terminal_adopted_review_rejection_requires_manual_recovery(self):
         with tempfile.TemporaryDirectory() as directory:

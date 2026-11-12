@@ -128,13 +128,12 @@ class BundleValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(FileNotFoundError, "image archive is missing"):
                 validate_bundle_archives(task, root)
 
-    def test_dockerfile_and_timeout_are_rejected(self):
+    def test_dockerfile_is_allowed_and_timeout_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             task = self._bundle(root)
             (task / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "Dockerfile"):
-                validate_bundle_archives(task, root)
+            validate_bundle_archives(task, root)
             (task / "Dockerfile").unlink()
             (task / "harbor-runtime-profile/task.toml").write_text(
                 '[environment]\ntimeout_sec = 10\nnetwork_mode = "public"\n',

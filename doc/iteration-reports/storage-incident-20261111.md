@@ -216,3 +216,35 @@ PIPELINE_KEEP_RESOURCES=1 ...
 ### 仍可回收
 
 - `.repair-20261111-174827/` 211.8G：208 个目录全部有同名活动目录，是纯重复归档；删除后 results 约 84G。
+
+## 9. 其他占用与自动化（2026-11-12 收尾）
+
+### `/nvme/docker` 70.6G 的真实构成
+
+| 子目录 | 大小 | 说明 |
+|---|---:|---|
+| `volumes/` | **55.4G** | 402 个**匿名 volume**——被超时杀掉的 Compose trial 留下的，没有标签可以回溯到题目 |
+| `rootfs/` | 14.6G | 旧存储驱动的历史数据 |
+| `buildkit/` | 0.6G | 构建器状态 |
+| `containers/`（日志） | **10.9M** | 容器日志其实很小，不是问题 |
+
+处理：`docker volume prune -f` 回收了 **58G**（402 → 18 个在用）。自动化：coordinator 在批次结束时执行 `volume prune`（`prune_unused_volumes`），配合 per-task 清理，不再需要人工定期清。
+
+### `TMPDIR`（`/nvme/wuyida/tmp`）15G
+
+构成：`pip-unpack-*`（agent 安装依赖时的解包目录，每个 ~500MB）、构建临时目录、Claude Code agent 的会话输出（单个任务可达 8G）。已清到 820M。自动化：批次结束时删除 24 小时前的 `pip-unpack-*`（`prune_temp_leftovers`）。
+
+### 隐藏归档 `.repair-20261111-174827/`
+
+以 `.` 开头，`ls` 默认看不到，需 `ls -a`。已删除（212G），删除前确认了 208 个子目录全部有同名活动目录。
+
+### `workspace/.agent-tmp/`
+
+已全部删除（0 GB）。per-task 清理会自动删除（含 root 文件回退），**不需要定时任务**。
+
+### 批次结束时的自动清理顺序
+
+1. 每题终态：容器、网络、任务镜像、`accept-profile`/`bundle`/`verifier work`/`infrastructure-attempts` 中间产物、`.agent-tmp`；
+2. 整批结束：`docker builder prune --filter until=1h`、`docker volume prune`、TMPDIR 24 小时前的 `pip-unpack-*`。
+
+均可在 `synthesize_batch` 用 `--no-prune-cache` 关闭缓存清理；`PIPELINE_KEEP_RESOURCES=1` 关闭 per-task 清理。

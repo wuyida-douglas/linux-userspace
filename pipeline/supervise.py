@@ -138,6 +138,10 @@ def latest_turn(path: Path) -> int:
 
 
 TERMINAL_RESULT_STATUSES = {"passed", "failed", "rejected", "error", "timeout"}
+# A terminal failed/error result is final. The supervisor must not silently
+# re-add a failed task to the scheduling queue; retrying is an explicit
+# operator decision (`--retry-failed` in the coordinator or a manual requeue).
+AUTO_RETRY_FAILED = False
 # The supervisor schedules continuously up to --concurrency; this bound only
 # limits how many fresh task IDs one invocation may own. The coordinator passes
 # the whole batch so there is no wave barrier.
@@ -1590,7 +1594,8 @@ def main() -> int:
                 completed.add(task)
                 continue
             if (retry_reason is None and record.get("status") in {"routing", "error"}
-                    and not route_file.is_file() and child.get("retry_count", 0) < 1):
+                    and not route_file.is_file() and child.get("retry_count", 0) < 1
+                    and (AUTO_RETRY_FAILED or record.get("status") != "error")):
                 child.pop("retry_reason", None)
                 completed.discard(task)
             if (retry_reason is None and record.get("status") == "harbor"
@@ -1614,6 +1619,15 @@ def main() -> int:
                                 "synthesis_interrupted", "delivery_contract_repair",
                                 "delivery_review_repair"}:
                 children[task].update(retry_reason="manual_recovery_required",
+                                      previous_status=record.get("status"))
+                completed.add(task)
+                continue
+            if retry_reason and not AUTO_RETRY_FAILED \
+                    and record.get("status") in {"failed", "error"}:
+                # Failed tasks are final. Keep the evidence and the frozen
+                # state; do not requeue them from the scheduler.
+                children[task].update(retry_reason=None,
+                                      retry_blocked="auto_retry_disabled",
                                       previous_status=record.get("status"))
                 completed.add(task)
                 continue

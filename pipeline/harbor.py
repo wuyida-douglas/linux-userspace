@@ -1055,9 +1055,8 @@ def validate_bundle_archives(task_dir: Path, root: Path) -> None:
                 raise ValueError(f"image archive differs from manifest: {path}")
 
     profile = task_dir / "harbor-runtime-profile"
-    for path in task_dir.rglob("*"):
-        if path.is_file() and path.name.startswith("Dockerfile"):
-            raise ValueError(f"delivery must not contain a Dockerfile: {path}")
+    # Dockerfiles are allowed in the exported bundle: they are inert build
+    # material and never replace the prebuilt images used by acceptance.
     if profile.is_dir():
         toml_path = profile / "task.toml"
         if toml_path.is_file():

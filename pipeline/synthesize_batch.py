@@ -528,11 +528,18 @@ def main() -> int:
         # live worker the cache is dead weight, and this is the only window
         # where pruning cannot collide with an acceptance on the daemon.
         if not args.no_prune_cache:
-            from .resource_cleanup import prune_build_cache
+            from .resource_cleanup import (prune_build_cache, prune_temp_leftovers,
+                                           prune_unused_volumes)
             pruned = prune_build_cache("1h")
+            volumes = prune_unused_volumes()
+            temp = prune_temp_leftovers(24)
             summary["build_cache_prune"] = pruned
+            summary["volume_prune"] = volumes
+            summary["temp_prune"] = temp
             write_json(args.results / "synthesis-summary.json", summary)
             print(f"build cache pruned: {pruned.get('returncode', pruned)}", flush=True)
+            print(f"volumes pruned: {volumes.get('returncode', volumes)}", flush=True)
+            print(f"temp leftovers removed: {len(temp.get('removed', []))}", flush=True)
         return 0 if all(status in ACCEPTABLE_STATUSES for status in counts) else 1
 
 

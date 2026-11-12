@@ -143,6 +143,10 @@ worker，不会重复启动。
 （证据不删除），清掉该题在 `supervisor-state.json` 里的状态，再从头合成。
 `RETRY_ROUNDS` 控制最多重跑几轮。归档会占磁盘，确认无用后可删
 `results/<run>/.attempts/`。
+- **失败即终态**：supervisor 不会自动把 `failed` / `error` 的题重新加入队列；
+失败结果会保留原样，重跑必须显式使用 `RETRY_FAILED=1` 或手动 requeue。
+只有 `routing` / `synthesizing` / `reviewing` / `harbor` 这类中断状态会从保留的
+workspace 继续。
 - 输入缺失（`input_unavailable` 或没有 `tasks/<task>/input/manifest.json`）的题
 不会被自动重跑；先把输入补齐。
 - 也可以从汇总里导出失败题，写进 `TASKS_FILE` 后按 `MODE=tasks-file` 精确重跑：

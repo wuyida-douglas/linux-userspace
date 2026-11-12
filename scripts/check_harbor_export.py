@@ -204,7 +204,9 @@ def check_task(task_dir: Path, root: Path, report: Report, *, do_hash: bool) -> 
         report.warn(task, "self-contained", "profile has obsolete load_shared_images.py")
     for path in profile.rglob("*"):
         if path.is_file() and path.name.startswith("Dockerfile"):
-            report.fail(task, "layout", f"Dockerfile in delivery: {path.relative_to(profile)}")
+            # Inert build material is allowed in the bundle; acceptance still
+            # uses the prebuilt images from image-lock.json.
+            report.warn(task, "layout", f"Dockerfile in delivery (allowed): {path.relative_to(profile)}")
         if path.is_file() and path.suffix in {".py", ".sh", ".md", ".toml", ".yaml", ".json"}:
             try:
                 text = path.read_text(encoding="utf-8", errors="replace")

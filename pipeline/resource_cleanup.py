@@ -273,6 +273,47 @@ def prune_build_cache(until: str = "1h", dry_run: bool = False) -> dict[str, Any
             "output": (result.stdout + result.stderr)[-2000:]}
 
 
+def prune_unused_volumes(dry_run: bool = False) -> dict[str, Any]:
+    """Remove anonymous volumes left by killed Compose trials.
+
+    Compose removes its named volumes on ``down --volumes``; a trial killed by
+    a timeout leaves anonymous volumes behind with no label that could tie
+    them to a task. At batch end nothing references them, so prune is safe.
+    """
+    docker = docker_path()
+    if not docker:
+        return {"skipped": "docker not found"}
+    argv = [docker, "volume", "prune", "--force"]
+    if dry_run:
+        return {"command": argv}
+    result = _run(argv, timeout=1800)
+    return {"returncode": result.returncode,
+            "output": (result.stdout + result.stderr)[-2000:]}
+
+
+def prune_temp_leftovers(older_than_hours: int = 24, dry_run: bool = False) -> dict[str, Any]:
+    """Drop old pip/build unpack directories from the shared TMPDIR."""
+    import tempfile
+    import time as _time
+    root = Path(tempfile.gettempdir())
+    if not root.is_dir():
+        return {"skipped": "no tmpdir"}
+    cutoff = _time.time() - older_than_hours * 3600
+    removed = []
+    for path in root.iterdir():
+        if not (path.name.startswith("pip-unpack-") or path.name.startswith("pip-req-build-")):
+            continue
+        try:
+            if path.stat().st_mtime >= cutoff:
+                continue
+        except OSError:
+            continue
+        removed.append(path.name)
+        if not dry_run:
+            _remove_tree(path)
+    return {"removed": removed}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--results", type=Path, required=True)
@@ -280,6 +321,8 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--include-in-flight", action="store_true",
                         help="treat tasks without a live worker as finished (stopped batch)")
+    parser.add_argument("--prune-volumes", action="store_true",
+                        help="also remove unused anonymous Docker volumes (batch end)")
     parser.add_argument("--prune-cache", action="store_true",
                         help="also prune build cache older than --prune-until (run when idle)")
     parser.add_argument("--prune-until", default="1h")
@@ -312,6 +355,8 @@ def main() -> int:
         total["scratch"] += len(report.get("scratch") or [])
         if args.dry_run:
             print(task_id, {k: v for k, v in report.items() if k in ("containers", "networks", "images", "scratch")})
+    if args.prune_volumes:
+        total["volumes"] = prune_unused_volumes(dry_run=args.dry_run)
     if args.prune_cache:
         total["build_cache"] = prune_build_cache(args.prune_until, dry_run=args.dry_run)
     print(json.dumps(total, ensure_ascii=False))
