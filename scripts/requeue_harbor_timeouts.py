@@ -30,6 +30,28 @@ MAX_REQUEUES = 3
 TRIGGERS = ("TimeoutExpired", "Harbor trial failed")
 
 
+def job_finished_with_zero_reward(error: str) -> bool:
+    """True when the referenced Harbor job completed without an exception.
+
+    A completed trial with reward 0 is a grading verdict (harbor_failed), not
+    an infrastructure failure. Requeueing it just replays the same delivery,
+    and after per-task cleanup the images are gone, so every retry would fail
+    at export instead.
+    """
+    marker = "harbor/jobs/"
+    if marker not in error:
+        return False
+    tail = error.split(marker, 1)[1]
+    job_name = tail.split(":", 1)[0].split()[0].rstrip("/")
+    root = Path(error.split(marker, 1)[0] + marker)
+    job = root / job_name / "result.json"
+    try:
+        stats = json.loads(job.read_text(encoding="utf-8")).get("stats") or {}
+    except (OSError, ValueError):
+        return False
+    return (stats.get("n_errored_trials") or 0) == 0 and (stats.get("n_completed_trials") or 0) == 1
+
+
 def load(path: Path) -> dict:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -54,6 +76,8 @@ def main() -> int:
             continue
         error = str(record.get("error") or "")
         if not any(token in error for token in TRIGGERS):
+            continue
+        if job_finished_with_zero_reward(error):
             continue
         task = record_path.parent
         if not (task / "workspace/delivery").is_dir():
