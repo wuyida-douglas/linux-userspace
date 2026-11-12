@@ -7,6 +7,7 @@ import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -17,6 +18,59 @@ from .common import timestamp, write_json
 
 EMPTY_MCP = '{"mcpServers":{}}'
 ROOT = Path(__file__).resolve().parents[1]
+NO_PROXY = ("localhost,127.0.0.1,::1,.pjlab.org.cn,.sensetime.com,"
+            "10.0.0.0/8,100.0.0.0/8,172.16.0.0/12,192.168.0.0/16,"
+            "10.140.84.42,10.12.111.133")
+
+
+def docker_config_environment(env: dict[str, str]) -> dict[str, str]:
+    """Make ``docker build`` egress without per-command ``--build-arg`` flags.
+
+    The Docker CLI reads proxies from ``$DOCKER_CONFIG/config.json``.  This is
+    a CLI-side setting only: it never moves the daemon's data-root, images,
+    containers, volumes or build cache.
+    """
+    if env.get("PT_PROXY_DISABLED"):
+        return env
+    credential = Path.home() / ".config/pt-proxy/proxy-url"
+    if not credential.is_file():
+        return env
+    proxy_url = credential.read_text(encoding="utf-8").strip()
+    if not proxy_url:
+        return env
+
+    directory = Path.home() / ".config/pt-proxy/docker"
+    directory.mkdir(parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+    target = directory / "config.json"
+    config: dict = {}
+    if target.is_file():
+        try:
+            loaded = json.loads(target.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                config = loaded
+        except (OSError, ValueError):
+            config = {}
+    config["proxies"] = {
+        "default": {
+            "httpProxy": proxy_url,
+            "httpsProxy": proxy_url,
+            "noProxy": NO_PROXY,
+        }
+    }
+    text = json.dumps(config, ensure_ascii=False, indent=2) + "\n"
+    if not target.is_file() or target.read_text(encoding="utf-8") != text:
+        handle, temporary = tempfile.mkstemp(dir=directory, prefix=".config.", suffix=".json")
+        try:
+            with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                stream.write(text)
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, target)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+    env["DOCKER_CONFIG"] = str(directory)
+    return env
 
 
 def workspace_environment(workspace: Path, base: dict[str, str] | None = None) -> dict[str, str]:
@@ -50,7 +104,7 @@ def workspace_environment(workspace: Path, base: dict[str, str] | None = None) -
     env.setdefault("PIPELINE_IPAM_WORK_DIR", str(resolved / ".compose-ipam"))
     env.setdefault("LC_ALL", "C.UTF-8")
     env.setdefault("LANG", "C.UTF-8")
-    return env
+    return docker_config_environment(env)
 
 
 def command(prompt: str, model: str, max_turns: int, network: Path,
@@ -721,11 +775,8 @@ def run(prompt: str, workspace: Path, output: Path, *, model: str,
         if proxy_url and not os.environ.get("PT_PROXY_DISABLED"):
             for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
                 env[key] = proxy_url
-            no_proxy = ("localhost,127.0.0.1,::1,.pjlab.org.cn,.sensetime.com,"
-                        "10.0.0.0/8,100.0.0.0/8,172.16.0.0/12,192.168.0.0/16,"
-                        "10.140.84.42,10.12.111.133")
-            env["NO_PROXY"] = no_proxy
-            env["no_proxy"] = no_proxy
+            env["NO_PROXY"] = NO_PROXY
+            env["no_proxy"] = NO_PROXY
     env = workspace_environment(workspace, env)
     env.update({
         "CLAUDE_CODE_MAX_RETRIES": "15",

@@ -15,6 +15,7 @@ from typing import Any
 
 import yaml
 
+from .agent import docker_config_environment
 from .common import export_task_id, sha256 as digest_file
 from .common import timestamp, write_json
 from .pristine_binds import create_pristine_binds_tar, extract_pristine_binds
@@ -875,7 +876,7 @@ def _harbor_run_fresh(profile: Path, jobs: Path, name: str, timeout: int,
     executable = ROOT / ".venv/bin/harbor"
     if not executable.is_file():
         raise FileNotFoundError(f"Harbor 0.22 CLI is missing: {executable}")
-    environment = dict(os.environ)
+    environment = docker_config_environment(dict(os.environ))
     environment["PATH"] = str(ROOT / "config/bin") + os.pathsep + environment.get("PATH", "")
     environment["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
     environment["PASS2FAIL_DOCKER"] = str(ROOT / "config/bin/docker")
