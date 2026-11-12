@@ -580,11 +580,46 @@ if __name__ == "__main__":
     (bin_dir / "load_image.py").chmod(0o755)
 
 
+def rebuild_missing_images(delivery: Path, contract: dict[str, Any]) -> list[str]:
+    """Recreate task images that per-task cleanup removed.
+
+    A finished task keeps its delivery (Dockerfile plus build context) but not
+    its images. A later ``--resume`` acceptance needs those images for
+    ``docker save``, so rebuild them with the same tags instead of failing.
+    Shared platform images are never rebuilt or replaced here.
+    """
+    images = contract.get("images") or {}
+    project = delivery / "project"
+    rebuilt: list[str] = []
+    for role, relative in (("agent", "main/Dockerfile"), ("target", "client/Dockerfile")):
+        reference = images.get(role)
+        if not isinstance(reference, str) or not reference:
+            continue
+        if reference.startswith(("linux-userspace-agent", "linux-userspace-verifier")):
+            continue
+        check = subprocess.run(docker_argv(["docker", "image", "inspect", reference]),
+                               capture_output=True, text=True, timeout=60)
+        if check.returncode == 0:
+            continue
+        dockerfile = project / relative
+        if not dockerfile.is_file():
+            raise RuntimeError(f"image {reference} is missing and {dockerfile} does not exist")
+        built = subprocess.run(
+            docker_argv(["docker", "build", "--network", "host", "-t", reference,
+                         "-f", str(dockerfile), str(project)]),
+            capture_output=True, text=True, timeout=3600)
+        if built.returncode:
+            raise RuntimeError(f"failed to rebuild {reference}: {built.stderr[-2000:]}")
+        rebuilt.append(reference)
+    return rebuilt
+
+
 def export(delivery: Path, destination: Path, task_id: str, route: dict[str, Any],
            agent_image: str | None = None, bundle_root: Path | None = None) -> dict[str, Any]:
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{3,159}", task_id):
         raise ValueError("invalid Harbor task id")
     contract = load_task(delivery / "task.json")
+    rebuild_missing_images(delivery, contract)
     agent_image = agent_image or contract["images"]["agent"]
     if agent_image == AGENT_IMAGE:
         # Runtime preparation is explicit (pipeline.runtime_images). Export
