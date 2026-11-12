@@ -4,7 +4,7 @@
 #
 # MODE=all          synthesize every task in selection.jsonl
 # MODE=tasks-file   synthesize only the ids listed in TASKS_FILE
-# RETRY_FAILED=1    archive failed/error/timeout attempts and rerun them
+# 失败即终态：不提供自动重跑开关（--retry-failed 已禁用）
 set -eu
 
 # ===== 直接改这里 =====
@@ -14,7 +14,6 @@ ENV_FILE=/nvme/wuyida/env
 MODE=all
 CONCURRENCY=80
 WAVE_SIZE=0
-RETRY_FAILED=0
 RETRY_ROUNDS=1
 DRY_RUN=0
 EXPECT_BATCH=1
@@ -47,7 +46,6 @@ if [ "$WAVE_SIZE" -gt 100000 ]; then
   echo "WAVE_SIZE must be in 0..100000 (0 = continuous scheduling)" >&2
   exit 2
 fi
-case "$RETRY_FAILED" in 0|1) ;; *) echo "RETRY_FAILED must be 0 or 1" >&2; exit 2 ;; esac
 case "$DRY_RUN" in 0|1) ;; *) echo "DRY_RUN must be 0 or 1" >&2; exit 2 ;; esac
 
 case "$MODE" in
@@ -65,9 +63,6 @@ case "$MODE" in
 esac
 set -- --sample "$SAMPLE" --results "$RESULTS" --env-file "$ENV_FILE" \
        --concurrency "$CONCURRENCY" --wave-size "$WAVE_SIZE" "$@"
-if [ "$RETRY_FAILED" = "1" ]; then
-  set -- "$@" --retry-failed --retry-rounds "$RETRY_ROUNDS"
-fi
 if [ "$DRY_RUN" = "1" ]; then
   set -- "$@" --dry-run
 fi
@@ -75,5 +70,5 @@ if [ -n "${EXPECT_BATCH:-}" ]; then
   set -- "$@" --expect-batch "$EXPECT_BATCH"
 fi
 
-echo "synthesizing sample=$SAMPLE results=$RESULTS mode=$MODE concurrency=$CONCURRENCY wave_size=$WAVE_SIZE retry_failed=$RETRY_FAILED"
+echo "synthesizing sample=$SAMPLE results=$RESULTS mode=$MODE concurrency=$CONCURRENCY wave_size=$WAVE_SIZE"
 exec "$REPO/.venv/bin/python" -m pipeline.synthesize_batch "$@"

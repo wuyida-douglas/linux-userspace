@@ -616,6 +616,13 @@ class ExplicitCarryPlanTests(unittest.TestCase):
 
 
 class BoundedRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        # Production defaults to "failures are terminal"; these tests exercise
+        # the bounded recovery paths themselves, so they opt back in.
+        patcher = unittest.mock.patch.object(supervise, "FAILURES_TERMINAL", False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_abandoned_review_recovery_is_not_terminal_before_launch(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

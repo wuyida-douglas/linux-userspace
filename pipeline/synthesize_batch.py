@@ -196,6 +196,9 @@ def resolve_paths(args: argparse.Namespace) -> None:
                          "(0 = one continuous supervisor batch)")
     if args.concurrency < 1 or args.concurrency > MAX_CONCURRENCY:
         raise SystemExit(f"--concurrency must be 1..{MAX_CONCURRENCY}")
+    if args.retry_failed:
+        raise SystemExit("--retry-failed is disabled: failed/error are terminal; "
+                         "re-run a specific task manually if you really need it")
     if args.retry_rounds < 0:
         raise SystemExit("--retry-rounds must be >= 0")
 
@@ -461,7 +464,7 @@ def main() -> int:
     parser.add_argument("--no-prune-cache", action="store_true",
                         help="keep the Docker build cache after the batch (default: prune idle cache)")
     parser.add_argument("--retry-failed", action="store_true",
-                        help="archive failed/error tasks and run them again")
+                        help="disabled: failures are terminal")
     parser.add_argument("--retry-rounds", type=int, default=1,
                         help="bounded retry rounds after the first pass (default: 1)")
     parser.add_argument("--force", action="store_true",

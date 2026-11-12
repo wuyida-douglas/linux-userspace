@@ -51,7 +51,7 @@ WORKERS=30
 抽题或重复下载。
 
 准备过程会显示完成数、失败数、耗时和 ETA；按 `Ctrl-C` 后重新运行同一脚本即可
-续跑。下载完成后如果还要 `RETRY_FAILED=1` 重跑，先不要删 `tasks/<task-id>/`。
+续跑。下载完成后不要删除 `tasks/<task-id>/`，否则该题会被视为输入不可用。
 
 ### 1.2 输出
 
@@ -78,8 +78,6 @@ MODE=tasks-file
 TASKS_FILE=/nvme/wuyida/新管线开发/samples/batch-01/todo.txt
 CONCURRENCY=40
 WAVE_SIZE=0
-RETRY_FAILED=0
-RETRY_ROUNDS=1
 DRY_RUN=0
 EXPECT_BATCH=1
 # ======================
@@ -100,8 +98,6 @@ TASKS_FILE         任务清单；只在 tasks-file 模式使用
 CONCURRENCY        同时运行的 worker 数，1..40，默认 40
 WAVE_SIZE          0 = 所有题交给一个 supervisor 连续调度（默认，无 wave 屏障）；
                    正数 = 旧的有界 wave 模式，每 N 题重启一次 supervisor
-RETRY_FAILED=1     归档 failed/error/timeout 的尝试并重跑
-RETRY_ROUNDS       重跑轮数，默认 1
 DRY_RUN=1          只打印目标和 batch 划分，不启动模型
 EXPECT_BATCH       校验 sample.json 里的 batch 号；留空表示不校验
 ```
@@ -137,14 +133,9 @@ route / synthesis 状态继续，不会重新抽题。
 - `Ctrl-C` 会停掉协调器和当前 supervisor；已经启动的 `pipeline.run` worker
 在独立 session 里，可能继续把当前题跑完。重跑时新 supervisor 会接管这些
 worker，不会重复启动。
-- **重跑失败题**：把 `RETRY_FAILED` 改成 `1`。它会把 `failed` / `error` /
-`timeout` 的整次尝试归档到
-`/nvme/wuyida/新管线开发/results/<run>/.attempts/<task>/<timestamp>/`
-（证据不删除），清掉该题在 `supervisor-state.json` 里的状态，再从头合成。
-`RETRY_ROUNDS` 控制最多重跑几轮。归档会占磁盘，确认无用后可删
-`results/<run>/.attempts/`。
-- **失败即终态**：supervisor 不会自动把 `failed` / `error` 的题重新加入队列；
-失败结果会保留原样，重跑必须显式使用 `RETRY_FAILED=1` 或手动 requeue。
+- **失败即终态（强制）**：`failed` / `error` 的题不会被重新加入队列，
+`--retry-failed` 已禁用，也没有任何自动 requeue 脚本。需要重做某一道题时，
+只能人工对该题单独起一次运行；不要写进批次循环。
 只有 `routing` / `synthesizing` / `reviewing` / `harbor` 这类中断状态会从保留的
 workspace 继续。
 - 输入缺失（`input_unavailable` 或没有 `tasks/<task>/input/manifest.json`）的题

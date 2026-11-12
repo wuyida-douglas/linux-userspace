@@ -110,7 +110,7 @@ Docker 配了 `data-root=/nvme/docker`，但这台机器用的是 **containerd �
 |---|---|
 | `pipeline/resource_cleanup.py` | 清理实现：容器、网络、镜像、临时目录；支持 dry-run 和批量 |
 | `pipeline/run.py` | `run_exclusive()` 在 `run_one()` 返回后立即调用 `cleanup_task()`；清理失败只记日志，不改判分 |
-| `scripts/requeue_harbor_timeouts.py` | 基础设施失败重排（与本清理配套，保证重排时镜像还在） |
+| 失败重排 | 已删除：failed/error 即终态，不再有自动重排脚本 |
 
 ### 每个任务终态后自动执行
 

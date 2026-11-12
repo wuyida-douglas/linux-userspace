@@ -153,11 +153,11 @@ TERMINAL_RESULT_STATUSES = {"passed", "failed", "rejected", "error", "timeout"}
 # re-add a failed task to the scheduling queue; retrying is an explicit
 # operator decision (`--retry-failed` in the coordinator or a manual requeue).
 AUTO_RETRY_FAILED = False
-# Strict operator mode: a failed/errored task is final and is never relaunched,
-# not even for an acceptance-only resume. Enabled with
-# PIPELINE_FAILURES_TERMINAL=1; the default keeps the bounded recovery paths
-# that the unit tests describe.
-FAILURES_TERMINAL = os.environ.get("PIPELINE_FAILURES_TERMINAL") == "1"
+# A failed/errored task is final by default: it is never relaunched, not even
+# for an acceptance-only resume. Re-enabling the old bounded recovery paths
+# requires an explicit operator override, so no script or stray flag can pull a
+# failed task back into the queue by accident.
+FAILURES_TERMINAL = os.environ.get("PIPELINE_ALLOW_FAILURE_RETRY") != "1"
 # The supervisor schedules continuously up to --concurrency; this bound only
 # limits how many fresh task IDs one invocation may own. The coordinator passes
 # the whole batch so there is no wave barrier.
