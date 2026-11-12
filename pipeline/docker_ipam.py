@@ -126,10 +126,20 @@ def _network_snapshot(docker: str) -> dict[str, tuple[str, int]]:
             capture_output=True, text=True, timeout=60)
 
     inspected = inspect(ids)
-    if inspected.returncode and " not found" in inspected.stderr:
+    # Networks can vanish between `network ls` and the bulk inspect: killed
+    # Compose trials remove theirs concurrently. Drop the ids named in the
+    # error and retry a few times instead of failing the whole verifier.
+    attempts = 0
+    while inspected.returncode and " not found" in inspected.stderr and attempts < 5:
         remaining = [network_id for network_id in ids if network_id not in inspected.stderr]
-        inspected = inspect(remaining) if remaining else subprocess.CompletedProcess(
-            inspected.args, 0, "", "")
+        if not remaining or len(remaining) == len(ids):
+            break
+        ids = remaining
+        attempts += 1
+        inspected = inspect(ids)
+    if inspected.returncode and " not found" in inspected.stderr:
+        # Everything listed vanished meanwhile: treat as an empty snapshot.
+        inspected = subprocess.CompletedProcess(inspected.args, 0, "", "")
     if inspected.returncode:
         raise RuntimeError("cannot inspect Docker subnets for IPAM allocation: " + inspected.stderr[-1000:])
     snapshot: dict[str, tuple[str, int]] = {}

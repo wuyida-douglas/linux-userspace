@@ -49,6 +49,23 @@ class IpamTests(unittest.TestCase):
             self.assertEqual(docker_ipam._docker_networks("docker-test"), self.occupied[:1])
             self.assertEqual(execute.call_count, 3)
 
+    def test_snapshot_retries_a_network_that_vanished_mid_inspect(self):
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            if argv[1:3] == ["network", "ls"]:
+                return subprocess.CompletedProcess(argv, 0, "aaa\nbbb\n", "")
+            if len(calls) == 2:
+                return subprocess.CompletedProcess(
+                    argv, 1, "", "Error response from daemon: network bbb not found")
+            return subprocess.CompletedProcess(argv, 0, "aaa\t10.80.0.0/24,\t1\n", "")
+
+        with patch.object(docker_ipam.subprocess, "run", side_effect=run):
+            snapshot = docker_ipam._network_snapshot("docker-test")
+        self.assertEqual(set(snapshot), {"aaa"})
+        self.assertEqual(snapshot["aaa"], ("10.80.0.0/24", 1))
+
     def test_real_network_inspection_error_is_not_suppressed(self):
         def run(argv, **kwargs):
             if argv[1:3] == ["network", "ls"]:
