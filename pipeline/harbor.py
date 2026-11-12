@@ -592,6 +592,8 @@ def rebuild_missing_images(delivery: Path, contract: dict[str, Any]) -> list[str
     images = contract.get("images") or {}
     project = delivery / "project"
     rebuilt: list[str] = []
+    # A rebuild may need apt/pip egress: pass the CLI-side proxy config.
+    environment = {**os.environ, **docker_config_environment(dict(os.environ))}
     for role, relative in (("agent", "main/Dockerfile"), ("target", "client/Dockerfile")):
         reference = images.get(role)
         if not isinstance(reference, str) or not reference:
@@ -599,7 +601,7 @@ def rebuild_missing_images(delivery: Path, contract: dict[str, Any]) -> list[str
         if reference.startswith(("linux-userspace-agent", "linux-userspace-verifier")):
             continue
         check = subprocess.run(docker_argv(["docker", "image", "inspect", reference]),
-                               capture_output=True, text=True, timeout=60)
+                               capture_output=True, text=True, timeout=60, env=environment)
         if check.returncode == 0:
             continue
         dockerfile = project / relative
@@ -608,7 +610,7 @@ def rebuild_missing_images(delivery: Path, contract: dict[str, Any]) -> list[str
         built = subprocess.run(
             docker_argv(["docker", "build", "--network", "host", "-t", reference,
                          "-f", str(dockerfile), str(project)]),
-            capture_output=True, text=True, timeout=3600)
+            capture_output=True, text=True, timeout=3600, env=environment)
         if built.returncode:
             raise RuntimeError(f"failed to rebuild {reference}: {built.stderr[-2000:]}")
         rebuilt.append(reference)
