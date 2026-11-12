@@ -781,12 +781,24 @@ sys.exit(result["returncode"])
                 record["down"] = self.compose(project, "down", "--volumes", "--remove-orphans", timeout=180)
             else:
                 record["down"] = {"returncode": 0, "output": "kept for explicit diagnostic run"}
+            # A phase whose oracle already produced an explicit 0/1 verdict is
+            # graded; a slow `compose down` or a leftover client container is a
+            # resource leak, not a reason to discard that verdict. Under a
+            # loaded daemon both can take minutes/timeout.
+            verdict_ok = (isinstance(record.get("triggered"), bool)
+                          and (record.get("oracle") or {}).get("returncode") in {0, 1})
             if record["down"]["returncode"]:
-                record["error_stage"] = "down"
+                if verdict_ok:
+                    record.setdefault("warnings", []).append("compose down failed after a valid verdict")
+                else:
+                    record["error_stage"] = "down"
             cleanup_private = bounded_run([self.docker, "rm", "--volumes", "--force", project + "-client-1"], timeout=60)
             if cleanup_private["returncode"] and "No such container" not in cleanup_private["output"]:
                 record["private_cleanup"] = cleanup_private
-                record["error_stage"] = "private_cleanup"
+                if verdict_ok:
+                    record.setdefault("warnings", []).append("client container cleanup failed after a valid verdict")
+                else:
+                    record["error_stage"] = "private_cleanup"
             # An override belongs only to this phase. Release its /24 once
             # Compose has removed the network; never copy it into the delivery.
             import importlib.util
