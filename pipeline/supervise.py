@@ -69,12 +69,23 @@ def load(path: Path, default):
 
 
 def worker_alive(pid: object) -> bool:
-    """A zombie is exited work, not a live task holding a concurrency slot."""
+    """True only while this exact pid is still a ``python -m pipeline.run``.
+
+    A kill(0)/state check is not enough: the worker exits, its pid is reused by
+    an unrelated process, and the supervisor then believes the slot is busy
+    forever (observed: 80 recorded pids, 49 real workers). The cmdline pins the
+    identity. Wrapper and child processes both match, which is intended.
+    """
     if not pid:
         return False
     try:
-        stat = Path(f"/proc/{int(pid)}/stat").read_text(encoding="utf-8")
-        return stat.rsplit(")", 1)[1].split()[0] != "Z"
+        root = Path(f"/proc/{int(pid)}")
+        stat = (root / "stat").read_text(encoding="utf-8")
+        if stat.rsplit(")", 1)[1].split()[0] == "Z":
+            return False
+        raw = (root / "cmdline").read_bytes().split(b"\0")
+        command = [part.decode(errors="surrogateescape") for part in raw if part]
+        return command[1:3] == ["-m", "pipeline.run"]
     except (OSError, ValueError, IndexError):
         return False
 
@@ -142,6 +153,11 @@ TERMINAL_RESULT_STATUSES = {"passed", "failed", "rejected", "error", "timeout"}
 # re-add a failed task to the scheduling queue; retrying is an explicit
 # operator decision (`--retry-failed` in the coordinator or a manual requeue).
 AUTO_RETRY_FAILED = False
+# Strict operator mode: a failed/errored task is final and is never relaunched,
+# not even for an acceptance-only resume. Enabled with
+# PIPELINE_FAILURES_TERMINAL=1; the default keeps the bounded recovery paths
+# that the unit tests describe.
+FAILURES_TERMINAL = os.environ.get("PIPELINE_FAILURES_TERMINAL") == "1"
 # The supervisor schedules continuously up to --concurrency; this bound only
 # limits how many fresh task IDs one invocation may own. The coordinator passes
 # the whole batch so there is no wave barrier.
@@ -1750,9 +1766,14 @@ def main() -> int:
                 # directory. Do not replace its workspace with a partial merge.
                 worker_results = shared_recovery_tasks[task]
             # The candidate list is a snapshot from this tick's start. A task
-            # can finish and pass while the tick is still launching; never
-            # overwrite a passing record with a fresh acceptance attempt.
-            if load(worker_results / task / "result.json", {}).get("status") == "passed":
+            # can finish while the tick is still launching; never overwrite a
+            # passing record, and (AUTO_RETRY_FAILED is off) never relaunch a
+            # task that is already failed or errored: failure is terminal.
+            _record = load(worker_results / task / "result.json", {})
+            if _record.get("status") == "passed":
+                completed.add(task)
+                continue
+            if _record.get("status") in {"failed", "error"} and FAILURES_TERMINAL:
                 completed.add(task)
                 continue
             state["batch_members"] = sorted(accountable_ids or [])

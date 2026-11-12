@@ -776,6 +776,33 @@ class BoundedRecoveryTests(unittest.TestCase):
             self.assertFalse(launch.call_args.kwargs["review_delivery"])
             self.assertEqual(launch.call_args.args[4], 18000)
 
+    def test_failures_terminal_mode_never_relaunches_an_errored_task(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task = "linux-003"
+            (root / "selection.jsonl").write_text(
+                json.dumps({"task_id": task, "instance_id": "CVE-test::project"}) + "\n")
+            base = root / task
+            (base / "workspace/delivery").mkdir(parents=True)
+            (base / "workspace/route.json").write_text("{}")
+            (base / "workspace/review.json").write_text('{"passed": true}')
+            (base / "result.json").write_text(json.dumps({
+                "status": "error", "failure_class": "pipeline",
+                "error": "RuntimeError: Harbor trial failed"}))
+            (base / "synthesis").mkdir()
+            (base / "synthesis/result.json").write_text('{"status": "completed"}')
+            (root / "supervisor-state.json").write_text(json.dumps({
+                "children": {task: {"pid": None, "retry_count": 0,
+                                    "retry_reason": "review_infrastructure"}}}))
+            with unittest.mock.patch.object(supervise, "launch") as launch, \
+                    unittest.mock.patch.object(supervise, "pipeline_worker_command", return_value=None), \
+                    unittest.mock.patch.object(supervise, "FAILURES_TERMINAL", True):
+                launch.return_value.pid = 4321
+                with unittest.mock.patch("sys.argv", ["supervise", "--sample", str(root),
+                                                       "--results", str(root), "--only", task, "--once"]):
+                    self.assertEqual(supervise.main(), 0)
+            launch.assert_not_called()
+
     def test_approved_delivery_without_result_resumes_harbor(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
