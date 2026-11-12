@@ -319,6 +319,86 @@ class Differential:
             (self.runner / "output").chmod(0o777)
         self._write_compose()
 
+    def _root_chown(self, paths: list[Path], uid: int, gid: int, recursive: bool = False) -> None:
+        """Change host ownership of the runner mounts without host sudo.
+
+        The Docker CLI is already the verifier's privileged handle on these
+        projects, so a throwaway container running as root can own the mount
+        directories just as well as ``sudo chown``. Host ``sudo`` is avoided
+        on purpose: with many concurrent Compose projects the kernel keeps
+        interrupting netlink interface dumps used during sudo's hostname
+        resolution, and sudo then spins for tens of seconds (beyond the phase
+        timeout). The helper mounts only the smallest path that covers the
+        requested targets.
+        """
+        if not paths:
+            return
+        if os.geteuid() == 0:
+            for path in paths:
+                os.chown(path, uid, gid)
+                if recursive:
+                    for root, dirs, files in os.walk(path):
+                        for name in dirs + files:
+                            os.chown(os.path.join(root, name), uid, gid, follow_symlinks=False)
+            return
+        chown_args = (["-R"] if recursive else []) + [f"{uid}:{gid}", *[str(path) for path in paths]]
+        # Reuse one long-lived root helper per verifier run: `docker exec` is a
+        # fraction of a second while a fresh `docker run` costs several seconds
+        # under a loaded daemon, and this runs twice per phase.
+        name = self._root_helper()
+        if name is not None:
+            result = bounded_run([self.docker, "exec", "-u", "0:0", name, "chown", *chown_args],
+                                 timeout=180)
+            if result["returncode"] == 0:
+                return
+            detail = result["output"][-2000:]
+        else:
+            detail = getattr(self, "_root_helper_error", "helper container unavailable")
+        # Fallback: a single throwaway container that mounts only these paths.
+        mounts = sorted({str(path if recursive else path.parent) for path in paths})
+        argv = [self.docker, "run", "--rm", "--network", "none", "--entrypoint", "chown"]
+        for mount in mounts:
+            argv += ["-v", f"{mount}:{mount}"]
+        argv.append(self._helper_image())
+        argv += chown_args
+        result = bounded_run(argv, timeout=180)
+        if result["returncode"]:
+            raise VerifierInfraError(
+                f"root chown failed (rc={result['returncode']}): {detail}; fallback: "
+                f"{result['output'][-2000:]}")
+
+    def _helper_image(self) -> str:
+        """Image used by the throwaway root chown helper.
+
+        Every bundle declares the agent image, but a unit test may build a
+        partial contract; the shared agent image is always available then.
+        """
+        images = self.contract.get("images") or {}
+        return str(images.get("agent") or "linux-userspace-agent:22.04")
+
+    def _root_helper(self) -> str | None:
+        """Start (once) the root container that owns the runner work dirs."""
+        if getattr(self, "_root_helper_state", None) is not None:
+            return self._root_helper_state or None
+        name = f"{getattr(self, 'project', 'pass2fail')}-root-helper"
+        result = bounded_run([
+            self.docker, "run", "-d", "--rm", "--name", name, "--network", "none",
+            "--entrypoint", "sleep", "-v", f"{self.runner}:{self.runner}",
+            self._helper_image(), "86400",
+        ], timeout=180)
+        if result["returncode"]:
+            self._root_helper_error = result["output"][-2000:]
+            self._root_helper_state = ""
+            return None
+        self._root_helper_state = name
+        return name
+
+    def _stop_root_helper(self) -> None:
+        name = getattr(self, "_root_helper_state", None)
+        self._root_helper_state = ""
+        if name:
+            bounded_run([self.docker, "rm", "--force", name], timeout=60)
+
     def _prepare_runner_mounts(self) -> None:
         """Create an unshared scratch directory for this single Compose phase."""
         if self.contract["branch"] == "FILE-POV":
@@ -335,19 +415,15 @@ class Differential:
             archive = archives / f"{len(list(archives.iterdir())):03d}"
             os.rename(previous, archive)
         (self.runner / "run").mkdir(mode=0o755)
-        for mount in (self.runner / "run", self.runner / "output"):
-            # Host preparation is outside the container's capability boundary.
-            subprocess.run(["sudo", "-n", "chown", f"{uid}:{gid}", str(mount)],
-                           check=True, capture_output=True, text=True, timeout=30)
+        # Host preparation is outside the container's capability boundary.
+        self._root_chown([self.runner / "run", self.runner / "output"], uid, gid)
 
     def _restore_runner_mounts(self) -> None:
         """Restore host evidence ownership before any cleanup or later phase."""
         if not getattr(self, "runner_owner", None):
             return
         uid, gid = self.runner_owner
-        subprocess.run(["sudo", "-n", "chown", "-R", f"{uid}:{gid}",
-                        str(self.runner / "run"), str(self.runner / "output")],
-                       check=True, capture_output=True, text=True, timeout=30)
+        self._root_chown([self.runner / "run", self.runner / "output"], uid, gid, recursive=True)
 
     def _write_file_runner(self) -> None:
         script = '''#!/bin/sh
@@ -768,9 +844,12 @@ sys.exit(result["returncode"])
         return result
 
     def cleanup(self) -> None:
-        if self.active_project:
-            self.compose(self.active_project, "down", "--volumes", "--remove-orphans", timeout=180)
-            self.active_project = None
+        try:
+            if self.active_project:
+                self.compose(self.active_project, "down", "--volumes", "--remove-orphans", timeout=180)
+                self.active_project = None
+        finally:
+            self._stop_root_helper()
 
 
 def _remove_reward_files(log_dir: Path) -> None:

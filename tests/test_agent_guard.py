@@ -61,6 +61,15 @@ class AgentGuardTests(unittest.TestCase):
             ("Read", {"file_path": "/home/wuyida/.claude/projects/x/memory/MEMORY.md"}),
             ("Read", {"file_path": str(self.root / "env")}),
             ("Write", {"file_path": str(self.task / "synthesis/x")}),
+            ("Bash", {"command": f"ls {self.root}/pipeline"}),
+            ("Bash", {"command": f"cat {self.root}/config/bin/docker"}),
+            ("Read", {"file_path": str(self.root / "pipeline/pass2fail_verifier.py")}),
+            ("Bash", {"command": "docker kill $(docker ps -q)"}),
+            ("Bash", {"command": "docker rm -f $(docker ps -aq)"}),
+            ("Bash", {"command": "docker system prune -af"}),
+            ("Bash", {"command": "cat /tmp/linux-userspace-ipam-1/leases.json"}),
+            ("Write", {"file_path": "/tmp/linux-userspace-ipam-1/leases.json"}),
+            ("Bash", {"command": "cat /home/wuyida/other/notes"}),
         ]
         for tool, tool_input in cases:
             with self.subTest(tool=tool, input=tool_input):
@@ -72,13 +81,15 @@ class AgentGuardTests(unittest.TestCase):
             ("Bash", {"command": f"cat {self.ws}/input/fix.diff"}),
             ("Bash", {"command": f"cat {self.task}/route/live.chat.md"}),
             ("Bash", {"command": f"ls {self.task}/route"}),
-            ("Bash", {"command": f"ls {self.root}/pipeline"}),
+            ("Bash", {"command": "docker rm -f $(docker ps -aq --filter ancestor=fli-dev:1)"}),
+            ("Bash", {"command": "cat /nvme/wuyida/tmp/claude-abc/tasks/x.output"}),
             ("Bash", {"command": "docker run -v \"$PWD\":/m alpine true"}),
             ("Bash", {"command": "echo ok"}),
             ("Read", {"file_path": str(self.ws / "input/fix.diff")}),
             ("Read", {"file_path": str(self.task / "route/live.chat.md")}),
-            ("Read", {"file_path": str(self.root / "pipeline/pass2fail_verifier.py")}),
+            ("Read", {"file_path": "/nvme/wuyida/tmp/claude-abc/tasks/x.output"}),
             ("Write", {"file_path": str(self.ws / "delivery/task.json")}),
+            ("Write", {"file_path": "/tmp/scratch.txt"}),
         ]
         for tool, tool_input in cases:
             with self.subTest(tool=tool, input=tool_input):

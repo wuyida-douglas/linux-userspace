@@ -203,12 +203,12 @@ class PublishBundleTests(unittest.TestCase):
                 "  main:\n    image: agent:1\n    healthcheck:\n      test: ['CMD', 'true']\n"
                 "  client:\n    image: target:1\n    healthcheck:\n      test: ['CMD', 'true']\n",
                 encoding="utf-8")
-            acceptance = Path(directory) / "acceptance.json"
-            acceptance.write_text('{"status": "passed"}\n', encoding="utf-8")
-            publish_bundle(staging, root, "task", acceptance)
+            publish_bundle(staging, root, "task")
             self.assertEqual((root / "shared-images/agent.tar.gz").read_bytes(), b"agent")
             self.assertTrue((root / "task/image-lock.json").is_file())
-            self.assertTrue((root / "task/acceptance.json").is_file())
+            self.assertFalse((root / "task/acceptance.json").exists())
+            manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+            self.assertNotIn("acceptance", manifest["tasks"][0])
 
 
 class ImageArchiveScanTests(unittest.TestCase):

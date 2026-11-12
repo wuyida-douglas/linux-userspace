@@ -1,17 +1,32 @@
 #!/bin/sh
 # One-command evaluation of selected tasks from a published bundle.
-# Usage: scripts/evaluate.sh <bundle-dir> <task-id> [task-id...]
+# Edit the config block below, then run this script with no arguments.
 set -eu
-cd "$(dirname "$0")/.."
-ROOT=$PWD
 
-BUNDLE=${1:?usage: scripts/evaluate.sh <bundle-dir> <task-id> [task-id...]}
-shift
-[ "$#" -gt 0 ] || { echo "select at least one task id" >&2; exit 2; }
+# ===== 直接改这里 =====
+BUNDLE=/nvme/wuyida/新管线开发/harbor_export/20261111-production
+TASKS="cve-2024-23346-file-pov"
+ENV_FILE=/nvme/wuyida/env
+MODEL=glm-5.3
+MAX_TURNS=300
+EVAL_JOBS=/nvme/wuyida/新管线开发/eval-jobs
+CLAUDE_BIN=
+CLAUDE_VERSION=
+HARBOR_BIN=harbor
+# ======================
+
+# 可选命令行覆盖：<bundle-dir> [task-id...]
+if [ "$#" -gt 0 ]; then
+  BUNDLE=$1
+  shift
+  if [ "$#" -gt 0 ]; then TASKS="$*"; fi
+fi
+
+REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 [ -d "$BUNDLE" ] || { echo "bundle directory missing: $BUNDLE" >&2; exit 1; }
+[ -n "$TASKS" ] || { echo "set TASKS in the config block" >&2; exit 2; }
 BUNDLE=$(cd "$BUNDLE" && pwd)
 
-ENV_FILE=${ENV_FILE:-/nvme/wuyida/env}
 if [ -f "$ENV_FILE" ]; then
   set -a
   . "$ENV_FILE"
@@ -24,10 +39,6 @@ CLAUDE_BIN=${CLAUDE_BIN:-$(command -v claude || true)}
 }
 CLAUDE_BIN=$(realpath "$CLAUDE_BIN")
 CLAUDE_VERSION=${CLAUDE_VERSION:-$("$CLAUDE_BIN" --version | awk '{print $1}')}
-MODEL=${MODEL:-glm-5.3}
-MAX_TURNS=${MAX_TURNS:-300}
-HARBOR_BIN=${HARBOR_BIN:-harbor}
-EVAL_JOBS=${EVAL_JOBS:-$ROOT/eval-jobs}
 mkdir -p "$EVAL_JOBS"
 
 if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
@@ -41,7 +52,7 @@ fi
 
 MOUNTS=$(printf '[{"type":"bind","source":"%s","target":"/usr/local/bin/claude","read_only":true}]' "$CLAUDE_BIN")
 
-for TASK in "$@"; do
+for TASK in $TASKS; do
   PROFILE="$BUNDLE/$TASK/harbor-runtime-profile"
   [ -d "$PROFILE" ] || { echo "task profile missing: $PROFILE" >&2; exit 1; }
   JOB_NAME="eval-$(printf '%s' "$TASK" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-')-$(date +%Y%m%d-%H%M%S)"

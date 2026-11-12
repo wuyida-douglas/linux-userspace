@@ -6,36 +6,245 @@ verifier. It re-executes itself under `sg docker` when the caller's login
 session lacks the supplementary group, then injects the task-local 10.80/10.112
 Compose network lease. Using `sg` (rather than a newgrp stdin pipe) preserves
 stdin for `docker compose exec`/`docker cp`-style callers.
+
+For factory agents it also refuses destructive operations on containers,
+networks or volumes that do not belong to the current task. Compose containers
+are identified by their compose working directory; `docker run` containers get
+a `pipeline.task=<task>` label. This is a behaviour guard on top of the shared
+host daemon, not a replacement for a per-task daemon.
 """
+from __future__ import annotations
+
 import importlib.util
+import json
 import os
 import shlex
 import subprocess
 import sys
 from pathlib import Path
 
-argv = sys.argv[1:]
-if argv and argv[0] == "docker":
-    argv = argv[1:]
+PROJECT_LABEL = "com.docker.compose.project"
+TASK_LABEL = "pipeline.task"
+AGENT_CONTEXT = bool(os.environ.get("AGENT_GUARD_WORKSPACE"))
+PROJECT = os.environ.get("COMPOSE_PROJECT_NAME", "").strip()
 
-groups = subprocess.run(["id", "-nG"], capture_output=True, text=True, check=True).stdout.split()
-if "docker" not in groups:
-    command = "exec " + shlex.join([sys.executable, str(Path(__file__).resolve()), *argv])
-    os.execvp("sg", ["sg", "docker", "-c", command])
 
-# Resolve the IPAM helper in development (pipeline/) and in an exported bundle
-# (profile/bin/), then rewrite compose up/create/run with the allocated subnet.
-root = Path(__file__).resolve().parents[2]
-for candidate in (root / "pipeline/docker_ipam.py", root / "bin/docker_ipam.py"):
-    if candidate.is_file():
-        spec = importlib.util.spec_from_file_location("pipeline_docker_ipam", candidate)
-        if spec and spec.loader:
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            try:
-                argv = module.inject_compose_ipam(argv, Path.cwd(), "/usr/bin/docker")
-            except Exception as exc:
-                print(f"docker-ipam warning: {type(exc).__name__}: {exc}", file=sys.stderr)
-        break
+def _task_root() -> Path:
+    workspace = Path(os.environ.get("AGENT_GUARD_WORKSPACE", ""))
+    return workspace.parent if workspace.name == "workspace" else workspace
 
-os.execv("/usr/bin/docker", ["/usr/bin/docker", *argv])
+
+def _task_id() -> str:
+    try:
+        return _task_root().name
+    except Exception:
+        return ""
+
+
+def _fail(message: str) -> None:
+    print(f"BLOCKED by docker wrapper: {message}. "
+          f"Work only with this task's containers and workspace.", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def _docker(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["/usr/bin/docker", *args], capture_output=True,
+                          text=True, timeout=30)
+
+
+def _inspect_labels(kind: str, name: str) -> dict | None:
+    if kind == "container":
+        argv = ["inspect", "--format", "{{json .Config.Labels}}", name]
+    elif kind == "network":
+        argv = ["network", "inspect", "--format", "{{json .Labels}}", name]
+    else:
+        argv = ["volume", "inspect", "--format", "{{json .Labels}}", name]
+    result = _docker(*argv)
+    if result.returncode:
+        return None
+    try:
+        value = json.loads(result.stdout.strip() or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _owned(labels: dict) -> bool:
+    if not labels:
+        return False
+    if labels.get(TASK_LABEL) == _task_id():
+        return True
+    working_dir = labels.get("com.docker.compose.project.working_dir") or ""
+    if working_dir:
+        try:
+            value = Path(working_dir).resolve()
+            root = _task_root().resolve()
+            if value == root or root in value.parents:
+                return True
+        except (OSError, RuntimeError):
+            pass
+    project = labels.get(PROJECT_LABEL) or ""
+    return bool(PROJECT and project == PROJECT)
+
+
+def _assert_owned(kind: str, targets: list[str]) -> None:
+    for target in targets:
+        if not target or target.startswith("$"):
+            continue
+        labels = _inspect_labels(kind, target)
+        if labels is None:
+            # The target does not exist; let Docker report its normal error.
+            continue
+        if not _owned(labels):
+            _fail(f"refusing to touch {kind} {target!r} outside this task")
+
+
+def _container_targets(argv: list[str]) -> list[str]:
+    if argv and argv[0] == "container" and len(argv) > 1:
+        argv = argv[1:]
+    command = argv[0]
+    if command in {"kill", "rm", "stop", "restart"}:
+        targets = []
+        args = argv[1:]
+        index = 0
+        while index < len(args):
+            value = args[index]
+            if value in {"-s", "--signal", "-t", "--time"}:
+                index += 2
+                continue
+            if value.startswith("-"):
+                index += 1
+                continue
+            targets.append(value)
+            index += 1
+        return targets
+    if command == "exec":
+        args = argv[1:]
+        value_options = {"-u", "--user", "-e", "--env", "-w", "--workdir",
+                         "--env-file", "--detach-keys", "--cgroupns"}
+        index = 0
+        while index < len(args):
+            value = args[index]
+            if value in value_options:
+                index += 2
+                continue
+            if value.startswith("--") and "=" in value:
+                index += 1
+                continue
+            if value.startswith("-"):
+                index += 1
+                continue
+            return [value]
+        return []
+    if command == "cp":
+        targets = []
+        for value in argv[1:]:
+            if value.startswith("-"):
+                continue
+            name = value.split(":", 1)[0]
+            if name and not name.startswith(("/", ".")):
+                targets.append(name)
+        return targets
+    if command in {"network", "volume"} and len(argv) > 1 and argv[1] == "rm":
+        return [value for value in argv[2:] if not value.startswith("-")]
+    return []
+
+
+def _inject_label(argv: list[str]) -> list[str]:
+    label = f"{TASK_LABEL}={_task_id()}"
+    if argv and argv[0] in {"run", "create"}:
+        if any(value == "--label" or value.startswith("--label=") for value in argv[1:]):
+            # Still add the ownership label if the caller supplied other labels.
+            if not any(label in value for value in argv[1:]):
+                return [argv[0], "--label", label, *argv[1:]]
+            return argv
+        return [argv[0], "--label", label, *argv[1:]]
+    if len(argv) > 1 and argv[0] in {"network", "volume"} and argv[1] == "create":
+        if not any(label in value for value in argv[2:]):
+            return [argv[0], argv[1], "--label", label, *argv[2:]]
+    return argv
+
+
+def _compose_file_paths(argv: list[str]) -> list[Path]:
+    paths = []
+    index = 1
+    while index < len(argv):
+        value = argv[index]
+        if value in {"-f", "--file", "--project-directory"} and index + 1 < len(argv):
+            paths.append(Path(argv[index + 1]))
+            index += 2
+            continue
+        index += 1
+    return paths
+
+
+def _check_compose_paths(argv: list[str]) -> None:
+    if not argv or argv[0] != "compose":
+        return
+    root = _task_root().resolve()
+    for path in _compose_file_paths(argv):
+        try:
+            resolved = path if path.is_absolute() else (Path.cwd() / path)
+            resolved = resolved.resolve()
+        except (OSError, RuntimeError):
+            continue
+        if resolved == root or root in resolved.parents:
+            continue
+        if str(resolved).startswith("/tmp/"):
+            continue
+        _fail(f"refusing to use compose path {resolved} outside this task")
+
+
+def _guard_argv(argv: list[str]) -> list[str]:
+    if not AGENT_CONTEXT or not argv:
+        return argv
+    command = argv[0]
+    if command == "container" and len(argv) > 1:
+        command = argv[1]
+    _check_compose_paths(argv)
+    if command in {"system", "volume", "network", "builder", "container", "image"} \
+            and len(argv) > 1 and argv[1] == "prune":
+        _fail("global docker prune is not allowed")
+    if command in {"kill", "rm", "stop", "restart", "exec", "cp"}:
+        _assert_owned("container", _container_targets(argv))
+    if command in {"network", "volume"} and len(argv) > 1 and argv[1] == "rm":
+        _assert_owned(command, _container_targets(argv))
+    return _inject_label(argv)
+
+
+def _inject_ipam(argv: list[str]) -> list[str]:
+    # Resolve the IPAM helper in development (pipeline/) and in an exported
+    # bundle (profile/bin/), then rewrite compose up/create/run with the
+    # allocated subnet.
+    root = Path(__file__).resolve().parents[2]
+    for candidate in (root / "pipeline/docker_ipam.py", root / "bin/docker_ipam.py"):
+        if candidate.is_file():
+            spec = importlib.util.spec_from_file_location("pipeline_docker_ipam", candidate)
+            if spec and spec.loader:
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                try:
+                    return module.inject_compose_ipam(argv, Path.cwd(), "/usr/bin/docker")
+                except Exception as exc:
+                    print(f"docker-ipam warning: {type(exc).__name__}: {exc}", file=sys.stderr)
+            break
+    return argv
+
+
+def main() -> None:
+    argv = sys.argv[1:]
+    if argv and argv[0] == "docker":
+        argv = argv[1:]
+
+    groups = subprocess.run(["id", "-nG"], capture_output=True, text=True, check=True).stdout.split()
+    if "docker" not in groups:
+        command = "exec " + shlex.join([sys.executable, str(Path(__file__).resolve()), *argv])
+        os.execvp("sg", ["sg", "docker", "-c", command])
+
+    argv = _guard_argv(argv)
+    argv = _inject_ipam(argv)
+    os.execv("/usr/bin/docker", ["/usr/bin/docker", *argv])
+
+
+if __name__ == "__main__":
+    main()

@@ -187,7 +187,6 @@ def check_task(task_dir: Path, root: Path, report: Report, *, do_hash: bool) -> 
     task = task_dir.name
     required = (
         "image-lock.json",
-        "acceptance.json",
         "images/manifest.json",
         "harbor-runtime-profile/task.toml",
         "harbor-runtime-profile/instruction.md",
@@ -375,6 +374,9 @@ def check_compose(task_dir: Path, report: Report) -> None:
 
 def check_acceptance(task_dir: Path, report: Report) -> None:
     task = task_dir.name
+    # acceptance.json is no longer written by the pipeline. If an older bundle
+    # has one, validate it; otherwise the harbor/result.json + verifier
+    # evidence is the acceptance record.
     path = task_dir / "acceptance.json"
     if not path.is_file():
         return

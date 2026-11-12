@@ -225,6 +225,18 @@ class CarriedRecoveryTests(unittest.TestCase):
 
 
 class StrictProtocolEvidenceTests(unittest.TestCase):
+    def test_published_task_directory_is_acceptance_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = root / "cve-2024-0001-file-pov/harbor-runtime-profile"
+            profile.mkdir(parents=True)
+            (root / "cve-2024-0001-file-pov/image-lock.json").write_text("{}")
+            (profile / "task.toml").write_text("")
+            row = {"export_task_id": "cve-2024-0001-file-pov"}
+            self.assertEqual(supervise.published_task_path(row, "linux-001", root),
+                             root / "cve-2024-0001-file-pov")
+            self.assertIsNone(supervise.published_task_path({}, "linux-002", root))
+
     def test_strict_acceptance_requires_two_harbor_agent_runs(self):
         row = {"status": "passed", "review": {"passed": True}, "harbor": {
             "status": "passed",

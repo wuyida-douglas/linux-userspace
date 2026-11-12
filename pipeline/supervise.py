@@ -79,6 +79,19 @@ def worker_alive(pid: object) -> bool:
         return False
 
 
+def published_task_path(record: dict, task: str, root: Path | None) -> Path | None:
+    """Return the atomically published task directory, if this task exists."""
+    if root is None:
+        return None
+    task_id = (record.get("export_task_id")
+               or (record.get("manifest") or {}).get("task_id")
+               or task)
+    candidate = root / str(task_id)
+    required = (candidate / "image-lock.json",
+                candidate / "harbor-runtime-profile/task.toml")
+    return candidate if all(path.is_file() for path in required) else None
+
+
 def strictly_accepted(record: dict) -> bool:
     harbor = record.get("harbor") or {}
     review_ok = (record.get("review") or {}).get("passed") is True
@@ -125,6 +138,10 @@ def latest_turn(path: Path) -> int:
 
 
 TERMINAL_RESULT_STATUSES = {"passed", "failed", "rejected", "error", "timeout"}
+# The supervisor schedules continuously up to --concurrency; this bound only
+# limits how many fresh task IDs one invocation may own. The coordinator passes
+# the whole batch so there is no wave barrier.
+MAX_FRESH_BATCH = 100000
 
 
 def write_display_index(results: Path) -> dict[str, str]:
@@ -133,7 +150,7 @@ def write_display_index(results: Path) -> dict[str, str]:
     Result directories stay keyed by the internal selection id so a worker or
     supervisor can always find them. This index is the human/export-facing
     name map (canonical advisory id + route branch), and it never invalidates
-    paths stored in result.json or acceptance.json.
+    paths stored in result.json.
     """
     statuses = [load(path, {}).get("status") for path in results.glob("*/result.json")]
     if not statuses or any(status not in TERMINAL_RESULT_STATUSES for status in statuses):
@@ -302,7 +319,7 @@ def carry_workspaces(sources: list[Path], results: Path, selected_ids: set[str] 
 
 
 def launch(task: str, sample: Path, results: Path,
-           turns: int, timeout: int,
+           turns: int, timeout: int, env_file: Path = Path("/nvme/wuyida/env"),
            resume_harbor: bool = False,
            published_root: Path | None = None, review_turns: int = 140,
            review_timeout: int = 5400, verify_timeout: int = 1800,
@@ -314,7 +331,8 @@ def launch(task: str, sample: Path, results: Path,
            concurrency: int = 30) -> subprocess.Popen:
     """Launch one new task or resume only its frozen route/synthesis/review tail."""
     command = [sys.executable, "-m", "pipeline.run", "--sample", str(sample),
-               "--results", str(results), "--only", task, "--concurrency", str(concurrency),
+               "--results", str(results), "--env-file", str(env_file),
+               "--only", task, "--concurrency", str(concurrency),
                "--max-turns", str(turns), "--route-turns", "60",
                "--timeout", str(timeout), "--review-turns", str(review_turns),
                "--review-timeout", str(review_timeout), "--verify-timeout", str(verify_timeout)]
@@ -346,6 +364,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sample", type=Path, required=True)
     parser.add_argument("--results", type=Path, required=True)
+    parser.add_argument("--env-file", type=Path, default=Path("/nvme/wuyida/env"))
     parser.add_argument("--concurrency", type=int, default=20)
     parser.add_argument("--max-turns", type=int, default=400)
     parser.add_argument("--timeout", type=int, default=18000)
@@ -361,7 +380,8 @@ def main() -> int:
                         help="isolated output for this supervisor's bounded retries, merged into --results")
     parser.add_argument("--only", nargs="*")
     parser.add_argument("--batch-size", type=int, default=30,
-                        help="fresh tasks per batch; wait for the full batch before the next batch")
+                        help="maximum fresh IDs owned by this invocation; scheduling is "
+                             "continuous up to --concurrency")
     parser.add_argument("--carry-results", type=Path, nargs="*",
                         help="frozen task results to recover in this sample without modifying their source")
     parser.add_argument("--batch-selection", type=Path,
@@ -369,13 +389,13 @@ def main() -> int:
     parser.add_argument("--batch-number", type=int, help="stable attribution number from the batch coordinator")
     parser.add_argument("--once", action="store_true", help="schedule available work and return")
     args = parser.parse_args()
-    if not 1 <= args.batch_size <= 40:
-        parser.error("--batch-size must be 1..40")
+    if not 1 <= args.batch_size <= MAX_FRESH_BATCH:
+        parser.error(f"--batch-size must be 1..{MAX_FRESH_BATCH}")
     state_sample = load(args.results / "supervisor-state.json", {}).get("sample")
     if state_sample and Path(state_sample).resolve() != args.sample.resolve():
         parser.error("this results directory belongs to a different sample; choose a new results directory")
-    if not 1 <= args.concurrency <= 40:
-        parser.error("concurrency must be 1..40")
+    if not 1 <= args.concurrency <= 80:
+        parser.error("concurrency must be 1..80")
     selected_ids = set(args.only) if args.only else None
     if args.batch_selection and args.results not in args.batch_selection.parents:
         parser.error("--batch-selection must belong to this results directory")
@@ -1093,8 +1113,7 @@ def main() -> int:
                 # No routing verdict was ever produced. Remove only this
                 # contradictory migration marker; all other state is intact.
                 child.pop("retry_reason", None)
-            published_acceptance = (args.published_root / task / "acceptance.json") \
-                if args.published_root is not None else None
+            published_task = published_task_path(record, task, args.published_root)
             approved_review = load(args.results / task / "workspace/review.json", {})
             if ((not record or record.get("error") == "ValueError: completed delivery requires --resume; refusing to replace it with a fresh route")
                     and synthesis.get("status") == "completed"
@@ -1199,9 +1218,7 @@ def main() -> int:
                                       repair_priority=1)
                 candidates.append(task)
                 continue
-            if (strictly_accepted(record) or (published_acceptance is not None
-                    and published_acceptance.is_file()
-                    and strictly_accepted(load(published_acceptance, {})))) \
+            if (strictly_accepted(record) or published_task is not None) \
                     and historical_gold_defect is None:
                 child.update(pid=None, final_status="passed", manual_correction=True)
                 completed.add(task)
@@ -1698,7 +1715,8 @@ def main() -> int:
         accountable_ids = official_ids if selection_receipt else selected_ids
         carried_budget = len(set(selection_receipt.get("carried", []))) if selection_receipt else len(carried_ids)
         if accountable_ids is not None and not 1 <= len(accountable_ids) <= args.batch_size + carried_budget:
-            parser.error("one supervisor batch must contain at most 30 fresh IDs plus explicit carried repairs")
+            parser.error(f"one supervisor batch must contain at most {args.batch_size} "
+                         "fresh IDs plus explicit carried repairs")
         # A bounded repair already has a validated route, delivery and concrete
         # reviewer findings. Let it use the next free slot instead of starving
         # behind every never-started route in the sample. Stable ordering among
@@ -1717,6 +1735,12 @@ def main() -> int:
                 # An adopted recovery remains authoritative in its own result
                 # directory. Do not replace its workspace with a partial merge.
                 worker_results = shared_recovery_tasks[task]
+            # The candidate list is a snapshot from this tick's start. A task
+            # can finish and pass while the tick is still launching; never
+            # overwrite a passing record with a fresh acceptance attempt.
+            if load(worker_results / task / "result.json", {}).get("status") == "passed":
+                completed.add(task)
+                continue
             state["batch_members"] = sorted(accountable_ids or [])
             state["observed_only"] = sorted(observed_ids)
             state["batch_number"] = batch_number
@@ -1743,7 +1767,7 @@ def main() -> int:
             child = launch(task, Path(child_state["source_sample"]) if task in shared_recovery_tasks
                            and child_state.get("source_sample") else args.sample,
                            worker_results, args.max_turns,
-                           args.timeout, resume_harbor=resume_harbor,
+                           args.timeout, env_file=args.env_file, resume_harbor=resume_harbor,
                            published_root=args.published_root,
                            review_turns=args.review_turns, review_timeout=args.review_timeout,
                            verify_timeout=args.verify_timeout,

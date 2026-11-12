@@ -24,6 +24,8 @@ POOLS = {
     "harbor": ipaddress.ip_network("10.112.0.0/12"),
 }
 LEASE_GRACE_SEC = 24 * 3600
+LEASE_STALE_SEC = int(os.environ.get("PIPELINE_IPAM_STALE_SEC", "3600"))
+LEASE_MISSING_GRACE_SEC = int(os.environ.get("PIPELINE_IPAM_MISSING_GRACE_SEC", "300"))
 
 
 def state_dir() -> Path:
@@ -82,6 +84,134 @@ def _network_subnet(docker: str, name: str) -> str:
     return ""
 
 
+def _network_container_count(docker: str, name: str) -> int | None:
+    inspected = subprocess.run(
+        [docker, "network", "inspect", name, "--format", "{{len .Containers}}"],
+        capture_output=True, text=True, timeout=15)
+    if inspected.returncode:
+        return None
+    try:
+        return int(inspected.stdout.strip() or "0")
+    except ValueError:
+        return None
+
+
+def _network_state(docker: str, name: str) -> tuple[bool | None, int | None]:
+    """Return (exists, container_count); exists=None means inspect failed."""
+    subnet = _network_subnet(docker, name)
+    if not subnet:
+        return False, 0
+    return True, _network_container_count(docker, name)
+
+
+def _network_snapshot(docker: str) -> dict[str, tuple[str, int]]:
+    """Return {network name: (first IPv4 subnet or "", live container count)}.
+
+    Allocation holds a host-wide lock, so every per-lease inspect turns into
+    queueing time for every other Compose start. One bulk query keeps the
+    critical section bounded by the daemon, not by the number of leases.
+    """
+    listed = subprocess.run([docker, "network", "ls", "-q"], capture_output=True,
+                            text=True, timeout=30)
+    if listed.returncode:
+        raise RuntimeError("cannot inspect Docker networks for IPAM allocation: " + listed.stderr[-1000:])
+    ids = [item for item in listed.stdout.splitlines() if item.strip()]
+    if not ids:
+        return {}
+
+    def inspect(selection: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [docker, "network", "inspect", *selection, "--format",
+             "{{.Name}}\t{{range .IPAM.Config}}{{.Subnet}},{{end}}\t{{len .Containers}}"],
+            capture_output=True, text=True, timeout=60)
+
+    inspected = inspect(ids)
+    if inspected.returncode and " not found" in inspected.stderr:
+        remaining = [network_id for network_id in ids if network_id not in inspected.stderr]
+        inspected = inspect(remaining) if remaining else subprocess.CompletedProcess(
+            inspected.args, 0, "", "")
+    if inspected.returncode:
+        raise RuntimeError("cannot inspect Docker subnets for IPAM allocation: " + inspected.stderr[-1000:])
+    snapshot: dict[str, tuple[str, int]] = {}
+    for line in inspected.stdout.splitlines():
+        fields = line.split("\t")
+        if len(fields) < 3:
+            continue
+        name, subnets, count = fields[0], fields[1], fields[2]
+        subnet = ""
+        for value in subnets.split(","):
+            try:
+                network = ipaddress.ip_network(value.strip())
+            except ValueError:
+                continue
+            if isinstance(network, ipaddress.IPv4Network):
+                subnet = str(network)
+                break
+        try:
+            containers = int(count)
+        except ValueError:
+            containers = 0
+        snapshot[name] = (subnet, containers)
+    return snapshot
+
+
+def _occupied_subnets(snapshot: dict[str, tuple[str, int]]) -> list[ipaddress.IPv4Network]:
+    occupied = []
+    for subnet, _ in snapshot.values():
+        if subnet:
+            try:
+                occupied.append(ipaddress.ip_network(subnet))
+            except ValueError:
+                continue
+    return occupied
+
+
+def _prune_stale_locked(snapshot: dict[str, tuple[str, int]], leases: dict[str, Any],
+                        now: float) -> list[str]:
+    """Drop leases whose Compose network vanished or has been idle too long."""
+    removed = []
+    for subnet, metadata in list(leases.items()):
+        try:
+            ipaddress.ip_network(subnet)
+        except ValueError:
+            leases.pop(subnet)
+            continue
+        if not isinstance(metadata, dict):
+            leases.pop(subnet)
+            continue
+        network = str(metadata.get("network") or "")
+        if not network:
+            leases.pop(subnet)
+            continue
+        try:
+            age = now - float(metadata.get("timestamp", 0))
+        except (TypeError, ValueError):
+            age = LEASE_STALE_SEC + 1
+        entry = snapshot.get(network)
+        if entry is None:
+            if age >= LEASE_MISSING_GRACE_SEC:
+                removed.append(subnet)
+                leases.pop(subnet)
+            continue
+        if entry[1] == 0 and age >= LEASE_STALE_SEC:
+            removed.append(subnet)
+            leases.pop(subnet)
+    return removed
+
+
+def prune_stale_leases(docker: str) -> list[str]:
+    """Remove leases for vanished/idle networks; safe to call at any time."""
+    directory = state_dir()
+    with (directory / "leases.lock").open("a+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        path = directory / "leases.json"
+        leases = _load_leases(path)
+        removed = _prune_stale_locked(_network_snapshot(docker), leases, time.time())
+        if removed:
+            _save_leases(path, leases)
+    return removed
+
+
 def _load_leases(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -108,12 +238,13 @@ def release_compose_subnets(project: str, role: str, docker: str) -> list[str]:
         fcntl.flock(handle, fcntl.LOCK_EX)
         path = directory / "leases.json"
         leases = _load_leases(path)
+        snapshot = _network_snapshot(docker) if leases else {}
         for subnet, metadata in list(leases.items()):
             if not isinstance(metadata, dict) or metadata.get("role") != role \
                     or metadata.get("project") != project:
                 continue
             network = str(metadata.get("network") or "")
-            if network and not _network_subnet(docker, network):
+            if network and network not in snapshot:
                 released.append(str(subnet))
                 leases.pop(subnet)
         _save_leases(path, leases)
@@ -130,8 +261,10 @@ def _allocate(requested: dict[str, str], project: str, role: str, docker: str) -
         fcntl.flock(handle, fcntl.LOCK_EX)
         path = directory / "leases.json"
         leases = _load_leases(path)
-        occupied = _docker_networks(docker)
         now = time.time()
+        snapshot = _network_snapshot(docker)
+        _prune_stale_locked(snapshot, leases, now)
+        occupied = _occupied_subnets(snapshot)
         # A live Docker network always retains its lease. Without a network,
         # retain a bounded grace period to cover compose up/recreate windows.
         for subnet, metadata in list(leases.items()):
@@ -150,7 +283,7 @@ def _allocate(requested: dict[str, str], project: str, role: str, docker: str) -
                      and metadata.get("role") == role and metadata.get("network") == actual]
             if owned:
                 subnet, metadata = owned[0]
-                live = _network_subnet(docker, actual)
+                live = snapshot.get(actual, ("", 0))[0]
                 if live and live != str(subnet):
                     raise RuntimeError(f"Compose network {actual} has an unexpected subnet: {live}")
                 # The named network may be gone while its old subnet is now
@@ -297,3 +430,17 @@ def inject_compose_ipam(argv: list[str], cwd: Path, docker: str) -> list[str]:
     insertion = next(index for index, part in enumerate(argv)
                      if part in {"up", "create", "run"})
     return [*argv[:insertion], "-f", str(override), *argv[insertion:]]
+
+
+def _cli() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Prune stale Compose IPAM leases.")
+    parser.add_argument("--docker", default="/usr/bin/docker")
+    args = parser.parse_args()
+    removed = prune_stale_leases(args.docker)
+    print(json.dumps({"removed": removed}, sort_keys=True))
+
+
+if __name__ == "__main__":
+    _cli()

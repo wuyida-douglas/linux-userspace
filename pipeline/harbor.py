@@ -199,31 +199,27 @@ def copy_environment(delivery: Path, profile: Path, public: dict[str, Any], cont
     for service in public["services"].values():
         service.pop("x-public-runner", None)
     public["services"]["main"].pop("image", None)
-    # Docker creates an image's declared WORKDIR, but an arbitrary prebuilt
-    # analysis image need not declare one. Harbor always collects submission
-    # artifacts from /workspace, so make that public contract explicit.
+    # Docker creates an image's declared WORKDIR, but a substituted shared
+    # agent image need not declare one. Harbor collects artifacts from
+    # /workspace, so make that public contract explicit.
     public["services"]["main"]["working_dir"] = "/workspace"
-    # Harbor replaces main.image with its own agent image, so a healthcheck
-    # script baked into the task-specific main image would be missing. Main is
-    # only the analysis workstation; an image-agnostic liveness probe is the
-    # stable contract.
+    # Export may substitute a shared agent runtime for main (--agent-image).
+    # A healthcheck baked into the task-specific main image would then be
+    # missing, so keep an image-agnostic liveness probe.
     public["services"]["main"]["healthcheck"] = {
         "test": ["CMD", "sh", "-c", "kill -0 1"],
         "interval": "10s", "timeout": "5s", "retries": 12,
     }
-    # Harbor injects its agent image later and replaces main.command with its
-    # own blocking Python process. Do not allow a shell -c image entrypoint to
-    # consume that command as an argument or exit before the verifier starts.
-    # Entrypoint is a launch contract, not task-specific analysis tooling.
+    # Harbor's prebuilt overlay supplies a keepalive command for main. Only the
+    # launch entrypoint needs normalizing: an image ENTRYPOINT (node, python,
+    # tini, ...) would otherwise consume that command as its own argument.
+    # Targets and sidecars retain their explicit/image-owned entrypoints.
     for name, service in public["services"].items():
-        # Harbor injects the agent image and replaces main's command, so only
-        # the player container needs a neutral entrypoint. Targets and sidecars
-        # retain both an explicit Compose entrypoint and an image-owned default;
-        # a sleeping command does not mean that the daemon entrypoint is unused.
         if name == "main":
             service["entrypoint"] = ["/usr/bin/env"]
-    public["services"]["main"]["command"] = ["python3", "-c",
-        "import signal,time; signal.signal(signal.SIGTERM, lambda *_: exit(0)); time.sleep(10**9)"]
+    # Pin the same plain keepalive Harbor's prebuilt overlay uses. Do not depend
+    # on the task image's ENTRYPOINT/CMD or on a Python interpreter being PID 1.
+    public["services"]["main"]["command"] = ["sleep", "infinity"]
     if "client" not in (public["services"]["main"].get("depends_on") or {}):
         public["services"]["main"].setdefault("depends_on", {})["client"] = {"condition": "service_started"}
     (environment / "docker-compose.yaml").write_text(yaml.safe_dump(public, sort_keys=False), encoding="utf-8")
@@ -819,6 +815,13 @@ def harbor_run(profile: Path, jobs: Path, name: str, timeout: int, *,
                mounts: list[dict[str, Any]] | None = None,
                max_turns: int | None = None,
                agent_version: str | None = None) -> dict[str, Any]:
+    # The caller's --verify-timeout bounds the verifier, but Harbor also has
+    # to export/load images, run the reference agent and drive two Compose
+    # phases per attempt. Under a loaded Docker daemon a single attempt can
+    # legitimately take 20+ minutes, and a 30-minute wall clock then kills
+    # otherwise healthy acceptances. Keep a floor so the outer process
+    # timeout never becomes the reason a verified task is discarded.
+    timeout = max(int(timeout), 5400)
     # Run each Harbor invocation in a separate process so module-level and
     # host-side subprocess state from a previous trial cannot leak into this
     # one. The verifier class itself is generic and identical for every task.
@@ -853,8 +856,16 @@ def _harbor_run_fresh(profile: Path, jobs: Path, name: str, timeout: int,
                "--n-attempts", "1", "--n-concurrent", "1", "--jobs-dir", str(jobs),
                "--job-name", name, "--yes", "--verifier", import_path,
                # task.toml must not set a timeout; this invocation keeps the
-               # old 3600s verifier budget without baking it into the task.
-               "--verifier-timeout-multiplier", "6.0"]
+               # budget out of the delivered task. Peak Docker-daemon load can
+               # spend 30+ minutes just starting the separate verifier
+               # environment, so 3600s (6x600) is not enough; the verifier
+               # itself bounds each phase, so the extra headroom only helps.
+               "--verifier-timeout-multiplier", "12.0",
+               # Environment start and agent setup also stall under the same
+               # load; without headroom they surface as
+               # EnvironmentStartTimeoutError before the verifier ever runs.
+               "--environment-build-timeout-multiplier", "3.0",
+               "--agent-setup-timeout-multiplier", "3.0"]
     if agent != "oracle":
         if not model or not mounts or not max_turns or not credentials or not agent_version:
             raise ValueError("Harbor agent acceptance needs model, mounts, max_turns, credentials and version")
@@ -1071,7 +1082,7 @@ def scan_image_hygiene(image: str, archive: Path, *, scan_layers: bool) -> None:
         scan_docker_archive(archive)
 
 
-def publish_bundle(staging: Path, root: Path, task_id: str, acceptance: dict[str, Any]) -> None:
+def publish_bundle(staging: Path, root: Path, task_id: str) -> None:
     """Atomically publish an accepted task and serialize the shared index."""
     import fcntl
     root.mkdir(parents=True, exist_ok=True)
@@ -1095,13 +1106,6 @@ def publish_bundle(staging: Path, root: Path, task_id: str, acceptance: dict[str
         merge_shared_images(staging / "shared-images", root / "shared-images")
         _merge_tree(staging / "bin", root / "bin")
         (root / "bin/load_shared_images.py").unlink(missing_ok=True)
-        # Keep the exact evidence in the sealed task directory. The outer
-        # acceptance directory is intentionally rotated on every retry, so a
-        # host path in manifest.json would become stale and make an otherwise
-        # accepted bundle unauditable.
-        evidence = temporary / task_id / "acceptance.json"
-        shutil.copy2(acceptance, evidence)
-        evidence.chmod(0o444)
         os.rename(temporary / task_id, destination)
         shutil.rmtree(temporary)
         try:
@@ -1118,8 +1122,7 @@ def publish_bundle(staging: Path, root: Path, task_id: str, acceptance: dict[str
                         "acceptance_runs": 2, "acceptance_rewards": [1.0, 1.0],
                         "profile": f"{task_id}/harbor-runtime-profile",
                         "image_lock": f"{task_id}/image-lock.json",
-                        "image_manifest": f"{task_id}/images/manifest.json",
-                        "acceptance": f"{task_id}/acceptance.json"})
+                        "image_manifest": f"{task_id}/images/manifest.json"})
         entries.sort(key=lambda entry: entry["task_id"])
         write_json(manifest_path, {"schema_version": 1, "status": "accepted_tasks_only",
                                    "task_count": len(entries), "tasks": entries})
@@ -1223,8 +1226,7 @@ def accept(workspace: Path, output: Path, task_id: str, route: dict[str, Any],
         # first accept() has no pre-existing result.json to copy.
         write_json(output / "result.json", result)
     if result["status"] == "passed" and published_root is not None:
-        publish_bundle(output / "bundle", published_root, delivery_id,
-                       str((output / "result.json").resolve()))
+        publish_bundle(output / "bundle", published_root, delivery_id)
     return result
 
 

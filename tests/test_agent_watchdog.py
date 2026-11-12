@@ -66,6 +66,7 @@ class CompactLogTests(unittest.TestCase):
                 {"type": "result", "timestamp": "2026-11-09T17:08:09.000Z",
                  "is_error": False, "subtype": "success", "num_turns": 2, "result": "done"},
             ]
+            (output / "prompt.md").write_text("Route this task.\n")
             with (output / "stdout.jsonl").open("w") as handle:
                 for event in events:
                     handle.write(json.dumps(event) + "\n")
@@ -95,13 +96,21 @@ class CompactLogTests(unittest.TestCase):
             self.assertIn("Claude Code compaction", live)
             self.assertIn("List files", live)
             sft = json.loads((output / "sft.jsonl").read_text())
-            self.assertTrue(any(block.get("type") == "thinking"
-                                for message in sft["messages"]
-                                if isinstance(message.get("content"), list)
-                                for block in message["content"]
-                                if isinstance(block, dict)))
-            self.assertTrue(any(message.get("event") == "compact_boundary"
-                                for message in sft["messages"]))
+            self.assertEqual(sft["messages"][0]["role"], "system")
+            self.assertEqual(sft["messages"][1]["role"], "user")
+            assistant = next(m for m in sft["messages"]
+                             if m["role"] == "assistant" and m.get("tool_calls"))
+            self.assertIn("huge private thought", assistant["content"])
+            self.assertTrue(assistant["content"].startswith("\x3cthink\x3e\n"))
+            self.assertIn("\x3c/think\x3e", assistant["content"])
+            self.assertEqual(assistant["tool_calls"][0]["type"], "function")
+            self.assertEqual(assistant["tool_calls"][0]["function"]["name"], "Bash")
+            self.assertIsInstance(
+                assistant["tool_calls"][0]["function"]["arguments"], dict)
+            self.assertTrue(any(m["role"] == "tool" and m.get("tool_call_id") == "t1"
+                                for m in sft["messages"]))
+            self.assertTrue(any(event.get("subtype") == "compact_boundary"
+                                for event in sft["metadata"]["events"]))
 
     def test_autocompact_keeps_pre_compact_history_and_string_summary(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -137,7 +146,8 @@ class CompactLogTests(unittest.TestCase):
                 str(message.get("content", "")) for message in sft["messages"])
             self.assertIn("BEFORE_COMPACT", text)
             self.assertIn("AFTER_COMPACT", text)
-            self.assertIn("COMPACT_SUMMARY_TEXT", text)
+            events_text = json.dumps(sft["metadata"]["events"], ensure_ascii=False)
+            self.assertIn("COMPACT_SUMMARY_TEXT", events_text)
             self.assertEqual(sft["metadata"]["result"]["result"], long_result)
 
     def test_background_task_output_is_archived(self):

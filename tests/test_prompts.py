@@ -29,6 +29,19 @@ class IsolationPromptTests(unittest.TestCase):
         self.assertIn("/run/pass2fail/input.bin", prompt)
         self.assertIn("with that path as `$1`", prompt)
 
+    def test_prompts_require_image_leak_and_oracle_breadth_checks(self):
+        from pipeline.prompts import REVIEW, SYNTHESIZE
+        for phrase in ("Image-leak audit", "Main-visible answer material",
+                       "Oracle breadth is a suitability check",
+                       "phase-aware negative control"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, REVIEW)
+        for phrase in ("not only their Dockerfiles", "main is agent-visible",
+                       "no broader than instruction.md's effect A",
+                       "phase-aware negative control"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, SYNTHESIZE)
+
     def test_review_uses_two_decision_levels_and_a_two_key_output(self):
         from pipeline.prompts import REVIEW
         self.assertIn("exactly two decision", REVIEW)

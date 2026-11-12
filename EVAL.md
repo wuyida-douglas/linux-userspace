@@ -1,6 +1,7 @@
 # 单题跑题 / 评测
 
-只说明怎么评测一个已发布的题包。批量调度不在本文范围。
+只说明怎么评测一个已发布的题包。批量调度和合成见
+`/nvme/wuyida/新管线开发/README.md`。
 
 ## 1. 前置条件
 
@@ -16,18 +17,32 @@ ANTHROPIC_API_KEY=...        # 或 ANTHROPIC_AUTH_TOKEN
 
 ## 2. 一键评测
 
-```bash
-cd /nvme/wuyida/新管线开发
-scripts/evaluate.sh <bundle-dir> <task-id> [task-id...]
+脚本：`/nvme/wuyida/新管线开发/scripts/evaluate.sh`
+
+```sh
+# ===== 直接改这里 =====
+BUNDLE=/nvme/wuyida/新管线开发/harbor_export/20261111-production
+TASKS="cve-2024-23346-file-pov"
+ENV_FILE=/nvme/wuyida/env
+MODEL=glm-5.3
+MAX_TURNS=300
+EVAL_JOBS=/nvme/wuyida/新管线开发/eval-jobs
+CLAUDE_BIN=
+CLAUDE_VERSION=
+HARBOR_BIN=harbor
+# ======================
 ```
 
-例如：
+运行：
 
 ```bash
-scripts/evaluate.sh \
-  harbor_export/20261111-production \
-  cve-2024-23346-file-pov
+/nvme/wuyida/新管线开发/scripts/evaluate.sh
 ```
+
+- `TASKS` 是空格分隔的 task id 列表，可以写多个。
+- `CLAUDE_BIN` 留空时自动从 `PATH` 查找 `claude`；`CLAUDE_VERSION` 留空时
+  自动执行 `claude --version` 取版本。
+- 临时覆盖也可以带参数：`evaluate.sh <bundle-dir> [task-id...]`。
 
 脚本会：
 
@@ -36,24 +51,16 @@ scripts/evaluate.sh \
 3. 用 `load_image.py --run` 包住 `harbor run`，跑题前后再恢复一次；
 4. 自动设置 `PYTHONPATH`；
 5. 只挂本机 `claude`，不挂参考 PoC；
-6. 把结果写到 `eval-jobs/<job-name>/`。
+6. 把结果写到 `/nvme/wuyida/新管线开发/eval-jobs/<job-name>/`。
 
-可调环境变量：
-
-```bash
-MODEL=glm-5.3 \
-MAX_TURNS=300 \
-CLAUDE_BIN=/path/to/claude \
-ANTHROPIC_API_KEY=... \
-ANTHROPIC_BASE_URL=... \
-scripts/evaluate.sh <bundle> <task-id>
-```
+也可以直接设置 `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` /
+`ANTHROPIC_BASE_URL`，不依赖环境文件。
 
 ## 3. 手动跑（不用脚本）
 
 ```bash
-cd <bundle>/<task-id>/harbor-runtime-profile
-PYTHONPATH="$PWD" harbor run \
+cd /nvme/wuyida/新管线开发/harbor_export/20261111-production/cve-2024-23346-file-pov/harbor-runtime-profile
+PYTHONPATH="$PWD" /usr/local/bin/harbor run \
   --path "$PWD" \
   --agent claude-code \
   --model glm-5.3 \
@@ -63,7 +70,8 @@ PYTHONPATH="$PWD" harbor run \
   --ae ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
   --ae ANTHROPIC_BASE_URL="$ANTHROPIC_BASE_URL" \
   --n-attempts 1 \
-  --jobs-dir <jobs> --job-name <unique> --yes \
+  --jobs-dir /nvme/wuyida/新管线开发/eval-jobs \
+  --job-name <unique> --yes \
   --verifier bin.pass2fail_verifier:Pass2FailVerifier \
   --verifier-timeout-multiplier 6.0
 ```
@@ -74,7 +82,7 @@ PYTHONPATH="$PWD" harbor run \
 ## 4. 看结果
 
 ```text
-eval-jobs/<job-name>/.../result.json
+/nvme/wuyida/新管线开发/eval-jobs/<job-name>/.../result.json
 ```
 
 重点看：
@@ -96,6 +104,6 @@ eval-jobs/<job-name>/.../result.json
 | `ModuleNotFoundError: bin.pass2fail_verifier` | 没设 `PYTHONPATH`，也没用 `load_image.py --run` |
 | main 里没有 `claude` | 忘了 `--mounts` 挂本机 claude |
 | 适配器尝试联网安装 | `--ak version` 和挂载 binary 版本不一致 |
-| shared 镜像不存在 | 先 `python3 <bundle>/bin/load_image.py --shared-only` |
+| shared 镜像不存在 | 先 `python3 /nvme/wuyida/新管线开发/harbor_export/20261111-production/bin/load_image.py --shared-only` |
 | 模型 API 连不上 | `ANTHROPIC_*` 没设置，或 Compose 里写死了代理 |
 | 第二次跑看到上次残留 | 没用 `load_image.py --task` / `--run` 恢复 bind |

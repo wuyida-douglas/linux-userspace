@@ -7,6 +7,7 @@ import re
 import shutil
 import signal
 import subprocess
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -84,6 +85,22 @@ def _beijing_time(value: Any) -> str:
         return parsed.astimezone(BEIJING).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + " +0800"
     except (TypeError, ValueError):
         return str(value)
+
+
+def _is_placeholder_result(event: dict) -> bool:
+    """Reject the duplicate CLI shutdown result that follows a real result.
+
+    Claude Code can append a synthetic ``result`` with ``num_turns=0``, a tiny
+    duration and an empty body. It must not overwrite the substantive result
+    already present in the stream (or the SFT/result metadata derived from it).
+    """
+    turns = event.get("num_turns")
+    try:
+        duration = int(event.get("duration_ms") or 0)
+    except (TypeError, ValueError):
+        duration = 0
+    text = event.get("result")
+    return turns in (0, None) and duration < 1000 and not str(text or "").strip()
 
 
 def _block_text(block: dict) -> str:
@@ -178,56 +195,261 @@ def _render_markdown(timeline: list[dict], *, title: str, full: bool,
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _write_sft(output: Path, prompt: str | None, timeline: list[dict],
-               metadata: dict, result: dict) -> None:
-    """Write one machine-readable conversation suitable for SFT tooling."""
-    messages: list[dict] = []
+SFT_SYSTEM = {
+    "route": "你是 Linux 用户态漏洞路由助手。读取 input/meta.json、alternate-candidates.json、fix.diff 和源码，选择 SVC-EXPLOIT / FILE-EXPLOIT / FILE-POV 或拒绝，并把结论写入 route.json。",
+    "synthesis": "你是 Linux 用户态漏洞题目合成助手。根据 route.json 构建可运行、可验证、可评分的 Docker 题包，并完成 gold、oracle、solution 和自检。",
+    "review": "你是独立审查助手。只读检查冻结交付是否适合训练，重点判断漏洞真实性、入口可达性、差分确定性和 oracle 是否可伪造。",
+}
+SFT_CVE_RE = re.compile(
+    r"(?:cve-\d{4}-\d+|osv-\d{4}-\d+|ghsa-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4})",
+    re.I)
+
+
+class LiveLogs:
+    """Tail stdout.jsonl and keep tool-calls.jsonl / live.chat.md live.
+
+    ``_write_compact_logs`` remains authoritative and rewrites both files from
+    the complete raw stream when the session ends. This writer only makes the
+    two human-facing files readable while the agent is still running.
+    """
+
+    def __init__(self, output: Path, task: str, stage: str) -> None:
+        self.output = output
+        self.stdout = output / "stdout.jsonl"
+        self.tools = output / "tool-calls.jsonl"
+        self.chat = output / "live.chat.md"
+        self.stop_event = threading.Event()
+        self.result_seen = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="live-logs", daemon=True)
+        self.started = False
+        self.turn = 0
+        self.turn_by_message: dict[str, int] = {}
+        self.offset = 0
+        self.buffer = b""
+        self.tools.write_text("", encoding="utf-8")
+        self.chat.write_text(
+            f"# Live chat — {stage}\n\n"
+            f"- task: `{task}`\n"
+            f"- stage: `{stage}`\n"
+            f"- started: `{timestamp()}`\n"
+            "- note: live view; rewritten from `stdout.jsonl` when the session ends\n\n",
+            encoding="utf-8")
+
+    def start(self) -> None:
+        if not self.started:
+            self.started = True
+            self.thread.start()
+
+    def stop(self) -> None:
+        if not self.started:
+            return
+        self.stop_event.set()
+        self.thread.join(timeout=5)
+        self._drain(final=True)
+        self.started = False
+
+    def wait_for_result(self, timeout: float | None = None) -> bool:
+        return self.result_seen.wait(timeout)
+
+    def _run(self) -> None:
+        while not self.stop_event.wait(0.5):
+            self._drain()
+        self._drain(final=True)
+
+    def _drain(self, final: bool = False) -> None:
+        try:
+            with self.stdout.open("rb") as handle:
+                handle.seek(self.offset)
+                chunk = handle.read()
+                self.offset = handle.tell()
+        except OSError:
+            return
+        if chunk:
+            self.buffer += chunk
+        while b"\n" in self.buffer:
+            line, self.buffer = self.buffer.split(b"\n", 1)
+            self._line(line)
+        if final and self.buffer.strip():
+            self._line(self.buffer)
+            self.buffer = b""
+
+    def _line(self, raw: bytes) -> None:
+        try:
+            event = json.loads(raw.decode("utf-8", "replace"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return
+        if isinstance(event, dict):
+            try:
+                self._event(event)
+            except Exception:
+                pass
+
+    def _stamp(self, event: dict) -> str:
+        return _beijing_time(event.get("timestamp")) or _beijing_time(
+            datetime.now(timezone.utc).isoformat())
+
+    def _append_chat(self, text: str) -> None:
+        with self.chat.open("a", encoding="utf-8") as handle:
+            handle.write(text.rstrip() + "\n\n")
+
+    def _event(self, event: dict) -> None:
+        kind = event.get("type")
+        stamp = self._stamp(event)
+        message = event.get("message") or {}
+        content = message.get("content") if isinstance(message, dict) else None
+        if kind == "assistant" and isinstance(content, list):
+            message_id = str(message.get("id") or event.get("uuid") or "")
+            turn = self.turn_by_message.get(message_id)
+            if turn is None:
+                self.turn += 1
+                turn = self.turn
+                self.turn_by_message[message_id] = turn
+            blocks: list[dict] = []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") not in {"thinking", "redacted_thinking", "text", "tool_use"}:
+                    continue
+                blocks.append(block)
+                if block.get("type") == "tool_use":
+                    tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
+                    description = tool_input.get("description", "")
+                    input_view = dict(tool_input)
+                    if description:
+                        input_view.pop("description", None)
+                    call = {"time": stamp, "turn": turn,
+                            "tool": block.get("name"),
+                            "description": description,
+                            "id": block.get("id"), "input": input_view}
+                    with self.tools.open("a", encoding="utf-8") as handle:
+                        handle.write(json.dumps(call, ensure_ascii=False, default=str) + "\n")
+            if blocks:
+                lines = [f"## Turn {turn} — assistant — {stamp}", ""]
+                for block in blocks:
+                    _append_block(lines, block, full=True)
+                self._append_chat("\n".join(lines))
+        elif kind == "user":
+            blocks = content if isinstance(content, list) else []
+            results = [block for block in blocks
+                       if isinstance(block, dict) and block.get("type") == "tool_result"]
+            if results:
+                lines = [f"### Tool result — {stamp}", ""]
+                for block in results:
+                    text = _block_text(block)
+                    fence, close = _fence(text)
+                    lines += [fence + "text", text, close, ""]
+                self._append_chat("\n".join(lines))
+            elif content and (event.get("isCompactSummary") or message.get("isCompactSummary")):
+                text = _block_text({"content": content})
+                fence, close = _fence(text)
+                self._append_chat(
+                    f"## Claude Code compaction — {stamp}\n\n{fence}text\n{text}\n{close}")
+        elif kind == "system":
+            subtype = event.get("subtype") or ""
+            if subtype == "thinking_tokens":
+                return
+            if subtype == "init":
+                self._append_chat(
+                    f"## System init — {stamp}\n\n```json\n"
+                    + json.dumps(event, ensure_ascii=False, default=str) + "\n```")
+            elif "compact" in subtype.lower():
+                payload = json.dumps(event, ensure_ascii=False, default=str)
+                self._append_chat(
+                    f"## Claude Code compaction — {stamp}\n\n```json\n{payload}\n```")
+        elif kind == "result":
+            self.result_seen.set()
+            result = event.get("result") or ""
+            text = str(result.get("result", "") if isinstance(result, dict) else result)
+            fence, close = _fence(text)
+            self._append_chat(f"## Final result — {stamp}\n\n{fence}text\n{text}\n{close}")
+
+
+def _qwen_messages(prompt: str | None, timeline: list[dict],
+                   metadata: dict, result: dict) -> tuple[list[dict], list[dict]]:
+    """Convert the internal timeline to the Qwen/OpenAI tool-call shape.
+
+    The example format uses string assistant content, ``tool_calls`` on the
+    assistant, and separate ``role=tool`` messages. Thinking is embedded in
+    ``content`` as `` thinking...``; compaction/system events stay in
+    metadata so they do not break a single-system-message chat template.
+    """
+    stage = metadata.get("stage", "")
+    messages: list[dict] = [{
+        "role": "system",
+        "content": SFT_SYSTEM.get(stage, "你是 Linux 用户态漏洞合成助手。")}]
     if prompt:
-        messages.append({"role": "user", "content": prompt,
-                         "time": metadata.get("started_bj", "")})
+        messages.append({"role": "user", "content": prompt})
+    events: list[dict] = []
     for event in timeline:
         kind = event.get("kind")
         stamp = event.get("time") or ""
         if kind == "turn":
-            content = []
+            parts: list[str] = []
+            tool_calls: list[dict] = []
             for block in event.get("blocks", []):
                 if block.get("type") == "thinking":
-                    item = {"type": "thinking", "thinking": block.get("thinking", "")}
-                    if block.get("signature"):
-                        item["signature"] = block["signature"]
-                    content.append(item)
+                    parts.append("<think>\n" + str(block.get("thinking", "")).rstrip() + "\n</think>")
                 elif block.get("type") == "redacted_thinking":
-                    content.append({"type": "redacted_thinking",
-                                    "data": block.get("data", "")})
+                    parts.append("<think>\n[redacted thinking]\n</think>")
                 elif block.get("type") == "text":
-                    content.append({"type": "text", "text": block.get("text", "")})
+                    parts.append(str(block.get("text", "")))
                 elif block.get("type") == "tool_use":
-                    content.append({"type": "tool_use", "id": block.get("id"),
-                                    "name": block.get("name"),
-                                    "input": block.get("input")})
-            if content:
-                messages.append({"role": "assistant", "content": content,
-                                 "time": stamp, "turn": event.get("turn")})
+                    tool_calls.append({
+                        "id": block.get("id"),
+                        "type": "function",
+                        "function": {
+                            "name": block.get("name"),
+                            "arguments": block.get("input") or {},
+                        },
+                    })
+            content = "\n".join(part for part in parts if part).strip()
+            if content or tool_calls:
+                message = {"role": "assistant", "content": content}
+                if tool_calls:
+                    message["tool_calls"] = tool_calls
+                messages.append(message)
         elif kind == "tool_result":
-            content = [{"type": "tool_result",
-                        "tool_use_id": block.get("tool_use_id"),
-                        "content": _block_text(block),
-                        "is_error": bool(block.get("is_error"))}
-                       for block in event.get("blocks", [])]
-            messages.append({"role": "user", "content": content, "time": stamp})
-        elif kind == "compact":
-            messages.append({"role": "system", "event": "compact_boundary",
-                             "content": event.get("text") or
-                             json.dumps(event.get("event"), ensure_ascii=False, default=str),
-                             "time": stamp})
-        elif kind == "system":
-            if event.get("subtype") == "init":
-                continue  # represented in metadata, not mid-conversation
-            messages.append({"role": "system", "event": event.get("subtype") or "event",
-                             "content": json.dumps(event.get("event"), ensure_ascii=False,
-                                                   default=str),
-                             "time": stamp})
+            for block in event.get("blocks", []):
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": block.get("tool_use_id"),
+                    "content": _block_text(block),
+                })
+        elif kind in {"compact", "system"}:
+            subtype = event.get("subtype") or ("compact_boundary" if kind == "compact" else "event")
+            if subtype == "init":
+                continue
+            events.append({
+                "time": stamp,
+                "kind": kind,
+                "subtype": subtype,
+                "content": event.get("text") or json.dumps(
+                    event.get("event"), ensure_ascii=False, default=str),
+            })
+    final_text = str(result.get("result", "")).strip()
+    if final_text and not (messages and messages[-1].get("role") == "assistant"
+                           and messages[-1].get("content") == final_text):
+        messages.append({"role": "assistant", "content": final_text})
+    return messages, events
+
+
+def _write_sft(output: Path, prompt: str | None, timeline: list[dict],
+               metadata: dict, result: dict) -> None:
+    """Write one Qwen-format conversation suitable for SFT tooling."""
+    task = str(metadata.get("task") or output.parent.name)
+    stage = str(metadata.get("stage") or output.name)
+    messages, events = _qwen_messages(prompt, timeline, metadata, result)
+    cve_match = SFT_CVE_RE.search(task)
     metadata = dict(metadata)
+    metadata.update({
+        "sample_id": f"{task}::{stage}",
+        "cve": cve_match.group(0).upper() if cve_match else "",
+        "stage": stage,
+        "split": "train",
+        "note": "Qwen-style SFT generated from Claude Code stream; "
+                "compaction/system events are in metadata.events",
+        "events": events,
+    })
     metadata["result"] = {
         "is_error": result.get("is_error"), "subtype": result.get("subtype"),
         "num_turns": result.get("num_turns"), "duration_ms": result.get("duration_ms"),
@@ -253,6 +475,7 @@ def _write_compact_logs(output: Path, trajectory_name: str = "trajectory.jsonl")
     background: list[dict] = []
     turn = 0
     result: dict = {}
+    placeholder_result: dict = {}
     init: dict = {}
     result_time = ""
     for line in (output / "stdout.jsonl").read_text(encoding="utf-8", errors="replace").splitlines():
@@ -329,6 +552,11 @@ def _write_compact_logs(output: Path, trajectory_name: str = "trajectory.jsonl")
                 timeline.append({"kind": "system", "subtype": subtype,
                                  "time": stamp, "event": event})
         elif kind == "result":
+            if _is_placeholder_result(event):
+                # Keep it only as a fallback for sessions that never produced
+                # a substantive result; do not let it overwrite real metadata.
+                placeholder_result = event
+                continue
             result = event
             result_time = stamp
             timeline.append({"kind": "result", "time": stamp, "result": event,
@@ -337,6 +565,19 @@ def _write_compact_logs(output: Path, trajectory_name: str = "trajectory.jsonl")
                              "num_turns": event.get("num_turns"),
                              "duration_ms": event.get("duration_ms"),
                              "usage": event.get("usage")})
+
+    if not result and placeholder_result:
+        # A session that produced only the synthetic shutdown result still
+        # gets a result record, but a real result always wins.
+        result = placeholder_result
+        result_time = _beijing_time(placeholder_result.get("timestamp"))
+        timeline.append({"kind": "result", "time": result_time,
+                         "result": placeholder_result,
+                         "is_error": placeholder_result.get("is_error"),
+                         "subtype": placeholder_result.get("subtype"),
+                         "num_turns": placeholder_result.get("num_turns"),
+                         "duration_ms": placeholder_result.get("duration_ms"),
+                         "usage": placeholder_result.get("usage")})
 
     # Background commands are part of the synthesis record. Preserve their
     # output files too; the raw stream only carries the transient path.
@@ -534,43 +775,50 @@ def run(prompt: str, workspace: Path, output: Path, *, model: str,
         process = subprocess.Popen(argv, cwd=workspace, env=env,
                                    stdout=stdout, stderr=stderr,
                                    start_new_session=True)
+        # Keep the two human-facing logs live while the session runs. The
+        # final _write_compact_logs below rewrites them from the full stream.
+        live = LiveLogs(output, output.parent.name, output.name)
+        live.start()
         timed_out = False
         result_seen = False
         deadline = started + timeout
         stdout_path = output / "stdout.jsonl"
-        while process.poll() is None:
-            if time.monotonic() >= deadline:
-                timed_out = True
-                os.killpg(process.pid, 15)
-                try:
-                    process.wait(timeout=30)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, 9)
-                    process.wait(timeout=10)
-                break
-            time.sleep(2)
-            try:
-                tail = stdout_path.read_text(encoding="utf-8", errors="replace")[-2_000_000:]
-            except OSError:
-                continue
-            # Claude Code can emit the final result and then keep the process
-            # alive for hours. The result event is the authoritative end.
-            if '"type":"result"' in tail or '"type": "result"' in tail:
-                result_seen = True
+        try:
+            while process.poll() is None:
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    os.killpg(process.pid, 15)
+                    try:
+                        process.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(process.pid, 9)
+                        process.wait(timeout=10)
+                    break
                 time.sleep(2)
                 try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                try:
-                    process.wait(timeout=15)
-                except subprocess.TimeoutExpired:
+                    tail = stdout_path.read_text(encoding="utf-8", errors="replace")[-2_000_000:]
+                except OSError:
+                    continue
+                # Claude Code can emit the final result and then keep the process
+                # alive for hours. The result event is the authoritative end.
+                if '"type":"result"' in tail or '"type": "result"' in tail:
+                    result_seen = True
+                    time.sleep(2)
                     try:
-                        os.killpg(process.pid, signal.SIGKILL)
+                        os.killpg(process.pid, signal.SIGTERM)
                     except ProcessLookupError:
                         pass
-                    process.wait(timeout=10)
-                break
+                    try:
+                        process.wait(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        process.wait(timeout=10)
+                    break
+        finally:
+            live.stop()
     # stdout.jsonl is the complete raw stream; write compact, turn-numbered
     # logs for supervision and review without thinking-token heartbeats.
     result = _write_compact_logs(output)

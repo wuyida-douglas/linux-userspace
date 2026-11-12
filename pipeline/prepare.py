@@ -25,6 +25,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -38,9 +40,107 @@ DEFAULT_INPUT = Path(__file__).resolve().parents[1] / (
 # The frozen 23,873-row labeling output is kept at candidates-kept.jsonl for
 # audit. This default is that pool minus rows with no source snapshot under any
 # exact or ecosystem-alias S3 directory (see pool-availability-20261109.json).
-APPROVED_POOL_SHA256 = "565bdf5914152b3a4f2a00f44c09cc85a38f1b85ae8d42bb833a72c38579e941"
+APPROVED_POOL_SHA256 = "a102ab90fa51ac7ccc700e5e565ebdc700c81c82486f6d934a7088e1def8ca3b"
 APPROVED_POOL_SIZE = 22138
 DEFAULT_REMOTE = "p_huawei_hdd1:private-data-3/DataWheel/en-code-osv-nvd/file"
+
+
+def _duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
+class Progress:
+    """One-line download progress for a terminal, periodic lines for logs."""
+
+    def __init__(self, total: int) -> None:
+        self.total = total
+        self.stream = sys.stdout
+        self.tty = self.stream.isatty()
+        self.started = time.monotonic()
+        self.done = 0
+        self.counts: dict[str, int] = {}
+        self.width = 0
+        self.last_draw = 0.0
+        self.lock = threading.Lock()
+        self.stop = threading.Event()
+        self.timer: threading.Thread | None = None
+        if self.tty:
+            self._draw(force=True)
+            self.timer = threading.Thread(target=self._tick, daemon=True)
+            self.timer.start()
+
+    def _tick(self) -> None:
+        while not self.stop.wait(1.0):
+            with self.lock:
+                self._draw(force=True)
+
+    def update(self, record: dict[str, Any]) -> None:
+        with self.lock:
+            self.done += 1
+            status = str(record.get("status", "error"))
+            self.counts[status] = self.counts.get(status, 0) + 1
+            detail = (f"[{record.get('sample_id', 0):03d}] {status} "
+                      f"{record.get('canonical_id', '')}")
+            if not self.tty:
+                print(detail, flush=True)
+                if self.done % 10 == 0:
+                    self._draw(force=True)
+            elif status != "complete":
+                self.stream.write("\r\x1b[2K" + detail + "\n")
+                self._draw(force=True)
+            else:
+                self._draw()
+
+    def _line(self) -> str:
+        elapsed = time.monotonic() - self.started
+        rate = self.done / elapsed if elapsed > 0 else 0.0
+        remaining = max(0, self.total - self.done)
+        eta = remaining / rate if rate > 0 else 0.0
+        percent = 100.0 * self.done / self.total if self.total else 100.0
+        width = 15
+        filled = int(width * self.done / self.total) if self.total else width
+        bar = "#" * filled + "-" * (width - filled)
+        failed = self.counts.get("partial", 0) + self.counts.get("error", 0)
+        parts = [f"[{bar}] {self.done}/{self.total} {percent:5.1f}%",
+                 f"ok={self.counts.get('complete', 0)}",
+                 f"fail={failed}",
+                 f"left={remaining}",
+                 f"{_duration(elapsed)}",
+                 f"ETA {_duration(eta)}"]
+        return " | ".join(parts)
+
+    def _draw(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self.last_draw < 0.2:
+            return
+        line = self._line()
+        if self.tty:
+            self.width = max(self.width, len(line))
+            self.stream.write("\r" + line.ljust(self.width))
+            self.stream.flush()
+        else:
+            print(line, flush=True)
+        self.last_draw = now
+
+    def finish(self) -> None:
+        self.stop.set()
+        if self.timer is not None:
+            self.timer.join(timeout=2)
+        with self.lock:
+            line = self._line()
+            if self.tty:
+                self.width = max(self.width, len(line))
+                self.stream.write("\r" + line.ljust(self.width) + "\n")
+            else:
+                print(line, flush=True)
+            self.stream.flush()
 
 
 def sample(path: Path, count: int, seed: int) -> list[dict[str, Any]]:
@@ -112,6 +212,7 @@ def sample_from_row(row: dict[str, Any], index: int) -> dict[str, Any]:
         "vulnerability": row.get("vulnerability"),
         "code": row.get("code"),
         "old_tags": row.get("old_tags"),
+        "batch": row.get("batch"),
     }
 
 
@@ -131,6 +232,44 @@ def sample_all(path: Path) -> list[dict[str, Any]]:
     if not rows:
         raise ValueError("candidate pool is empty")
     return [sample_from_row(row, index) for index, row in enumerate(rows, 1)]
+
+
+def batch_counts(rows: list[dict[str, Any]]) -> dict[int, int]:
+    """Validate the frozen pool's batch partition and return its batch sizes.
+
+    Each row carries a 1-based ``batch`` number. Rows stay in pool order, so a
+    batch is a contiguous slice and every batch except the last has the same
+    size. Rejecting a malformed partition before any S3 call keeps two batch
+    runs from overlapping or silently skipping candidates.
+    """
+    counts: dict[int, int] = {}
+    previous = 0
+    for row in rows:
+        number = row.get("batch")
+        if type(number) is not int or number < 1:
+            raise ValueError(
+                f"row {row.get('instance_id')!r} has no positive integer batch")
+        if number < previous:
+            raise ValueError("candidate pool rows are not in batch order")
+        previous = number
+        counts[number] = counts.get(number, 0) + 1
+    if list(counts) != list(range(1, len(counts) + 1)):
+        raise ValueError(f"batch numbers must be contiguous from 1; got {sorted(counts)}")
+    size = counts[1]
+    if any(count != size for number, count in counts.items() if number != len(counts)):
+        raise ValueError("only the last batch may be smaller than the others")
+    if counts[len(counts)] > size:
+        raise ValueError("the last batch cannot be larger than the others")
+    return counts
+
+
+def sample_batch(rows: list[dict[str, Any]], number: int) -> list[dict[str, Any]]:
+    """Select one batch in frozen pool order; no random sampling."""
+    chosen = [row for row in rows if row["batch"] == number]
+    if not chosen:
+        raise ValueError(f"batch {number} has no rows")
+    return [sample_from_row(row, index) for index, row in enumerate(chosen, 1)]
+
 
 def safe_prepare(row: dict[str, Any], destination: Path, remote: str,
                  aliases: dict[str, list[str]] | None = None) -> dict[str, Any]:
@@ -428,11 +567,25 @@ def copy(remote: str, destination: Path, *, directory: bool = False) -> None:
             manifest.flush()
             # Keep the exact listing (needed for trailing-dot safety), but use
             # rclone's concurrent transfers instead of one S3 request per file.
-            subprocess.run(["rclone", "copy", remote, str(destination),
-                            "--files-from", manifest.name,
-                            "--transfers", "8", "--checkers", "8", "--stats", "60s",
-                            "--contimeout", "20s", "--timeout", "120s", "--retries", "2"],
-                           check=True, timeout=600)
+            # Capture stderr so a broken mirror does not scribble over the
+            # progress bar; the tail is attached to this task's error record.
+            completed = subprocess.run(
+                ["rclone", "copy", remote, str(destination),
+                 "--files-from", manifest.name,
+                 "--transfers", "8", "--checkers", "8", "--stats", "60s",
+                 "--contimeout", "20s", "--timeout", "120s", "--retries", "2"],
+                capture_output=True, text=True, timeout=600)
+            if completed.returncode != 0:
+                detail = (completed.stderr or completed.stdout or "").strip()
+                if "corrupted on transfer" in detail and "vs 25" in detail:
+                    # Observed on this mirror: keys containing "health_status"
+                    # can be answered by a proxy health check that returns the
+                    # 25-byte body "<status>healthy</status>\n" instead of the
+                    # object. Keep the concrete rclone evidence in the record.
+                    detail += " (possible S3 health-check stub for a health_status key)"
+                if len(detail) > 2000:
+                    detail = "..." + detail[-2000:]
+                raise RuntimeError(f"rclone copy failed for {remote}: {detail}")
         mismatches = []
         for name, size in sizes.items():
             local = destination / name
@@ -607,9 +760,11 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     size = parser.add_mutually_exclusive_group()
     size.add_argument("--count", type=int, default=None,
-                      help="random sample size (default 100 when --all is absent)")
+                      help="random sample size (default 100 when --all/--batch are absent)")
     size.add_argument("--all", action="store_true",
                       help="prepare the complete frozen candidate pool in pool order")
+    size.add_argument("--batch", type=int, default=None, metavar="N",
+                      help="prepare only batch N from the frozen pool, in pool order")
     parser.add_argument("--seed", type=int, default=20261103)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--sample-only", action="store_true")
@@ -622,16 +777,31 @@ def main() -> int:
     args = parser.parse_args()
     # The approved pool is a frozen provenance boundary, not a filename
     # hint. Historical regex subsets must fail before any S3 call.
+    print(f"validating frozen pool: {args.input}", flush=True)
     if sha256(args.input) != APPROVED_POOL_SHA256:
         parser.error(f"input is not the approved {APPROVED_POOL_SIZE:,} kept-candidate pool")
     pool_rows = list(read_jsonl(args.input))
     if len(pool_rows) != APPROVED_POOL_SIZE or len({row["instance_id"] for row in pool_rows}) != APPROVED_POOL_SIZE \
             or any((row.get("metadata_label") or {}).get("label") != "keep" for row in pool_rows):
         parser.error(f"candidate pool must contain exactly {APPROVED_POOL_SIZE:,} unique keep labels")
-    aliases = {} if args.sample_only else s3_alias_index(args.remote)
+    try:
+        batches = batch_counts(pool_rows)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.batch is not None and args.batch not in batches:
+        parser.error(f"--batch must be 1..{len(batches)}")
+    if args.sample_only:
+        aliases = {}
+    else:
+        print(f"building S3 alias index: {args.remote}", flush=True)
+        aliases = s3_alias_index(args.remote)
+        if aliases:
+            print(f"alias index ready: {len(aliases)} CVE alias(es)", flush=True)
     if args.top_up_from:
         if args.all:
             parser.error("--top-up-from cannot be combined with --all")
+        if args.batch is not None:
+            parser.error("--top-up-from cannot be combined with --batch")
         if args.only or args.sample_only:
             parser.error("--top-up-from cannot be combined with --only or --sample-only")
         if not 1 <= args.workers <= 30:
@@ -643,9 +813,14 @@ def main() -> int:
     args.output.mkdir(parents=True, exist_ok=True)
     selection = args.output / "selection.jsonl"
     count = args.count if args.count is not None else 100
+    batch_rows = ([row for row in pool_rows if row["batch"] == args.batch]
+                  if args.batch is not None else None)
     if args.all:
         policy = "all(frozen_pool_order)"
         expected = APPROVED_POOL_SIZE
+    elif batch_rows is not None:
+        policy = f"batch({args.batch}, frozen_pool_order)"
+        expected = len(batch_rows)
     else:
         policy = "random.Random(seed).sample(frozen_pool_order, count)"
         expected = count
@@ -654,23 +829,38 @@ def main() -> int:
         if len(rows) != expected:
             raise ValueError(
                 f"existing selection has {len(rows)} rows, expected {expected}; "
-                "choose another output directory or use the matching --all/--count mode")
+                "choose another output directory or use the matching --all/--batch/--count mode")
         if args.all:
             existing = [row["instance_id"] for row in rows]
             frozen = [row["instance_id"] for row in pool_rows]
             if existing != frozen:
                 raise ValueError("existing full selection differs from the frozen pool order; use a new output directory")
+        elif batch_rows is not None:
+            existing = [row["instance_id"] for row in rows]
+            frozen = [row["instance_id"] for row in batch_rows]
+            if existing != frozen:
+                raise ValueError(
+                    f"existing selection differs from batch {args.batch}; use a new output directory")
     elif args.only:
         raise ValueError("cannot repair a partial selection before the fixed sample is created")
     else:
-        rows = sample_all(args.input) if args.all else sample(args.input, count, args.seed)
+        if args.all:
+            rows = sample_all(args.input)
+        elif batch_rows is not None:
+            rows = sample_batch(pool_rows, args.batch)
+        else:
+            rows = sample(args.input, count, args.seed)
         write_jsonl(selection, rows)
-        write_json(args.output / "sample.json", {"seed": args.seed, "count": len(rows),
-                                                 "input": str(args.input), "input_sha256": APPROVED_POOL_SHA256,
-                                                 "input_count": APPROVED_POOL_SIZE,
-                                                 "label_policy": "metadata_label.label == keep; no additional filters",
-                                                 "sampling_policy": policy,
-                                                 "created_at": timestamp()})
+        sample_record = {"seed": args.seed, "count": len(rows),
+                         "input": str(args.input), "input_sha256": APPROVED_POOL_SHA256,
+                         "input_count": APPROVED_POOL_SIZE,
+                         "label_policy": "metadata_label.label == keep; no additional filters",
+                         "sampling_policy": policy,
+                         "created_at": timestamp()}
+        if args.batch is not None:
+            sample_record.update(batch=args.batch, batch_total=len(batches),
+                                 batch_rows=len(batch_rows))
+        write_json(args.output / "sample.json", sample_record)
     if args.only:
         wanted = set(args.only)
         rows = [row for row in rows if row["task_id"] in wanted or row["canonical_id"] in wanted]
@@ -680,6 +870,8 @@ def main() -> int:
     if not 1 <= args.workers <= 30:
         parser.error("workers must be 1..30")
     (args.output / "tasks").mkdir(exist_ok=True)
+    print(f"preparing {len(rows)} task(s) with {args.workers} worker(s) -> {args.output}",
+          flush=True)
     def prepare_record(row: dict[str, Any]) -> dict[str, Any]:
         try:
             return prepare_one(row, args.output / "tasks", args.remote, aliases=aliases)
@@ -690,12 +882,25 @@ def main() -> int:
             return {key: row[key] for key in ("sample_id", "task_id", "instance_id", "canonical_id")} | {
                 "status": "error", "error": f"{type(exc).__name__}: {exc}"}
 
+    progress = Progress(len(rows))
+    records: list[dict[str, Any]] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
-        records = list(pool.map(prepare_record, rows))
+        futures = {pool.submit(prepare_record, row): row for row in rows}
+        for future in concurrent.futures.as_completed(futures):
+            row = futures[future]
+            try:
+                record = future.result()
+            except Exception as exc:  # keep the batch report if one worker raises
+                record = {key: row[key] for key in
+                          ("sample_id", "task_id", "instance_id", "canonical_id")} | {
+                    "status": "error", "error": f"{type(exc).__name__}: {exc}"}
+            records.append(record)
+            progress.update(record)
+    progress.finish()
+    records.sort(key=lambda record: record["sample_id"])
     counts: dict[str, int] = {}
     for record in records:
         counts[record["status"]] = counts.get(record["status"], 0) + 1
-        print(f"[{record['sample_id']:03d}] {record['status']} {record['canonical_id']}", flush=True)
     write_json(args.output / "download-report.json", {"selected": len(rows), "counts": counts,
                                                       "tasks": records})
     history_path = args.output / "download-history.jsonl"
@@ -708,4 +913,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("\ninterrupted; rerun the same command to resume", file=sys.stderr)
+        raise SystemExit(130)

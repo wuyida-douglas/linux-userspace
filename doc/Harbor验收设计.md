@@ -364,7 +364,6 @@ Agent 模式对三个分支相同；区别只在 Harbor 收集的文件名和 ve
     │       ├── pristine_binds.py
     │       ├── docker_ipam.py
     │       └── task_contract.py
-    └── acceptance.json            # 只读验收证据
 ```
 
 ### 11.2 跑题/评测

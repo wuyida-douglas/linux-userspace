@@ -4,7 +4,12 @@
 Blocks access to:
   * Claude Code auto-memory (``/memory/``, ``.claude/projects``, ``MEMORY.md``)
   * prior runs / other tasks under ``results/`` (only the current task dir is allowed)
-  * writes outside the current workspace (``/tmp`` scratch is allowed)
+  * project paths outside the current task (pipeline/, config/, scripts/, other runs)
+  * host ``/home`` and ``/nvme/wuyida`` paths other than the current task and
+    harness ``claude-*`` outputs
+  * credentials and shared IPAM lease state
+  * host-wide Docker destructive commands (``kill $(docker ps -q)``, prune, ...)
+  * writes outside the current workspace (generic ``/tmp`` scratch is allowed)
 
 The hook is registered through ``--settings`` (see ``pipeline/agent.py``).  It
 receives the PreToolUse JSON on stdin and exits 2 with a message to block the
@@ -24,8 +29,6 @@ from pathlib import Path
 
 ROOT = Path(os.environ.get("AGENT_GUARD_ROOT", "/nvme/wuyida/新管线开发")).resolve()
 RESULTS = ROOT / "results"
-INSTALLED_VERIFIER = ROOT / "pipeline/pass2fail_verifier.py"
-DOCKER_WRAPPER = ROOT / "config/bin/docker"
 
 WS = Path(os.environ.get("AGENT_GUARD_WORKSPACE", "")).resolve()
 TASK_DIR = WS.parent if WS.name == "workspace" else WS
@@ -55,6 +58,22 @@ SECRET_RE = re.compile(
 )
 DOCKER_SRC_RE = re.compile(
     r"(?:-v|--volume)\s+([^\s:]+):|--mount\s+[^;]*?source=([^,\s]+)"
+)
+PROJECT_RE = re.compile(
+    r"(?:^|[\s\"'=:(])(" + re.escape(str(ROOT)) + r"(?:/[^\s\"'`;|&)]*)?)"
+    r"(?=$|[\s\"'`;|&)])"
+)
+IPAM_STATE_RE = re.compile(r"/tmp/linux-userspace-ipam-[^\s\"'`;|&)]*")
+DOCKER_PRUNE_RE = re.compile(
+    r"\bdocker\s+(?:system|volume|network|builder|container|image)\s+prune\b"
+)
+DOCKER_DESTRUCTIVE_RE = re.compile(r"\bdocker\s+(?:container\s+)?(?:kill|rm|stop|restart)\b")
+DOCKER_PS_SUBST_RE = re.compile(r"(?:\$\(|`)\s*docker\s+ps\b([^)`]*)")
+DOCKER_NETWORK_RM_ALL_RE = re.compile(
+    r"\bdocker\s+network\s+rm\b[^\n;|&]*\$\(\s*docker\s+network\s+ls\s+-q"
+)
+DOCKER_VOLUME_RM_ALL_RE = re.compile(
+    r"\bdocker\s+volume\s+rm\b[^\n;|&]*\$\(\s*docker\s+volume\s+ls\s+-q"
 )
 BROAD_SCAN_RE = re.compile(r"\b(?:find|ls|grep|rg|ag|tree)\b")
 REDACT_RE = re.compile(
@@ -127,11 +146,67 @@ def _check_results_token(tool: str, token: str) -> int | None:
     return _block(tool, "results path outside the current task", raw)
 
 
+def _check_docker_scope(command: str) -> int | None:
+    """Block host-wide Docker destruction and shared IPAM state."""
+    if DOCKER_PRUNE_RE.search(command):
+        return _block("Bash", "global docker prune is not allowed", command)
+    if DOCKER_NETWORK_RM_ALL_RE.search(command) or DOCKER_VOLUME_RM_ALL_RE.search(command):
+        return _block("Bash", "global docker network/volume removal is not allowed", command)
+    if DOCKER_DESTRUCTIVE_RE.search(command):
+        for match in DOCKER_PS_SUBST_RE.finditer(command):
+            if "--filter" not in match.group(1):
+                return _block(
+                    "Bash",
+                    "destructive docker command over an unfiltered docker ps is not allowed",
+                    command,
+                )
+    if IPAM_STATE_RE.search(command):
+        return _block("Bash", "shared IPAM lease state is outside the workspace", command)
+    return None
+
+
+def _check_project_paths(command: str) -> int | None:
+    """Block project paths outside the current task directory."""
+    if str(ROOT) not in command:
+        return None
+    for match in PROJECT_RE.finditer(command):
+        token = match.group(1).rstrip(".,;")
+        if token in {str(ROOT), str(ROOT) + "/"}:
+            return _block("Bash", "project root is outside the current task", token)
+        if _under(Path(token), TASK_DIR):
+            continue
+        return _block("Bash", "project path outside the current task", token)
+    return None
+
+
+def _check_outer_paths(command: str) -> int | None:
+    """Block /home and /nvme/wuyida paths except the current task and harness output."""
+    for match in re.finditer(r"(?:^|[\s\"'=:(])(/home/[^\s\"'`;|&)]*)", command):
+        token = match.group(1).rstrip(".,;")
+        if _is_memory(token):
+            return _block("Bash", "memory path", token)
+        return _block("Bash", "home path outside the workspace", token)
+    for match in re.finditer(r"(?:^|[\s\"'=:(])(/nvme/wuyida/[^\s\"'`;|&)]*)", command):
+        token = match.group(1).rstrip(".,;")
+        if token.startswith("/nvme/wuyida/tmp/claude-"):
+            continue
+        if _under(Path(token), TASK_DIR):
+            continue
+        if _is_secret(token):
+            return _block("Bash", "credential path", token)
+        return _block("Bash", "host path outside the current task", token)
+    return None
+
+
 def _check_bash(command: str) -> int:
     if _is_memory(command):
         return _block("Bash", "memory path", command)
     if _is_secret(command):
         return _block("Bash", "credential path", command)
+    for check in (_check_docker_scope, _check_project_paths, _check_outer_paths):
+        decision = check(command)
+        if decision is not None:
+            return decision
     for match in RESULTS_RE.finditer(command):
         token = match.group(1).rstrip(".,;")
         if token in {"results/", "results"}:
@@ -139,7 +214,8 @@ def _check_bash(command: str) -> int:
         decision = _check_results_token("Bash", token)
         if decision == 2:
             return 2
-    # Docker bind mounts must not expose memory or another task's results.
+    # Docker bind mounts must stay inside the current task/workspace; /tmp
+    # scratch is allowed, but shared IPAM state and other tasks are not.
     for match in DOCKER_SRC_RE.finditer(command):
         src = (match.group(1) or match.group(2) or "").strip().strip("\"'")
         if not src or src in {"$PWD", "${PWD}", "$WS", "${WS}",
@@ -147,12 +223,20 @@ def _check_bash(command: str) -> int:
             continue
         if _is_memory(src):
             return _block("Bash", "docker mount of memory path", src)
+        path = Path(src).resolve() if src.startswith("/") else _resolve(src)
+        if IPAM_STATE_RE.search(str(path)):
+            return _block("Bash", "docker mount of shared IPAM state", src)
+        if str(path).startswith("/home/"):
+            return _block("Bash", "docker mount of home path", src)
+        if _under(path, ROOT) and not _under(path, TASK_DIR):
+            return _block("Bash", "docker mount of project path outside the task", src)
+        if str(path).startswith("/nvme/wuyida/") and not _under(path, TASK_DIR):
+            return _block("Bash", "docker mount of host path outside the task", src)
         if "/results/" in src:
-            path = Path(src).resolve() if src.startswith("/") else _resolve(src)
             if not _under(path, TASK_DIR):
                 return _block("Bash", "docker mount of another task's results", src)
-    # Broad scans of the project root itself can enumerate prior runs.  A scan
-    # of a specific subdirectory (e.g. pipeline/) is allowed.
+    # Broad scans of the project root itself can enumerate prior runs; project
+    # paths outside the current task are blocked above.
     if BROAD_SCAN_RE.search(command) and re.search(
             re.escape(str(ROOT)) + r"/?(?:\s|$|[\"'])", command):
         if str(TASK_DIR) not in command and str(WS) not in command:
@@ -180,11 +264,21 @@ def _check_file(tool: str, path_text: str, write: bool) -> int:
         if write:
             return _block(tool, "write outside workspace", path_text)
         return _allow(tool, "current task stage output")
+    if IPAM_STATE_RE.search(str(path)):
+        return _block(tool, "shared IPAM lease state is outside the workspace", path_text)
+    if _under(path, ROOT):
+        return _block(tool, "project path outside the current task", path_text)
     if _under(path, RESULTS):
         return _block(tool, "results path outside the current task", path_text)
-    if path == INSTALLED_VERIFIER or path == DOCKER_WRAPPER:
-        return _allow(tool, "read-only pipeline tool")
-    if str(path).startswith("/tmp/") or str(path).startswith("/nvme/wuyida/tmp/claude-"):
+    if str(path).startswith("/nvme/wuyida/tmp/claude-"):
+        if write:
+            return _block(tool, "write outside workspace", path_text)
+        return _allow(tool, "harness output")
+    if str(path).startswith("/home/"):
+        return _block(tool, "home path outside the workspace", path_text)
+    if str(path).startswith("/nvme/wuyida/"):
+        return _block(tool, "host path outside the current task", path_text)
+    if str(path).startswith("/tmp/"):
         return _allow(tool, "scratch")
     if write:
         return _block(tool, "write outside workspace", path_text)

@@ -14,7 +14,7 @@ import json
 from pathlib import Path
 
 from . import prompts
-from .agent import _write_compact_logs
+from .agent import LiveLogs, _write_compact_logs
 from .common import write_json
 
 
@@ -51,10 +51,26 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("paths", nargs="+", type=Path,
                         help="synthesis directories containing stdout.jsonl")
+    parser.add_argument("--follow", action="store_true",
+                        help="keep tool-calls.jsonl and live.chat.md updated while an agent runs")
     args = parser.parse_args()
+    if args.follow and len(args.paths) != 1:
+        parser.error("--follow requires exactly one path")
     for path in args.paths:
         if not (path / "stdout.jsonl").is_file():
             print(f"skip {path}: no stdout.jsonl")
+            continue
+        if args.follow:
+            live = LiveLogs(path, path.parent.name, path.name)
+            live.start()
+            print(f"following {path}/stdout.jsonl -> "
+                  f"{path}/tool-calls.jsonl, {path}/live.chat.md")
+            try:
+                live.wait_for_result()
+            except KeyboardInterrupt:
+                pass
+            finally:
+                live.stop()
             continue
         if not (path / "prompt.md").is_file():
             reconstructed = _reconstruct_prompt(path)

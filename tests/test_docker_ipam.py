@@ -29,9 +29,13 @@ class IpamTests(unittest.TestCase):
         self.env.stop()
         self.temp.cleanup()
 
+    def snapshot(self):
+        """Live networks are reported by one bulk snapshot after the IPAM fix."""
+        return {f"occupied-{index}": (str(network), 0)
+                for index, network in enumerate(self.occupied)}
+
     def allocate(self, requested, project, role):
-        with patch.object(docker_ipam, "_docker_networks", return_value=self.occupied), \
-                patch.object(docker_ipam, "_network_subnet", return_value=""):
+        with patch.object(docker_ipam, "_network_snapshot", return_value=self.snapshot()):
             return docker_ipam._allocate(requested, project, role, "docker-test")
 
     def test_network_disappearing_between_list_and_inspect_is_absent(self):
@@ -64,8 +68,7 @@ class IpamTests(unittest.TestCase):
                          {"default": "10.80.2.0/24"})
 
     def test_concurrent_projects_never_receive_same_subnet(self):
-        with patch.object(docker_ipam, "_docker_networks", return_value=self.occupied), \
-                patch.object(docker_ipam, "_network_subnet", return_value=""), \
+        with patch.object(docker_ipam, "_network_snapshot", return_value=self.snapshot()), \
                 concurrent.futures.ThreadPoolExecutor(max_workers=20) as pool:
             results = list(pool.map(lambda index: docker_ipam._allocate(
                 {"default": f"concurrent-{index}_default"}, f"concurrent-{index}", "factory", "docker-test"), range(40)))
@@ -141,11 +144,53 @@ class IpamTests(unittest.TestCase):
     def test_release_only_after_project_network_disappears(self):
         allocated = self.allocate({"default": "release-a_default"}, "release-a", "harbor")
         subnet = allocated["default"]
-        with patch.object(docker_ipam, "_network_subnet", return_value=subnet):
+        with patch.object(docker_ipam, "_network_snapshot",
+                          return_value={"release-a_default": (subnet, 0)}):
             self.assertEqual(docker_ipam.release_compose_subnets("release-a", "harbor", "docker-test"), [])
-        with patch.object(docker_ipam, "_network_subnet", return_value=""):
+        with patch.object(docker_ipam, "_network_snapshot", return_value={}):
             self.assertEqual(docker_ipam.release_compose_subnets("release-a", "harbor", "docker-test"), [subnet])
         self.assertEqual(json.loads((self.root / "state/leases.json").read_text()), {})
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class StaleLeaseTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.env = patch.dict(os.environ, {"PIPELINE_IPAM_STATE": str(self.root / "state")})
+        self.env.start()
+        state = self.root / "state"
+        state.mkdir(parents=True)
+        now = 10_000.0
+        (state / "leases.json").write_text(json.dumps({
+            "10.80.1.0/24": {"project": "gone", "network": "gone_default",
+                             "role": "factory", "timestamp": now - 3600},
+            "10.80.2.0/24": {"project": "idle", "network": "idle_default",
+                             "role": "factory", "timestamp": now - 7200},
+            "10.80.3.0/24": {"project": "live", "network": "live_default",
+                             "role": "factory", "timestamp": now - 7200},
+            "10.80.4.0/24": {"project": "recent", "network": "recent_default",
+                             "role": "factory", "timestamp": now - 5},
+        }))
+
+    def tearDown(self):
+        self.env.stop()
+        self.temp.cleanup()
+
+    def test_prunes_vanished_and_idle_but_keeps_live_and_recent(self):
+        # gone_default is absent from the bulk snapshot (network vanished);
+        # recent_default is also absent but inside the missing-lease grace.
+        snapshot = {"idle_default": ("10.80.2.0/24", 0),
+                    "live_default": ("10.80.3.0/24", 1)}
+        with patch.object(docker_ipam, "_network_snapshot", return_value=snapshot), \
+                patch.object(docker_ipam.time, "time", return_value=10_000.0):
+            removed = docker_ipam.prune_stale_leases("docker-test")
+        self.assertEqual(set(removed), {"10.80.1.0/24", "10.80.2.0/24"})
+        leases = json.loads((self.root / "state/leases.json").read_text())
+        self.assertEqual(set(leases), {"10.80.3.0/24", "10.80.4.0/24"})
 
 
 if __name__ == "__main__":

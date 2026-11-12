@@ -390,12 +390,15 @@ class OracleContractTests(unittest.TestCase):
         differential = self.differential()
         differential.contract = {"branch": "SVC-EXPLOIT",
                                  "runner": {"user": "65534:65534"}}
+        differential.docker = "docker-test"
+        differential.project = "scratch-test"
         with tempfile.TemporaryDirectory() as directory:
             differential.runner = Path(directory)
             (differential.runner / "run").mkdir()
             (differential.runner / "output").mkdir()
             (differential.runner / "run/transcript.log").write_text("vulnerable")
-            with patch("pipeline.pass2fail_verifier.subprocess.run") as run:
+            with patch("pipeline.pass2fail_verifier.bounded_run",
+                       return_value={"returncode": 0, "output": ""}) as run:
                 differential._prepare_runner_mounts()
                 self.assertEqual((differential.runner / "run-archives/000/transcript.log").read_text(),
                                  "vulnerable")
@@ -405,13 +408,17 @@ class OracleContractTests(unittest.TestCase):
                 self.assertEqual((differential.runner / "run-archives/001/transcript.log").read_text(),
                                  "fixed")
                 differential._restore_runner_mounts()
-            self.assertEqual([call.args[0] for call in run.call_args_list], [
-                *([["sudo", "-n", "chown", "65534:65534", str(mount)]
-                   for _ in range(2) for mount in (differential.runner / "run",
-                                                    differential.runner / "output")]),
-                ["sudo", "-n", "chown", "-R", f"{differential.runner_owner[0]}:{differential.runner_owner[1]}",
-                 str(differential.runner / "run"), str(differential.runner / "output")],
-            ])
+            calls = [call.args[0] for call in run.call_args_list]
+            # One long-lived root helper, then one chown per phase and one
+            # recursive restore; host sudo is no longer part of this path.
+            self.assertEqual(calls[0][:6], ["docker-test", "run", "-d", "--rm", "--name",
+                                            "scratch-test-root-helper"])
+            execs = [call for call in calls if call[1:3] == ["exec", "-u"]]
+            self.assertEqual(len(execs), 3, execs)
+            self.assertEqual(execs[0][-3:], ["65534:65534", str(differential.runner / "run"),
+                                             str(differential.runner / "output")])
+            self.assertEqual(execs[2][-4], "-R")
+            self.assertEqual(execs[2][-3], f"{differential.runner_owner[0]}:{differential.runner_owner[1]}")
 
     def test_file_pov_crash_reaches_the_effect_oracle(self):
         differential = self.differential()

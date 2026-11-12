@@ -185,8 +185,10 @@ ISOLATION — read this before doing anything:
   reusing a prior delivery is a synthesis failure and invalidates the task.
 
 Read route.json and create the selected task under delivery/. If the selected
-route proves unworkable, write failure.json with a concrete reason and
-experimental evidence, then stop rather than silently changing the task contract.
+route proves unworkable, write `failure.json` in the workspace root (the current
+directory, i.e. `./failure.json`), not under `delivery/`, with a concrete reason
+and experimental evidence, then stop rather than silently changing the task
+contract.
 route.json is authoritative. Never rewrite it. If recovery_required=true,
 recover genuine source/patch evidence from official upstream and advisory-linked
 commits, preserve input/ unchanged, and record the recovered vulnerable/fixed
@@ -285,8 +287,8 @@ image. Export saves each public service image separately by its exact tag. main 
 target may share a base but must have different final images and running containers.
 Every public Compose service needs a prebuilt image and an enabled healthcheck.
 The main image must contain /bin/bash, python3 and /usr/bin/env; the exporter
-overrides main.command with a python3 blocking process and main.working_dir with
-/workspace. Prefer the shared analysis image (for example
+sets main.working_dir to /workspace and normalizes main.entrypoint, so an
+image-owned ENTRYPOINT cannot consume Harbor's keepalive command. Prefer the shared analysis image (for example
 linux-userspace-agent:22.04) for main; use a task-specific main image only when
 the analysis genuinely needs tools that the shared image lacks. In that case its
 healthcheck must still be image-agnostic, because Harbor may replace main.image.
@@ -357,9 +359,10 @@ image-owned liveness/benign check. Never point public Compose at the private
 `/healthcheck.sh`.
 Use a plain
 blocking command ["sleep", "infinity"] (or a real service command). Do not set a
-shell -c image entrypoint: Harbor replaces main.command with a Python blocking
-process. Only main's launch entrypoint is normalized to /usr/bin/env; explicitly
-declared target/sidecar entrypoints and image-owned startup are preserved.
+shell -c image entrypoint: the exporter normalizes main.entrypoint to
+/usr/bin/env so Harbor's keepalive command is not consumed as an argument. Only
+main's launch entrypoint is normalized; explicitly declared target/sidecar
+entrypoints and image-owned startup are preserved.
 The main image must provide /bin/bash because Harbor executes oracle and agent
 commands through bash -c. Keep /solution and /workspace accessible under rootless Docker.
 Never leave root-owned writable runner logs or fixture files. Exercise the
@@ -553,8 +556,10 @@ ISOLATION — read this before doing anything:
   reusing a prior delivery is a synthesis failure and invalidates the task.
 
 Read route.json and create the selected task under delivery/. If the selected
-route proves unworkable, write failure.json with a concrete reason and
-experimental evidence, then stop rather than silently changing the task contract.
+route proves unworkable, write `failure.json` in the workspace root (the current
+directory, i.e. `./failure.json`), not under `delivery/`, with a concrete reason
+and experimental evidence, then stop rather than silently changing the task
+contract.
 route.json is authoritative. Never rewrite it. If recovery_required=true,
 recover genuine source/patch evidence from official upstream and advisory-linked
 commits, preserve input/ unchanged, and record the recovered vulnerable/fixed
@@ -653,8 +658,8 @@ image. Export saves each public service image separately by its exact tag. main 
 target may share a base but must have different final images and running containers.
 Every public Compose service needs a prebuilt image and an enabled healthcheck.
 The main image must contain /bin/bash, python3 and /usr/bin/env; the exporter
-overrides main.command with a python3 blocking process and main.working_dir with
-/workspace. Prefer the shared analysis image (for example
+sets main.working_dir to /workspace and normalizes main.entrypoint, so an
+image-owned ENTRYPOINT cannot consume Harbor's keepalive command. Prefer the shared analysis image (for example
 linux-userspace-agent:22.04) for main; use a task-specific main image only when
 the analysis genuinely needs tools that the shared image lacks. In that case its
 healthcheck must still be image-agnostic, because Harbor may replace main.image.
@@ -725,9 +730,10 @@ image-owned liveness/benign check. Never point public Compose at the private
 `/healthcheck.sh`.
 Use a plain
 blocking command ["sleep", "infinity"] (or a real service command). Do not set a
-shell -c image entrypoint: Harbor replaces main.command with a Python blocking
-process. Only main's launch entrypoint is normalized to /usr/bin/env; explicitly
-declared target/sidecar entrypoints and image-owned startup are preserved.
+shell -c image entrypoint: the exporter normalizes main.entrypoint to
+/usr/bin/env so Harbor's keepalive command is not consumed as an argument. Only
+main's launch entrypoint is normalized; explicitly declared target/sidecar
+entrypoints and image-owned startup are preserved.
 The main image must provide /bin/bash because Harbor executes oracle and agent
 commands through bash -c. Keep /solution and /workspace accessible under rootless Docker.
 Never leave root-owned writable runner logs or fixture files. Exercise the
@@ -882,8 +888,10 @@ ISOLATION — read this before doing anything:
   reusing a prior delivery is a synthesis failure and invalidates the task.
 
 Read route.json and create the selected task under delivery/. If the selected
-route proves unworkable, write failure.json with a concrete reason and
-experimental evidence, then stop rather than silently changing the task contract.
+route proves unworkable, write `failure.json` in the workspace root (the current
+directory, i.e. `./failure.json`), not under `delivery/`, with a concrete reason
+and experimental evidence, then stop rather than silently changing the task
+contract.
 route.json is authoritative. Never rewrite it. If recovery_required=true,
 recover genuine source/patch evidence from official upstream and advisory-linked
 commits, preserve input/ unchanged, and record the recovered vulnerable/fixed
@@ -982,8 +990,8 @@ image. Export saves each public service image separately by its exact tag. main 
 target may share a base but must have different final images and running containers.
 Every public Compose service needs a prebuilt image and an enabled healthcheck.
 The main image must contain /bin/bash, python3 and /usr/bin/env; the exporter
-overrides main.command with a python3 blocking process and main.working_dir with
-/workspace. Prefer the shared analysis image (for example
+sets main.working_dir to /workspace and normalizes main.entrypoint, so an
+image-owned ENTRYPOINT cannot consume Harbor's keepalive command. Prefer the shared analysis image (for example
 linux-userspace-agent:22.04) for main; use a task-specific main image only when
 the analysis genuinely needs tools that the shared image lacks. In that case its
 healthcheck must still be image-agnostic, because Harbor may replace main.image.
@@ -1054,9 +1062,10 @@ image-owned liveness/benign check. Never point public Compose at the private
 `/healthcheck.sh`.
 Use a plain
 blocking command ["sleep", "infinity"] (or a real service command). Do not set a
-shell -c image entrypoint: Harbor replaces main.command with a Python blocking
-process. Only main's launch entrypoint is normalized to /usr/bin/env; explicitly
-declared target/sidecar entrypoints and image-owned startup are preserved.
+shell -c image entrypoint: the exporter normalizes main.entrypoint to
+/usr/bin/env so Harbor's keepalive command is not consumed as an argument. Only
+main's launch entrypoint is normalized; explicitly declared target/sidecar
+entrypoints and image-owned startup are preserved.
 The main image must provide /bin/bash because Harbor executes oracle and agent
 commands through bash -c. Keep /solution and /workspace accessible under rootless Docker.
 Never leave root-owned writable runner logs or fixture files. Exercise the

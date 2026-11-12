@@ -377,10 +377,20 @@ def run_one(task: Path, selection: dict[str, Any], results: Path, args: argparse
         if record["synthesis_agent"].get("status") != "completed":
             record.update(status="failed", failure_class="synthesis_incomplete")
             return record
-        if (workspace / "failure.json").is_file():
+        failure_path = workspace / "failure.json"
+        if not failure_path.is_file():
+            # Historical agents sometimes wrote the bounded failure record
+            # next to the delivery they were building. Accept that location
+            # only when it is explicitly a failure record, and keep the
+            # workspace-root path as the primary contract.
+            candidate = workspace / "delivery/failure.json"
+            candidate_value = load_json(candidate)
+            if isinstance(candidate_value, dict) and candidate_value.get("status") == "failure":
+                failure_path = candidate
+        if failure_path.is_file():
             record.update(status="failed", failure_class="synthesis_blocked",
                           error="Synthesis reported an unworkable route; stopped for later manual recovery.",
-                          failure=load_json(workspace / "failure.json"))
+                          failure=load_json(failure_path))
             return record
         if (workspace / "reroute-request.json").is_file():
             record.update(status="failed", failure_class="branch_mismatch",
@@ -464,7 +474,17 @@ def run_exclusive(task: Path, selection: dict[str, Any], results: Path,
         except BlockingIOError:
             return {"task_id": task.name, "instance_id": selection["instance_id"],
                     "status": "duplicate", "error": "another live worker owns this task"}
-        return run_one(task, selection, results, args, credentials)
+        record = run_one(task, selection, results, args, credentials)
+    # Release this task's containers, images and scratch trees as soon as its
+    # verdict is final. The per-task cleanup is best effort: a Docker problem
+    # must never rewrite a task's status, and images are kept for retryable
+    # error/timeout records so a later --resume can export the bundle again.
+    from .resource_cleanup import cleanup_task
+    try:
+        record["cleanup"] = cleanup_task(task.name, output, record)
+    except Exception as exc:
+        record["cleanup"] = {"error": f"{type(exc).__name__}: {exc}"}
+    return record
 
 
 def reported_published_root() -> Path:
@@ -478,7 +498,7 @@ def main() -> int:
     parser.add_argument("--sample", type=Path, required=True)
     parser.add_argument("--results", type=Path, required=True)
     parser.add_argument("--env-file", type=Path, default=Path("/nvme/wuyida/env"))
-    parser.add_argument("--model", default="glm-5.3")
+    parser.add_argument("--model", default=os.environ.get("ANTHROPIC_MODEL", "deepseek-v4.1-flash-1017"))
     parser.add_argument("--only", nargs="+")
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--route-only", action="store_true")
@@ -499,8 +519,8 @@ def main() -> int:
     parser.add_argument("--published-root", type=Path, default=reported_published_root(),
                         help="accepted-only Harbor bundle; never contains failed tasks")
     args = parser.parse_args()
-    if not 1 <= args.concurrency <= 40:
-        parser.error("concurrency must be 1..40")
+    if not 1 <= args.concurrency <= 80:
+        parser.error("concurrency must be 1..80")
     if args.review_delivery and len(args.only or []) != 1:
         parser.error("--review-delivery requires exactly one --only task")
     credentials = load_env(args.env_file)

@@ -42,6 +42,6 @@
 - `pipeline.iterate_batches` / `iterate.py` 协调器已移除；批次由 Agent 直接启动
   `pipeline.supervise`。
 - `conversation.md` 已删除；审查看 `review-input/live.chat.md`，
-  SFT 用 `sft.jsonl`，`trajectory.jsonl` 只保留 turn 索引。
+  SFT 用 `sft.jsonl`（Qwen/OpenAI 风格 messages + tool_calls/tool role），`trajectory.jsonl` 只保留 turn 索引。
 - `task.json` 仍存在，但由 `pipeline.contract_build.build_task_contract()` 生成；
   agent 只写 Compose 和固定脚本。

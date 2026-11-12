@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import tempfile
 import unittest
 import unittest.mock
 from pathlib import Path
+from types import SimpleNamespace
 
 from pipeline import common, prepare
 
@@ -72,6 +75,64 @@ class FullPoolTests(unittest.TestCase):
             self.assertEqual([row["instance_id"] for row in selected],
                              ["CVE-b::https://github.com/o/b", "CVE-a::https://github.com/o/a"])
             self.assertEqual([row["sample_id"] for row in selected], [1, 2])
+
+    def row(self, name: str, batch: int) -> dict:
+        return {"instance_id": f"{name}::https://github.com/o/{name}",
+                "canonical_id": name, "repo": f"https://github.com/o/{name}",
+                "vulnerability": {}, "code": {}, "old_tags": {}, "batch": batch}
+
+    def test_batch_counts_and_sampling_preserve_pool_order(self):
+        rows = [self.row("CVE-a", 1), self.row("CVE-b", 1),
+                self.row("CVE-c", 2), self.row("CVE-d", 2), self.row("CVE-e", 3)]
+        self.assertEqual(prepare.batch_counts(rows), {1: 2, 2: 2, 3: 1})
+        selected = prepare.sample_batch(rows, 2)
+        self.assertEqual([row["instance_id"] for row in selected],
+                         ["CVE-c::https://github.com/o/CVE-c",
+                          "CVE-d::https://github.com/o/CVE-d"])
+        self.assertEqual([row["sample_id"] for row in selected], [1, 2])
+        self.assertEqual([row["batch"] for row in selected], [2, 2])
+        self.assertEqual([row["task_id"] for row in selected],
+                         ["linux-001-cve-c-o-cve-c", "linux-002-cve-d-o-cve-d"])
+
+    def test_batch_counts_rejects_malformed_partitions(self):
+        cases = [
+            [self.row("CVE-a", 1), self.row("CVE-b", 3)],            # gap
+            [self.row("CVE-a", 2)],                                   # must start at 1
+            [self.row("CVE-a", 1), self.row("CVE-b", 2),
+             self.row("CVE-c", 1)],                                   # out of order
+            [self.row("CVE-a", 1), self.row("CVE-b", 2),
+             self.row("CVE-c", 2)],                                   # last batch too large
+        ]
+        for rows in cases:
+            with self.subTest(rows=rows), self.assertRaises(ValueError):
+                prepare.batch_counts(rows)
+        with self.assertRaises(ValueError):
+            prepare.batch_counts([{"instance_id": "CVE-a", "batch": 1},
+                                  {"instance_id": "CVE-b"}])          # missing key
+        with self.assertRaises(ValueError):
+            prepare.batch_counts([{"instance_id": "CVE-a", "batch": True}])
+
+
+class ProgressTests(unittest.TestCase):
+    def test_duration_is_readable_at_each_scale(self):
+        self.assertEqual(prepare._duration(5), "5s")
+        self.assertEqual(prepare._duration(65), "1m05s")
+        self.assertEqual(prepare._duration(3661), "1h01m")
+
+    def test_log_mode_prints_each_task_and_a_final_summary(self):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            progress = prepare.Progress(3)
+            for index, status in enumerate(["complete", "complete", "error"], 1):
+                progress.update({"sample_id": index, "status": status,
+                                 "canonical_id": f"CVE-{index}"})
+            progress.finish()
+        text = buffer.getvalue()
+        self.assertIn("[001] complete CVE-1", text)
+        self.assertIn("[003] error CVE-3", text)
+        self.assertIn("ok=2", text)
+        self.assertIn("fail=1", text)
+        self.assertIn("3/3 100.0%", text)
 
 
 class InputDownloadTests(unittest.TestCase):
@@ -163,6 +224,20 @@ class InputDownloadTests(unittest.TestCase):
             meta = json.loads((root / "output/linux-001/input/meta.json").read_text())
             self.assertEqual(meta["source"], "osv")
             self.assertEqual(meta["source_path"], "osv_UBUNTU-CVE-2024-0001")
+
+    def test_directory_copy_captures_rclone_stderr_in_the_task_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            failed = SimpleNamespace(
+                returncode=1, stdout="",
+                stderr="corrupted on transfer: sizes differ 10 vs 25")
+            with unittest.mock.patch.object(prepare, "remote_object_sizes",
+                                            return_value={"module.py": 10}), \
+                    unittest.mock.patch.object(prepare.subprocess, "run",
+                                               return_value=failed) as run:
+                with self.assertRaisesRegex(RuntimeError, "corrupted on transfer"):
+                    prepare.copy("remote:bucket/dir", Path(directory) / "out",
+                                 directory=True)
+            self.assertTrue(run.call_args.kwargs.get("capture_output"))
 
     def test_missing_object_does_not_leave_an_empty_download(self):
         with tempfile.TemporaryDirectory() as directory:

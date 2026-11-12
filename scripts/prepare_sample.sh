@@ -1,14 +1,23 @@
 #!/bin/sh
 # One-command input preparation for a fixed random sample.
-# Usage: scripts/prepare_sample.sh <sample-dir> [count] [seed] [workers]
+# Edit the config block below, then run this script with no arguments.
 set -eu
-cd "$(dirname "$0")/.."
 
-SAMPLE=${1:?usage: scripts/prepare_sample.sh <sample-dir> [count] [seed] [workers]}
-COUNT=${2:-100}
-SEED=${3:-$(date +%Y%m%d)}
-WORKERS=${4:-${WORKERS:-4}}
-POOL=data/frozen-pool-20261109/candidates-kept-available-20261109.jsonl
+# ===== 直接改这里 =====
+OUTPUT=/nvme/wuyida/新管线开发/samples/my100
+COUNT=100
+SEED=42
+WORKERS=4
+# ======================
+
+# 可选命令行覆盖（一般不用）：<输出目录> [数量] [seed] [workers]
+OUTPUT=${1:-$OUTPUT}
+COUNT=${2:-$COUNT}
+SEED=${3:-$SEED}
+WORKERS=${4:-$WORKERS}
+
+REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+POOL=$REPO/data/frozen-pool-20261109/candidates-kept-available-20261109.jsonl
 
 case "$COUNT" in
   ''|*[!0-9]*) echo "count must be a positive integer" >&2; exit 2 ;;
@@ -22,8 +31,9 @@ if [ "$COUNT" -lt 1 ] || [ "$WORKERS" -lt 1 ] || [ "$WORKERS" -gt 30 ]; then
 fi
 [ -f "$POOL" ] || { echo "frozen pool missing: $POOL" >&2; exit 1; }
 
-echo "preparing sample=$SAMPLE count=$COUNT seed=$SEED workers=$WORKERS"
-exec .venv/bin/python -m pipeline.prepare \
+echo "preparing sample=$OUTPUT count=$COUNT seed=$SEED workers=$WORKERS"
+export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
+exec "$REPO/.venv/bin/python" -m pipeline.prepare \
   --input "$POOL" \
-  --output "$SAMPLE" \
+  --output "$OUTPUT" \
   --count "$COUNT" --seed "$SEED" --workers "$WORKERS"
