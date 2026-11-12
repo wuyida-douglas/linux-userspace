@@ -192,3 +192,27 @@ PIPELINE_KEEP_RESOURCES=1 ...
 - 证据与工作区都保留在 `results/batch-01/`，可用原命令 `--resume` 继续；
 - 遗留容器：479 个（其中约 277 个属于 batch-01 的 compose 项目、58 个是验收 root-helper），可在低峰时统一 `docker rm -f` 清理；
 - `/nvme` 空闲约 750G，`/` 空闲 801G。
+## 8. 为什么 results/batch-01 比 harbor_export 大这么多（2026-11-12 复盘）
+
+同一批题，`harbor_export` 只有 89G，而清理前 `results/batch-01` 有 350G。实测构成：
+
+| 目录 | 大小 | 性质 |
+|---|---:|---|
+| `.repair-20261111-174827/` | **211.8G** | 迁移事故时归档的 208 个旧任务目录；**208 个在 results 下都有同名新目录**，属于纯重复 |
+| `workspace/.agent-tmp/` | **54.2G** | 合成阶段容器内构建的临时树，root 所有；`shutil.rmtree` 删不掉，需要 root 删除 |
+| `workspace/input/` | 33.7G | 每题源码输入（合成/复现需要） |
+| `workspace/delivery/` | 22.7G | 交付清单与项目文件（重验/重建镜像需要） |
+| `synthesis/`、`review/`、`route/` | ~12G | 轨迹与评审证据 |
+| `harbor/`、`infrastructure-attempts/` | ~3.8G | 验收 job 证据 |
+
+而 `harbor_export/<task>/` 只有交付包本身（镜像 tar.gz ~190–220MB/题 × 225 题 + profile ≈ 89G）。
+`results` 保留的是**过程数据**（输入源码、构建临时树、归档副本），`harbor_export` 保留的是**结果数据**，两者不是同一层东西。
+
+### 已修复
+
+- `.agent-tmp` 清不掉的原因：目录里有容器构建产生的 root 文件，`shutil.rmtree` 静默失败。现在 `resource_cleanup._remove_tree()` 会回退到 `sudo -n rm -rf`，再回退到用容器 root 删除；实测单题 13G 的 `.agent-tmp` 0.7 秒清完，全批 54G 已回收。
+- `trashcan/`（441G 旧迭代归档）已清空。
+
+### 仍可回收
+
+- `.repair-20261111-174827/` 211.8G：208 个目录全部有同名活动目录，是纯重复归档；删除后 results 约 84G。

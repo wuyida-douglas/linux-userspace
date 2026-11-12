@@ -152,6 +152,35 @@ def _remove_images(docker: str, refs: list[str], dry_run: bool) -> dict[str, Any
     return {"images": removed, "images_failed": failed}
 
 
+def _remove_tree(path: Path) -> bool:
+    """Remove a directory even when container builds left root-owned files."""
+    if not path.exists():
+        return True
+    shutil.rmtree(path, ignore_errors=True)
+    if not path.exists():
+        return True
+    sudo = shutil.which("sudo")
+    if sudo:
+        try:
+            result = subprocess.run([sudo, "-n", "rm", "-rf", "--", str(path)],
+                                    capture_output=True, text=True, timeout=300)
+            if result.returncode == 0 and not path.exists():
+                return True
+        except (subprocess.SubprocessError, OSError):
+            pass
+    docker = docker_path()
+    if docker:
+        image = next((tag for tag in ("linux-userspace-agent:22.04", "alpine:3.19", "busybox:1.36.1-musl")
+                      if _run([docker, "image", "inspect", tag], timeout=60).returncode == 0), None)
+        if image:
+            try:
+                _run([docker, "run", "--rm", "--entrypoint", "rm", "-v",
+                      f"{path.parent}:{path.parent}", image, "-rf", "--", str(path)], timeout=600)
+            except (subprocess.SubprocessError, OSError):
+                pass
+    return not path.exists()
+
+
 def _remove_scratch(output: Path, finished: bool, dry_run: bool) -> list[str]:
     """Remove reproducible scratch; keep the small evidence files."""
     removed: list[str] = []
@@ -174,7 +203,7 @@ def _remove_scratch(output: Path, finished: bool, dry_run: bool) -> list[str]:
         removed.append(str(path.relative_to(output)))
         if not dry_run:
             if path.is_dir() and not path.is_symlink():
-                shutil.rmtree(path, ignore_errors=True)
+                _remove_tree(path)
             else:
                 try:
                     path.unlink()
