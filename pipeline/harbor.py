@@ -594,7 +594,9 @@ def rebuild_missing_images(delivery: Path, contract: dict[str, Any]) -> list[str
     rebuilt: list[str] = []
     # A rebuild may need apt/pip egress: pass the CLI-side proxy config.
     environment = {**os.environ, **docker_config_environment(dict(os.environ))}
-    for role, relative in (("agent", "main/Dockerfile"), ("target", "client/Dockerfile")):
+    layouts = (("agent", ("main/Dockerfile", "Dockerfile.main")),
+               ("target", ("client/Dockerfile", "Dockerfile.client")))
+    for role, relatives in layouts:
         reference = images.get(role)
         if not isinstance(reference, str) or not reference:
             continue
@@ -604,9 +606,11 @@ def rebuild_missing_images(delivery: Path, contract: dict[str, Any]) -> list[str
                                capture_output=True, text=True, timeout=60, env=environment)
         if check.returncode == 0:
             continue
-        dockerfile = project / relative
-        if not dockerfile.is_file():
-            raise RuntimeError(f"image {reference} is missing and {dockerfile} does not exist")
+        dockerfile = next((project / relative for relative in relatives
+                           if (project / relative).is_file()), None)
+        if dockerfile is None:
+            raise RuntimeError(
+                f"image {reference} is missing and none of {relatives} exists in {project}")
         built = subprocess.run(
             docker_argv(["docker", "build", "--network", "host", "-t", reference,
                          "-f", str(dockerfile), str(project)]),

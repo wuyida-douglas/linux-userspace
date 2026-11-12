@@ -83,7 +83,7 @@ class RebuildMissingImagesTests(unittest.TestCase):
 
             with patch.object(harbor, "docker_argv", side_effect=lambda argv: argv), \
                     patch.object(harbor.subprocess, "run", side_effect=fake_run):
-                with self.assertRaisesRegex(RuntimeError, "does not exist"):
+                with self.assertRaisesRegex(RuntimeError, "none of"):
                     harbor.rebuild_missing_images(delivery, contract)
 
 
