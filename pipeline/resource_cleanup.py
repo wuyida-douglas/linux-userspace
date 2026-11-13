@@ -146,7 +146,7 @@ def _remove_networks(docker: str, output: Path, dry_run: bool,
     return {"networks": len(names), "networks_failed": failed[:20]}
 
 
-def prune_idle_networks(results_root: Path, min_age_hours: float = 2.0) -> dict[str, Any]:
+def prune_idle_networks(results_root: Path, min_age_hours: float = 0.5) -> dict[str, Any]:
     """Remove Compose networks this batch left behind with no containers.
 
     Trials that are killed or that fail to run ``down`` leave their project
@@ -360,7 +360,7 @@ def prune_unused_volumes(dry_run: bool = False) -> dict[str, Any]:
             "output": (result.stdout + result.stderr)[-2000:]}
 
 
-def prune_idle_volumes(results_root: Path, min_age_hours: float = 2.0,
+def prune_idle_volumes(results_root: Path, min_age_hours: float = 0.5,
                        dry_run: bool = False) -> dict[str, Any]:
     """Remove Compose volumes this batch left behind.
 
