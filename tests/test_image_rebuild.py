@@ -106,6 +106,14 @@ class SharedManifestTests(unittest.TestCase):
             self.assertEqual(harbor.shared_manifest_path(runtime, "verifier").name,
                              "verifier.manifest.json")
 
+    def test_full_archive_name_is_normalised(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory)
+            (runtime / "verifier.tar.manifest.json").write_text("{}", encoding="utf-8")
+            self.assertEqual(
+                harbor.shared_manifest_path(runtime, "verifier.tar.gz").name,
+                "verifier.tar.manifest.json")
+
     def test_identical_archive_is_not_an_error(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "new"
