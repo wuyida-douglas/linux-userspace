@@ -1122,7 +1122,7 @@ def main() -> int:
                                                      "route_budget", "completed_route_recovery"}
                     and previous_status not in {None, "error"}):
                 evidence = args.results / task / "retry-evidence"
-                evidence.mkdir(exist_ok=True)
+                evidence.mkdir(parents=True, exist_ok=True)
                 atomic_json(evidence / ("superseded-retry-" + timestamp().replace(":", "-") + ".json"), record)
                 child.update(retry_count=0, retry_reason=None, previous_status=None,
                              retry_reset_reason="superseded_historical_result")
@@ -1647,13 +1647,19 @@ def main() -> int:
                                       previous_status=record.get("status"))
                 completed.add(task)
                 continue
+            if retry_reason and not (args.results / task).is_dir():
+                # The task directory is gone (an operator removed the task).
+                # Never recreate it from stale scheduler state.
+                children.pop(task, None)
+                completed.add(task)
+                continue
             if retry_reason:
                 # Several specific recovery paths mutate the local child dict.
                 # Flush them once before terminal/launch handling so they cannot
                 # erase the authoritative shared retry gate on the next tick.
                 children[task] = child
                 evidence = args.results / task / "retry-evidence"
-                evidence.mkdir(exist_ok=True)
+                evidence.mkdir(parents=True, exist_ok=True)
                 # Re-routing replaces its own logs; review/Harbor resume must
                 # retain route and synthesis evidence in place.
                 if retry_reason == "review_incomplete":
