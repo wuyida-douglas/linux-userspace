@@ -273,7 +273,8 @@ class Differential:
     def prepare(self) -> None:
         shutil.copytree(self.environment_source, self.environment)
         shutil.copytree(self.private_source, self.private)
-        self.restore_pristine_binds()
+        # Each phase restores its writable binds from pristine-binds.tar before
+        # Compose starts; prepare() only copies the package.
         # The shipped reference is reused by the differential; never persist a
         # file with host-only permissions into that source tree.
         reference = self.private / f"reference_{self.contract['submission_mode']}"
