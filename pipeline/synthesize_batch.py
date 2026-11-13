@@ -289,7 +289,7 @@ def receipt_for(results: Path, wave: list[str], batch_number: int) -> Path:
     return path
 
 
-def _housekeeping_loop(stop, results_root: Path, interval_sec: int = 3 * 3600) -> None:
+def _housekeeping_loop(stop, results_root: Path, interval_sec: int = 30 * 60) -> None:
     """Periodic cleanup while the supervisor keeps the queue full.
 
     Anonymous volumes, old pip/build unpack directories and dead Compose
@@ -314,7 +314,9 @@ def _housekeeping_loop(stop, results_root: Path, interval_sec: int = 3 * 3600) -
     except ValueError:
         min_free = 1500.0
     # First sweep shortly after start (networks and stale volumes are already
-    # there from the previous run), then on the regular interval.
+    # there from the previous run), then every 30 minutes: leaked Compose
+    # networks and volumes accumulate faster than a three-hour cadence can
+    # contain, and every allocation pays for the networks that remain.
     delay = 300
     while not stop.wait(delay):
         delay = interval_sec
