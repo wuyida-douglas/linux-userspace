@@ -15,7 +15,6 @@ import json
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import tarfile
@@ -280,32 +279,22 @@ class Differential:
         reference = self.private / f"reference_{self.contract['submission_mode']}"
         reference.chmod(0o444)
         self.runner.mkdir(parents=True)
+        self._write_public_healthcheck()
         if self.contract["branch"] == "FILE-POV":
-            self._write_file_runner()
             self.file_input.mkdir(mode=0o755)
             destination = self.file_input / "input.bin"
-            (self.runner / "run").mkdir(mode=0o755)
         else:
             (self.runner / "submission").mkdir(mode=0o755)
             destination = self.runner / "submission" / self.contract["submission_mode"]
             (self.runner / "run").mkdir(mode=0o755)
             (self.runner / "output").mkdir(mode=0o777)
-            # The task healthcheck argv already points to the runner mount.
-            # Wrapping exec /healthcheck.sh in another script at that same path
-            # causes self-recursion rather than a protocol probe.
-            # Copy only this public normal-function check, never oracle/gold.
-            public_health = self.runner / "public_healthcheck.sh"
-            health_source = self.private / "healthcheck.sh"
-            if not health_source.is_file():
-                raise ValueError("missing private/healthcheck.sh for runner public healthcheck")
-            shutil.copyfile(health_source, public_health)
         shutil.copyfile(self.submission, destination)
         # docker bind mounts do not change the host file mode. The public
         # submission must be readable by the declared unprivileged runner.
         destination.chmod(0o444 if self.contract["branch"] == "FILE-POV" else 0o555)
         if self.contract["branch"] != "FILE-POV":
             (self.runner / "submission").chmod(0o755)
-        (self.runner / "run").chmod(0o755)
+            (self.runner / "run").chmod(0o755)
         self.runner.chmod(0o755)
         # The work directory itself may be created under a restrictive Harbor
         # umask. Its ancestor trial/log directories remain platform-owned.
@@ -318,7 +307,6 @@ class Differential:
             # Only the public task contract and normal-function healthcheck
             # enter the runner. Private oracle, patch and gold never do.
             (self.environment / "task.json").chmod(0o644)
-            (self.runner / "public_healthcheck.sh").chmod(0o755)
             (self.runner / "runner.py").chmod(0o755)
             (self.runner / "output").chmod(0o777)
         self._write_compose()
@@ -434,28 +422,13 @@ class Differential:
         uid, gid = self.runner_owner
         self._root_chown([self.runner / "run", self.runner / "output"], uid, gid, recursive=True)
 
-    def _write_file_runner(self) -> None:
-        script = '''#!/bin/sh
-set -eu
-mkdir -p /run/pass2fail
-if [ "$1" = health ]; then
-    exec /healthcheck.sh
-fi
-exec /opt/pass2fail/public_runner.sh /run/pass2fail/input.bin
-'''
-        (self.runner / "file-runner.sh").write_text(script, encoding="utf-8")
-        (self.runner / "file-runner.sh").chmod(0o755)
-        import shlex
-        (self.runner / "public_runner.sh").write_text(
-            "#!/bin/sh\nset -eu\nexec " + shlex.join(self.contract["public_runner"]["argv"]) + "\n", encoding="utf-8")
-        (self.runner / "public_runner.sh").chmod(0o755)
-        # The FILE-POV healthcheck runs in client but is the reviewed public
-        # normal-function probe, not private oracle material. Expose it at the
-        # same /healthcheck.sh path used by the other branches.
-        shutil.copyfile(self.private / "healthcheck.sh", self.runner / "public_healthcheck.sh")
-        (self.runner / "public_healthcheck.sh").chmod(0o755)
-        target = self.runner / "healthcheck.sh"
-        target.write_text("#!/bin/sh\nexec " + " ".join(self.contract["healthcheck"]["argv"]) + "\n", encoding="utf-8")
+    def _write_public_healthcheck(self) -> None:
+        """Expose the reviewed normal-function probe to the target side."""
+        source = self.private / "healthcheck.sh"
+        if not source.is_file():
+            raise ValueError("missing private/healthcheck.sh for public healthcheck")
+        target = self.runner / "public_healthcheck.sh"
+        shutil.copyfile(source, target)
         target.chmod(0o755)
 
     def _write_compose(self) -> None:
@@ -483,12 +456,7 @@ exec /opt/pass2fail/public_runner.sh /run/pass2fail/input.bin
             raise ValueError("target and untrusted runner must use different images")
         # A submitted script can write only this disposable per-shot workspace.
         # Private oracle and solution never enter this Compose project.
-        runner_volumes = [
-            f"{self.runner}/file-runner.sh:/opt/pass2fail/runner.sh:ro",
-            f"{self.runner}/public_runner.sh:/opt/pass2fail/public_runner.sh:ro",
-            f"{self.runner}/healthcheck.sh:/opt/pass2fail/healthcheck.sh:ro",
-            f"{self.file_input}:/run/pass2fail:ro",
-        ] if self.contract["branch"] == "FILE-POV" else [
+        runner_volumes = [] if self.contract["branch"] == "FILE-POV" else [
             f"{self.runner}/runner.py:/opt/pass2fail/runner.py:ro",
             f"{self.runner}/public_healthcheck.sh:{self.contract['healthcheck']['argv'][0]}:ro",
             f"{self.environment}/task.json:/opt/pass2fail/task.json:ro",
@@ -913,11 +881,6 @@ def fresh_verify(task_dir: Path, submission: Path | None, log_dir: Path,
         write_json(log_dir / "evidence.json", result)
         _remove_reward_files(log_dir)
         raise VerifierInfraError(result["error"]) from exc
-    finally:
-        # The verifier may have written into public ./ binds while bringing up
-        # its private target. Put the delivered task back even when grading
-        # raises, so the next trial starts from the sealed package.
-        _restore_public_binds(task_dir)
 
     write_json(log_dir / "evidence.json", result)
     status = str(result.get("status") or "")
