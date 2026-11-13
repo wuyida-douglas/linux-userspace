@@ -355,10 +355,15 @@ def run_one(task: Path, selection: dict[str, Any], results: Path, args: argparse
                                                  max_turns=args.route_turns, timeout=args.route_timeout,
                                                  network=ROOT / "config")
                 if record["route_agent"].get("status") != "completed":
-                    turns = record["route_agent"].get("num_turns")
-                    raise RuntimeError(
-                        f"routing agent did not complete: {record['route_agent'].get('status')} "
-                        f"(turns={turns}, cap={args.route_turns})")
+                    # The prompt asks for a valid route.json within ten turns;
+                    # an agent that dies later still leaves a usable decision.
+                    if not (workspace / "route.json").is_file():
+                        turns = record["route_agent"].get("num_turns")
+                        raise RuntimeError(
+                            f"routing agent did not complete: {record['route_agent'].get('status')} "
+                            f"(turns={turns}, cap={args.route_turns})")
+                    record["route_agent"]["warning"] = (
+                        "agent ended before completing; using the route.json it wrote")
                 if not (workspace / "route.json").is_file():
                     record.update(status="failed", failure_class="route_decision_missing")
                     return record
@@ -514,7 +519,7 @@ def main() -> int:
     parser.add_argument("--max-turns", type=int, default=400)
     parser.add_argument("--route-timeout", type=int, default=1800)
     parser.add_argument("--route-turns", type=int,
-                        default=int(os.environ.get("PIPELINE_ROUTE_TURNS", "100")),
+                        default=int(os.environ.get("PIPELINE_ROUTE_TURNS", "60")),
                         help="routing agent turn cap; hard routes verify provenance and "
                              "regularly needed 60+ turns")
     parser.add_argument("--review-timeout", type=int, default=5400)
