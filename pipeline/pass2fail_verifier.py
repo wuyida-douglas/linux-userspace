@@ -672,9 +672,11 @@ sys.exit(result["returncode"])
             # daemon load it fails intermittently for the same image that
             # passed a moment earlier. Retry a couple of times before calling
             # the target unhealthy.
-            for _ in range(4):
-                if not record["health"]["returncode"]:
-                    break
+            # Keep probing until the runner's own health budget is spent:
+            # services such as Jenkins need a minute or two after the Compose
+            # healthcheck already reports healthy.
+            health_deadline = time.monotonic() + self.contract["runner"]["health_timeout_sec"]
+            while record["health"]["returncode"] and time.monotonic() < health_deadline:
                 time.sleep(10)
                 if self.contract["branch"] == "FILE-POV":
                     record["health"] = self.compose(
