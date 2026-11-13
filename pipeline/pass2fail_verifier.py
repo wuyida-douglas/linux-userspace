@@ -1,8 +1,11 @@
 """Self-contained, host-side Harbor verifier for prebuilt isolated targets.
 
 The public Compose environment is gone when this runs. Only the declared
-submission artifact crosses from the untrusted player. Two new Compose projects
-run the same artifact/oracle; the second applies the private official solution.
+submission artifact crosses from the untrusted player. One differential runs
+the submission and the target-side oracle on the vulnerable target, then applies
+the official solution and reruns both on the fixed target. Repeated
+differentials belong to the caller (acceptance runs the verifier twice), not to
+this module.
 No private files or Docker socket are exposed to the submission runner.
 """
 from __future__ import annotations
@@ -271,8 +274,8 @@ class Differential:
         shutil.copytree(self.environment_source, self.environment)
         shutil.copytree(self.private_source, self.private)
         self.restore_pristine_binds()
-        # The shipped reference is reused in vulnerable/fixed jobs; never
-        # persist a file with host-only permissions into that source tree.
+        # The shipped reference is reused by the differential; never persist a
+        # file with host-only permissions into that source tree.
         reference = self.private / f"reference_{self.contract['submission_mode']}"
         reference.chmod(0o444)
         self.runner.mkdir(parents=True)
@@ -445,11 +448,9 @@ exec /opt/pass2fail/public_runner.sh /run/pass2fail/input.bin
         # same /healthcheck.sh path used by the other branches.
         shutil.copyfile(self.private / "healthcheck.sh", self.runner / "public_healthcheck.sh")
         (self.runner / "public_healthcheck.sh").chmod(0o755)
-        for name in ("healthcheck", "oracle", "solution"):
-            source = self.private / f"{name}.sh"
-            target = self.runner / f"{name}.sh"
-            target.write_text("#!/bin/sh\nexec " + " ".join(self.contract[name]["argv"]) + "\n", encoding="utf-8")
-            target.chmod(0o755)
+        target = self.runner / "healthcheck.sh"
+        target.write_text("#!/bin/sh\nexec " + " ".join(self.contract["healthcheck"]["argv"]) + "\n", encoding="utf-8")
+        target.chmod(0o755)
 
     def _write_compose(self) -> None:
         import yaml
@@ -460,7 +461,7 @@ exec /opt/pass2fail/public_runner.sh /run/pass2fail/input.bin
             service.pop("container_name", None)
         target_service = original["services"]["client"]
         # This is the verifier-owned disposable target, not the public service.
-        # Root is needed to install private scripts and rebuild patched source.
+        # Root is needed to install private scripts and apply the official solution.
         # The image's command and entrypoint remain untouched; the original
         # public Compose user is retained separately for inspection.
         original["services"]["client"]["user"] = "0:0"
@@ -763,7 +764,7 @@ sys.exit(result["returncode"])
                 if self.contract["branch"] in {"FILE-EXPLOIT", "SVC-EXPLOIT"} \
                         and record["submission_result"].get("returncode") == 1:
                     # A reference exploit may explicitly reject a patched target
-                    # with exit 1. Only the target oracle decides effect absence.
+                    # with exit 1. Only the target oracle decides.
                     pass
                 else:
                     # Other nonzero exits, including protocol errors, must not
@@ -984,13 +985,14 @@ if BaseVerifier is not None:
             import asyncio
 
             task_dir = Path(self.task.paths.task_dir)
-            _restore_public_binds(task_dir)
-            try:
-                artifacts = Path(self.trial_paths.artifacts_dir)
-                log_dir = Path(self.trial_paths.verifier_dir)
-                seed = str(getattr(self.trial_paths, "trial_dir", task_dir))
-                project = "lup" + hashlib.sha256(seed.encode()).hexdigest()[:16]
-                if (task_dir / "tests/private/task.json").is_file():
+            artifacts = Path(self.trial_paths.artifacts_dir)
+            log_dir = Path(self.trial_paths.verifier_dir)
+            seed = str(getattr(self.trial_paths, "trial_dir", task_dir))
+            project = "lup" + hashlib.sha256(seed.encode()).hexdigest()[:16]
+            if (task_dir / "tests/private/task.json").is_file():
+                # Current packages use this module's pristine_binds helper.
+                _restore_public_binds(task_dir)
+                try:
                     contract = load_contract(task_dir)
                     submission = collected_submission(artifacts, contract)
                     reward, _ = await asyncio.to_thread(
@@ -1000,30 +1002,31 @@ if BaseVerifier is not None:
                         log_dir=log_dir,
                         project=project,
                     )
-                elif (task_dir / "tests/test.sh").is_file():
-                    try:
-                        from .legacy_pass2fail_verifier import (
-                            collected_submission as legacy_collected_submission,
-                            fresh_verify as legacy_fresh_verify,
-                        )
-                    except ImportError:  # direct script execution beside the module
-                        from legacy_pass2fail_verifier import (
-                            collected_submission as legacy_collected_submission,
-                            fresh_verify as legacy_fresh_verify,
-                        )
-                    submission = legacy_collected_submission(artifacts)
-                    reward, _ = await asyncio.to_thread(
-                        legacy_fresh_verify,
-                        task_dir=task_dir,
-                        submission=submission,
-                        log_dir=log_dir,
-                        project=project,
+                finally:
+                    _restore_public_binds(task_dir)
+            elif (task_dir / "tests/test.sh").is_file():
+                # Legacy packages restore their own binds inside fresh_verify.
+                try:
+                    from .legacy_pass2fail_verifier import (
+                        collected_submission as legacy_collected_submission,
+                        fresh_verify as legacy_fresh_verify,
                     )
-                else:
-                    raise RuntimeError(
-                        "task profile has neither tests/private/task.json nor tests/test.sh")
-            finally:
-                _restore_public_binds(task_dir)
+                except ImportError:  # direct script execution beside the module
+                    from legacy_pass2fail_verifier import (
+                        collected_submission as legacy_collected_submission,
+                        fresh_verify as legacy_fresh_verify,
+                    )
+                submission = legacy_collected_submission(artifacts)
+                reward, _ = await asyncio.to_thread(
+                    legacy_fresh_verify,
+                    task_dir=task_dir,
+                    submission=submission,
+                    log_dir=log_dir,
+                    project=project,
+                )
+            else:
+                raise RuntimeError(
+                    "task profile has neither tests/private/task.json nor tests/test.sh")
             return VerifierResult(rewards={"reward": reward})
 
 

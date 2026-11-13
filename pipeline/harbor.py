@@ -1247,8 +1247,9 @@ def accept(workspace: Path, output: Path, task_id: str, route: dict[str, Any],
             {"type": "bind", "source": str(reference),
              "target": f"/workspace/{submission}", "read_only": True},
         ]
-        # Acceptance runs the same verifier twice. Each run performs one
-        # differential; the repetition belongs here, not inside the verifier.
+        # Acceptance runs the same verifier twice. Each run performs one full
+        # differential (vulnerable, then fixed); the repetition belongs here,
+        # not inside the verifier.
         # _harbor_run_fresh() restores the sealed writable binds before and
         # after every Harbor invocation, so the second run starts clean.
         for attempt in (1, 2):

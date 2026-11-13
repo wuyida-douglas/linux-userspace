@@ -471,6 +471,17 @@ class OracleContractTests(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertNotIn("fixed", result)
 
+    def test_legacy_infrastructure_failure_writes_no_reward(self):
+        from pipeline.legacy_pass2fail_verifier import (
+            VerifierInfraError, fresh_verify as legacy_fresh_verify)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaises(VerifierInfraError):
+                legacy_fresh_verify(task_dir=root, submission=None,
+                                    log_dir=root / "logs", project="legacy-test")
+            self.assertFalse((root / "logs/reward.txt").exists())
+            self.assertFalse((root / "logs/reward.json").exists())
+
     def test_infrastructure_exception_has_traceback(self):
         with tempfile.TemporaryDirectory() as directory:
             log_dir = Path(directory) / "logs"

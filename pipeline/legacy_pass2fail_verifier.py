@@ -83,6 +83,10 @@ def _log(message: str) -> None:
     print(f"pass2fail: {message}", file=sys.stderr)
 
 
+class VerifierInfraError(RuntimeError):
+    """Verification could not produce a trustworthy 0/1 verdict."""
+
+
 def _tail(text: str, limit: int = 400) -> str:
     text = (text or "").strip()
     return text[-limit:]
@@ -108,16 +112,11 @@ def _read_reward(log_dir: Path) -> tuple[float, str] | None:
     return reward, status
 
 
-def _write_reward(log_dir: Path, reward: float, status: str, detail: str) -> None:
-    log_dir.mkdir(parents=True, exist_ok=True)
-    (log_dir / "reward.txt").write_text(f"{reward}\n", encoding="utf-8")
-    (log_dir / "test-output.txt").write_text(
-        json.dumps({"reward": reward, "status": status}, ensure_ascii=False)
-        + "\n"
-        + detail
-        + "\n",
-        encoding="utf-8",
-    )
+def _infra(log_dir: Path, message: str) -> None:
+    """Infrastructure failures must leave no reward, so Harbor records an error."""
+    for name in ("reward.txt", "reward.json"):
+        (log_dir / name).unlink(missing_ok=True)
+    raise VerifierInfraError(message)
 
 
 def host_docker_bin() -> str:
@@ -507,18 +506,21 @@ def fresh_verify(
     run=host_run,
     docker_bin: str | None = None,
 ) -> tuple[float, str]:
-    """重新 compose up 交付包，在靶的网络里跑 test.sh。返回 (reward, status)。"""
+    """重新 compose up 交付包，在靶的网络里跑 test.sh。
+
+    只有 test.sh 真正给出 0/1 结论时才返回 (reward, status)。提交缺失、环境
+    起不来、test.sh 没写 reward、超时等基础设施失败一律抛 VerifierInfraError，
+    且不留下 reward 文件，Harbor 会把它记为 trial error 而不是 0 分。
+    """
     log_dir = Path(log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
     if submission is None or not Path(submission).is_file():
-        _write_reward(log_dir, 0.0, "miss", "exploit.py was not collected")
-        return 0.0, "miss"
+        _infra(log_dir, "exploit.py was not collected")
 
     task_dir = Path(task_dir)
     compose = task_dir / "environment" / "docker-compose.yaml"
     if not compose.is_file():
-        _write_reward(log_dir, 0.0, "error", f"missing {compose}")
-        return 0.0, "error"
+        _infra(log_dir, f"missing {compose}")
 
     binary = docker_bin or host_docker_bin()
     env_dir = compose.parent
@@ -537,12 +539,10 @@ def fresh_verify(
         up = run([*base, "up", "-d", "--remove-orphans"], timeout=900)
         if up.returncode != 0:
             detail = _tail((up.stderr or "") + (up.stdout or ""))
-            _write_reward(log_dir, 0.0, "error", f"compose up failed: {detail}")
-            return 0.0, "error"
+            _infra(log_dir, f"compose up failed: {detail}")
         client = _wait_client(run, project)
         if not client:
-            _write_reward(log_dir, 0.0, "error", "compose up did not start client")
-            return 0.0, "error"
+            _infra(log_dir, "compose up did not start client")
         network = _client_network(run, client, project)
         shim = _write_shim(log_dir)
         image = agent_image(task_dir / "task.toml")
@@ -577,8 +577,7 @@ def fresh_verify(
         launched = run(run_args, timeout=120)
         if launched.returncode != 0:
             detail = _tail((launched.stderr or "") + (launched.stdout or ""))
-            _write_reward(log_dir, 0.0, "error", f"judge container failed: {detail}")
-            return 0.0, "error"
+            _infra(log_dir, f"judge container failed: {detail}")
         # test.sh writes reward.txt onto the mounted log dir. A missing file is an error.
         # The vulnerable shot and the patched shot are different containers: e2's
         # exploit_fixed also starts from a fresh ready image. Scoring the patched
@@ -611,8 +610,7 @@ def fresh_verify(
             stopped = run([*base, "stop"], timeout=180)
             if stopped.returncode != 0:
                 detail = _tail((stopped.stderr or "") + (stopped.stdout or ""))
-                _write_reward(log_dir, 0.0, "error", f"stop before bind restore failed: {detail}")
-                return 0.0, "error"
+                _infra(log_dir, f"stop before bind restore failed: {detail}")
             extract_pristine_binds(task_dir)
             recreated = run(
                 [*base, "up", "-d", "--force-recreate", "--remove-orphans"],
@@ -620,20 +618,19 @@ def fresh_verify(
             )
             if recreated.returncode != 0:
                 detail = _tail((recreated.stderr or "") + (recreated.stdout or ""))
-                _write_reward(log_dir, 0.0, "error", f"recreate client failed: {detail}")
-                return 0.0, "error"
+                _infra(log_dir, f"recreate client failed: {detail}")
             client = _wait_client(run, project)
             if not client:
-                _write_reward(log_dir, 0.0, "error", "recreate did not start client")
-                return 0.0, "error"
+                _infra(log_dir, "recreate did not start client")
             executed = exec_phase("fixed", client)
         exec_out = _tail((executed.stdout or "") + (executed.stderr or ""), 800)
         scored = _read_reward(log_dir)
         if scored is None:
-            _write_reward(log_dir, 0.0, "error", f"test.sh wrote no reward: {exec_out}")
-            _log(f"reward=0.0 status=error {exec_out}")
-            return 0.0, "error"
-        if scored[0] != 1.0:
+            _infra(log_dir, f"test.sh wrote no reward: {exec_out}")
+        reward, status = scored
+        if status in {"error", "patched_down"}:
+            _infra(log_dir, f"test.sh status={status}: {exec_out}")
+        if reward != 1.0:
             parts: list[str] = []
             for name in ("test-output.txt", "boot.txt", "restart.txt", "solution.txt"):
                 path = log_dir / name
@@ -642,16 +639,16 @@ def fresh_verify(
                 text = path.read_text(encoding="utf-8", errors="replace").strip()
                 if text:
                     parts.append(f"{name}: {_tail(text, 400)}")
-            _log(f"reward={scored[0]} status={scored[1]} {' | '.join(parts) or exec_out}")
+            _log(f"reward={reward} status={status} {' | '.join(parts) or exec_out}")
         else:
-            _log(f"reward={scored[0]} status={scored[1]}")
-        return scored
+            _log(f"reward={reward} status={status}")
+        return reward, status
+    except VerifierInfraError:
+        raise
     except subprocess.TimeoutExpired as exc:
-        _write_reward(log_dir, 0.0, "error", f"verification command timed out: {exc.cmd}")
-        return 0.0, "error"
+        _infra(log_dir, f"verification command timed out: {exc.cmd}")
     except Exception as exc:
-        _write_reward(log_dir, 0.0, "error", str(exc))
-        return 0.0, "error"
+        _infra(log_dir, str(exc))
     finally:
         try:
             run(["docker", "rm", "-f", judge], timeout=60)
