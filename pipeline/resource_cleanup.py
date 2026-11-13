@@ -254,13 +254,26 @@ def cleanup_task(task_id: str, output: Path, record: dict[str, Any] | None = Non
     return report
 
 
-def prune_build_cache(until: str = "1h", dry_run: bool = False) -> dict[str, Any]:
-    """Drop idle build-cache entries once no task is building.
+def data_disk_free_gb() -> float:
+    """Free space on the disk holding docker's data root, in GiB."""
+    for candidate in (os.environ.get("PIPELINE_DATA_DISK"), "/nvme", "/"):
+        if candidate and Path(candidate).is_dir():
+            try:
+                return round(shutil.disk_usage(candidate).free / 1024 ** 3, 1)
+            except OSError:
+                continue
+    return 0.0
 
-    Build cache only speeds up rebuilding the same Dockerfile, so it has no
-    value after a task is finished. It is pruned at batch boundaries, never
-    while acceptance is running: the prune holds the containerd content-store
-    lock and once turned 26 live acceptances into ``infra_error``.
+
+def prune_build_cache(until: str = "1h", dry_run: bool = False) -> dict[str, Any]:
+    """Drop idle build-cache entries.
+
+    Every task builds its own images once; an idle cache entry is never reused
+    by another task, so the cache is pure disk growth (~130GB/h at concurrency
+    80). It is bounded from the housekeeping loop by pruning entries older
+    than ``until`` once free space drops below the high-water mark, and fully
+    pruned at batch end. The prune holds the containerd content-store lock, so
+    keep ``until`` well above the runtime of a single task.
     """
     docker = docker_path()
     if not docker:

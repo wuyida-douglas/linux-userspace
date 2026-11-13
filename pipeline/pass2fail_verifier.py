@@ -668,8 +668,12 @@ sys.exit(result["returncode"])
         try:
             self.restore_pristine_binds()
             self._prepare_runner_mounts()
+            # Compose up competes with ~80 other tasks for one docker daemon:
+            # measured cold starts range from seconds to >6 minutes, and the
+            # old health_timeout_sec+120 cap (420s) turned slow-but-healthy
+            # starts into infra_error. Keep at least 900s.
             up = self.compose(project, "up", "-d", "--force-recreate", "--no-build", "--wait",
-                              timeout=self.contract["runner"]["health_timeout_sec"] + 120)
+                              timeout=max(self.contract["runner"]["health_timeout_sec"] + 120, 900))
             record["up"] = up
             if up["returncode"]:
                 record["error_stage"] = "up"

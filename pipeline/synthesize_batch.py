@@ -290,18 +290,34 @@ def receipt_for(results: Path, wave: list[str], batch_number: int) -> Path:
 
 
 def _housekeeping_loop(stop, interval_sec: int = 3 * 3600) -> None:
-    """Cheap, lock-free cleanup while the supervisor keeps the queue full.
+    """Periodic cleanup while the supervisor keeps the queue full.
 
-    Anonymous volumes and old pip/build unpack directories accumulate during a
-    long batch and cost nothing to reclaim. Build-cache pruning is deliberately
-    not done here: it holds the containerd content-store lock and would stall
-    live acceptances; that prune only runs when the batch has no worker.
+    Anonymous volumes and old pip/build unpack directories are reclaimed every
+    cycle; that costs nothing. Build cache is bounded too, because every task
+    builds its own images once and the cache otherwise grows ~130GB/h until the
+    disk is full. The cache prune holds the containerd content-store lock for
+    minutes, so it runs only when the data disk drops below
+    ``PIPELINE_BUILD_CACHE_PRUNE_MIN_FREE_GB`` (default 1500) and only drops
+    entries idle longer than ``PIPELINE_BUILD_CACHE_PRUNE_UNTIL`` (default 6h),
+    i.e. layers no running task can still need.
     """
-    from .resource_cleanup import prune_temp_leftovers, prune_unused_volumes
+    from .resource_cleanup import (data_disk_free_gb, prune_build_cache,
+                                   prune_temp_leftovers, prune_unused_volumes)
+    until = os.environ.get("PIPELINE_BUILD_CACHE_PRUNE_UNTIL", "6h")
+    try:
+        min_free = float(os.environ.get("PIPELINE_BUILD_CACHE_PRUNE_MIN_FREE_GB", "1500"))
+    except ValueError:
+        min_free = 1500.0
     while not stop.wait(interval_sec):
         try:
             prune_unused_volumes()
             prune_temp_leftovers(24)
+        except Exception:
+            pass
+        try:
+            if min_free > 0 and data_disk_free_gb() >= min_free:
+                continue
+            prune_build_cache(until)
         except Exception:
             pass
 
