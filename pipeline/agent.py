@@ -259,6 +259,21 @@ SFT_CVE_RE = re.compile(
     re.I)
 
 
+def _has_result_event(text: str) -> bool:
+    """True only for a real result event, not text that merely mentions one."""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            value = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(value, dict) and value.get("type") == "result":
+            return True
+    return False
+
+
 class LiveLogs:
     """Tail stdout.jsonl and keep tool-calls.jsonl / live.chat.md live.
 
@@ -852,7 +867,10 @@ def run(prompt: str, workspace: Path, output: Path, *, model: str,
                     continue
                 # Claude Code can emit the final result and then keep the process
                 # alive for hours. The result event is the authoritative end.
-                if '"type":"result"' in tail or '"type": "result"' in tail:
+                # Parse whole JSON lines: a substring match fires when the agent
+                # merely cats a file that contains `"type":"result"`, which
+                # SIGTERMs a live session and records it as agent_error.
+                if _has_result_event(tail):
                     result_seen = True
                     time.sleep(2)
                     try:

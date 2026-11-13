@@ -174,3 +174,18 @@ class CompactLogTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ResultEventDetectionTests(unittest.TestCase):
+    """A session must not be SIGTERMed because a tool printed `"type":"result"`."""
+
+    def test_real_result_event_is_detected(self):
+        text = '{"type":"system","subtype":"init"}\n{"type":"result","is_error":false}\n'
+        self.assertTrue(agent._has_result_event(text))
+
+    def test_result_text_inside_tool_output_is_not_an_event(self):
+        text = json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_result", "content": 'payload {"type":"result"}'}]}}) + "\n"
+        self.assertFalse(agent._has_result_event(text))
+
+    def test_plain_text_mention_is_not_an_event(self):
+        self.assertFalse(agent._has_result_event('grep: "type":"result" appears in 3 files\n'))
