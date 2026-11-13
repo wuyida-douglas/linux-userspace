@@ -714,7 +714,13 @@ def export(delivery: Path, destination: Path, task_id: str, route: dict[str, Any
         for image, name in runtime_images:
             archive = runtime / name
             if archive.exists():
-                metadata = json.loads(archive.with_suffix("").with_suffix(".manifest.json").read_text())["archive"]
+                # Two manifest spellings exist: archive_image() writes
+                # "<name>.tar.manifest.json", while the loader below still
+                # accepts the legacy "<name>.manifest.json" alias.
+                manifest = runtime / f"{name}.tar.manifest.json"
+                if not manifest.is_file():
+                    manifest = runtime / f"{name}.manifest.json"
+                metadata = json.loads(manifest.read_text())["archive"]
                 if digest_file(archive) != metadata["sha256"]:
                     raise ValueError(f"cached runtime archive differs from its manifest: {archive}")
             else:
@@ -1009,6 +1015,9 @@ def merge_shared_images(source: Path, destination: Path) -> None:
                         f"shared image archive differs from already published copy: {target}")
             else:
                 shutil.copy2(path, target)
+        elif path.name.endswith(".manifest.json") and ".tar.manifest.json" not in path.name:
+            # Alias of a "<name>.tar.manifest.json" record; never published.
+            continue
         elif path.name.endswith(".manifest.json"):
             value = json.loads(path.read_text(encoding="utf-8"))
             record = value.get("archive") or {}
@@ -1176,7 +1185,7 @@ def accept(workspace: Path, output: Path, task_id: str, route: dict[str, Any],
            timeout: int, harbor_jobs: Path | None = None,
            published_root: Path | None = None, *, model: str = "glm-5.3",
            credentials: dict[str, str] | None = None,
-           accept_turns: int = 8) -> dict[str, Any]:
+           accept_turns: int = 1) -> dict[str, Any]:
     delivery = workspace / "delivery"
     if output.exists():
         raise FileExistsError(f"refusing to overwrite acceptance directory {output}")
@@ -1217,30 +1226,18 @@ def accept(workspace: Path, output: Path, task_id: str, route: dict[str, Any],
         if accept_profile.exists():
             shutil.rmtree(accept_profile)
         shutil.copytree(profile, accept_profile)
-        (accept_profile / "instruction.md").write_text(
-            "# Reference acceptance\n\n"
-            f"The reference submission is at `/opt/reference/{submission}` "
-            f"(read-only). Copy it to `/workspace/{submission}` with `cp`, do "
-            "not modify its contents, and do not run task work or start any "
-            "service. Reply with one line and end.\n",
-            encoding="utf-8")
+        # Acceptance uses the delivered instruction.md unchanged, exactly as
+        # evaluation does. The reference is pre-placed at the artifact path the
+        # real task collects, so the run still exercises the real Harbor task.
         reference = accept_profile / "tests/private" / f"reference_{submission}"
         if not reference.is_file():
             raise ValueError(f"missing reference submission: {reference}")
-        # Mount a directory, not a single file: Docker turns a non-existent
-        # file bind target into an empty directory, so the agent copied an
-        # empty directory and the verifier saw no submission.
-        reference_dir = accept_profile / "tests/private/reference"
-        if reference_dir.exists():
-            shutil.rmtree(reference_dir)
-        reference_dir.mkdir(parents=True)
-        shutil.copy2(reference, reference_dir / submission)
         claude_bin, claude_version = claude_agent()
         mounts = [
             {"type": "bind", "source": claude_bin,
              "target": "/usr/local/bin/claude", "read_only": True},
-            {"type": "bind", "source": str(reference_dir),
-             "target": "/opt/reference", "read_only": True},
+            {"type": "bind", "source": str(reference),
+             "target": f"/workspace/{submission}", "read_only": True},
         ]
         # Acceptance runs the same verifier twice. Each run performs one
         # differential; the repetition belongs here, not inside the verifier.
