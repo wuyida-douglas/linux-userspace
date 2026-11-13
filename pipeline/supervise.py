@@ -68,13 +68,15 @@ def load(path: Path, default):
         return default
 
 
-def worker_alive(pid: object) -> bool:
-    """True only while this exact pid is still a ``python -m pipeline.run``.
+def worker_alive(pid: object, task: str | None = None) -> bool:
+    """True only while this exact pid is still this task's ``pipeline.run``.
 
     A kill(0)/state check is not enough: the worker exits, its pid is reused by
     an unrelated process, and the supervisor then believes the slot is busy
     forever (observed: 80 recorded pids, 49 real workers). The cmdline pins the
-    identity. Wrapper and child processes both match, which is intended.
+    identity, and when ``task`` is given the ``--only`` argument must name that
+    same task: a reused pid that now runs another task's worker must not hold
+    this task's slot (observed: 122 ghost slots after restarts).
     """
     if not pid:
         return False
@@ -85,7 +87,15 @@ def worker_alive(pid: object) -> bool:
             return False
         raw = (root / "cmdline").read_bytes().split(b"\0")
         command = [part.decode(errors="surrogateescape") for part in raw if part]
-        return command[1:3] == ["-m", "pipeline.run"]
+        if command[1:3] != ["-m", "pipeline.run"]:
+            return False
+        if task is None:
+            return True
+        try:
+            index = command.index("--only")
+        except ValueError:
+            return False
+        return index + 1 < len(command) and command[index + 1] == task
     except (OSError, ValueError, IndexError):
         return False
 
@@ -531,7 +541,7 @@ def main() -> int:
             if selected_ids is not None and task not in selected_ids:
                 children.setdefault(task, {}).update(terminal_observation_only=True)
             parent = children.get(task, {}).get("pid")
-            if worker_alive(parent) and parent != int(fields[0]):
+            if worker_alive(parent, task) and parent != int(fields[0]):
                 print(f"duplicate worker refused to replace {task}: pid={fields[0]}", flush=True)
                 external.add(task)
                 continue
@@ -563,7 +573,7 @@ def main() -> int:
         if child.get("manual_correction"):
             continue
         pid = child.get("pid")
-        if worker_alive(pid):
+        if worker_alive(pid, task):
             continue
         status = load(args.results / task / "result.json", {}).get("status")
         if status in {"routing", "synthesizing", "reviewing", "harbor"}:
@@ -625,7 +635,7 @@ def main() -> int:
                 if result_dir.resolve() != args.from_pilot.resolve():
                     continue
                 pid = child.get("pid")
-                if worker_alive(pid):
+                if worker_alive(pid, task):
                     continue
                 result = load(result_dir / task / "result.json", {})
                 external.discard(task)
@@ -652,7 +662,7 @@ def main() -> int:
                     worker_dir == args.results.resolve() and retry_marker in {None, retry.stat().st_mtime_ns}
                     or retry_marker == retry.stat().st_mtime_ns)
                 if (result.get("status") not in {"passed", "failed", "error", "rejected"}
-                        or (worker_dir == args.retry_results.resolve() and worker_alive(child.get("pid")))
+                        or (worker_dir == args.retry_results.resolve() and worker_alive(child.get("pid"), task))
                         or already_merged):
                     continue
                 if strictly_accepted(load(args.results / task / "result.json", {})) \
@@ -705,7 +715,7 @@ def main() -> int:
                 child = children.get(task, {})
                 pid = child.get("pid")
                 if (result.get("status") not in {"passed", "failed", "error", "rejected"}
-                        or worker_alive(pid)):
+                        or worker_alive(pid, task)):
                     continue
                 destination = args.results / task
                 destination.mkdir(parents=True, exist_ok=True)
@@ -827,7 +837,7 @@ def main() -> int:
         # An adopted out-of-batch worker is monitored to termination but never
         # contributes a fresh launch, review, repair or terminal status here.
         for task in sorted(set(children) & observed_ids):
-            if worker_alive(children[task].get("pid")):
+            if worker_alive(children[task].get("pid"), task):
                 external.add(task)
             else:
                 children[task]["observation_final_status"] = load(
@@ -862,7 +872,7 @@ def main() -> int:
                 # Keep the first observed worker as this task's sole owner.
                 # A terminal wrapper may have several Python descendants; their
                 # command lines must not cause ownership to change mid-cycle.
-                if worker_alive(child.get("pid")):
+                if worker_alive(child.get("pid"), task):
                     if child["pid"] != pid:
                         print(f"duplicate worker refused to replace {task}: pid={pid}", flush=True)
                     continue
@@ -876,7 +886,7 @@ def main() -> int:
             if child.get("manual_correction") or not child.get("external_worker"):
                 continue
             pid = child.get("pid")
-            if not pid or pid in seen_pids or worker_alive(pid):
+            if not pid or pid in seen_pids or worker_alive(pid, task):
                 continue
             result_dir = Path(child.get("worker_results", args.results))
             result = load(result_dir / task / "result.json", {})
@@ -911,7 +921,7 @@ def main() -> int:
                 child["carry_blocked"] = "original_sample_required"
                 completed.add(task)
                 continue
-            if worker_alive(child.get("pid")):
+            if worker_alive(child.get("pid"), task):
                 continue
             # This is an explicitly adopted task, not a scan of unrelated old
             # failures. Its full workspace is authoritative, unlike the small
