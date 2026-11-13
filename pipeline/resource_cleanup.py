@@ -455,7 +455,13 @@ def prune_stale_images(min_age_hours: float = 12.0,
 
 
 def prune_temp_leftovers(older_than_hours: int = 24, dry_run: bool = False) -> dict[str, Any]:
-    """Drop old pip/build unpack directories and agent session output."""
+    """Drop agent and build scratch left in the batch TMPDIR.
+
+    The worker's TMPDIR holds pip unpack trees, claude session dirs and the
+    UUID scratch directories agents create with mktemp. Everything there is
+    pipeline-owned, so sweep any entry older than the cutoff; a running task's
+    scratch is minutes old and never touched.
+    """
     import tempfile
     import time as _time
     root = Path(tempfile.gettempdir())
@@ -464,9 +470,6 @@ def prune_temp_leftovers(older_than_hours: int = 24, dry_run: bool = False) -> d
     cutoff = _time.time() - older_than_hours * 3600
     removed = []
     for path in root.iterdir():
-        if not (path.name.startswith("pip-unpack-") or path.name.startswith("pip-req-build-")
-                or (path.name.startswith("claude-") and path.is_dir())):
-            continue
         try:
             if path.stat().st_mtime >= cutoff:
                 continue
