@@ -992,11 +992,12 @@ def shared_manifest_path(runtime: Path, name: str) -> Path:
     (the batch cache, older published roots) may carry the legacy
     ``<name>.manifest.json`` alias instead.
     """
-    for candidate in (runtime / f"{name}.tar.manifest.json",
-                      runtime / f"{name}.manifest.json"):
+    stem = name[:-7] if name.endswith(".tar.gz") else name
+    for candidate in (runtime / f"{stem}.tar.manifest.json",
+                      runtime / f"{stem}.manifest.json"):
         if candidate.is_file():
             return candidate
-    return runtime / f"{name}.tar.manifest.json"
+    return runtime / f"{stem}.tar.manifest.json"
 
 
 def merge_shared_images(source: Path, destination: Path) -> None:
