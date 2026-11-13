@@ -89,3 +89,43 @@ class RebuildMissingImagesTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class SharedManifestTests(unittest.TestCase):
+    def test_prefers_canonical_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory)
+            (runtime / "agent.tar.manifest.json").write_text("{}", encoding="utf-8")
+            (runtime / "agent.manifest.json").write_text("{}", encoding="utf-8")
+            self.assertEqual(harbor.shared_manifest_path(runtime, "agent").name,
+                             "agent.tar.manifest.json")
+
+    def test_accepts_legacy_alias_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory)
+            (runtime / "verifier.manifest.json").write_text("{}", encoding="utf-8")
+            self.assertEqual(harbor.shared_manifest_path(runtime, "verifier").name,
+                             "verifier.manifest.json")
+
+    def test_identical_archive_is_not_an_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "new"
+            destination = Path(directory) / "published"
+            source.mkdir()
+            destination.mkdir()
+            for root in (source, destination):
+                (root / "agent.tar.gz").write_bytes(b"same-bytes")
+            harbor.merge_shared_images(source, destination)
+            self.assertEqual((destination / "agent.tar.gz").read_bytes(), b"same-bytes")
+
+    def test_alias_manifest_is_not_published(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "new"
+            destination = Path(directory) / "published"
+            source.mkdir()
+            destination.mkdir()
+            (source / "agent.tar.gz").write_bytes(b"same-bytes")
+            record = {"schema_version": 1, "archive": {"file": "agent.tar.gz", "sha256": "x"}}
+            (source / "agent.manifest.json").write_text(__import__("json").dumps(record),
+                                                        encoding="utf-8")
+            harbor.merge_shared_images(source, destination)
+            self.assertFalse((destination / "agent.manifest.json").exists())

@@ -714,13 +714,7 @@ def export(delivery: Path, destination: Path, task_id: str, route: dict[str, Any
         for image, name in runtime_images:
             archive = runtime / name
             if archive.exists():
-                # Two manifest spellings exist: archive_image() writes
-                # "<name>.tar.manifest.json", while the loader below still
-                # accepts the legacy "<name>.manifest.json" alias.
-                manifest = runtime / f"{name}.tar.manifest.json"
-                if not manifest.is_file():
-                    manifest = runtime / f"{name}.manifest.json"
-                metadata = json.loads(manifest.read_text())["archive"]
+                metadata = json.loads(shared_manifest_path(runtime, name).read_text())["archive"]
                 if digest_file(archive) != metadata["sha256"]:
                     raise ValueError(f"cached runtime archive differs from its manifest: {archive}")
             else:
@@ -991,6 +985,20 @@ def _merge_tree(source: Path, destination: Path) -> None:
             shutil.copy2(path, target)
 
 
+def shared_manifest_path(runtime: Path, name: str) -> Path:
+    """Locate a shared-image manifest under either supported spelling.
+
+    ``archive_image`` writes ``<name>.tar.manifest.json``; pre-seeded copies
+    (the batch cache, older published roots) may carry the legacy
+    ``<name>.manifest.json`` alias instead.
+    """
+    for candidate in (runtime / f"{name}.tar.manifest.json",
+                      runtime / f"{name}.manifest.json"):
+        if candidate.is_file():
+            return candidate
+    return runtime / f"{name}.tar.manifest.json"
+
+
 def merge_shared_images(source: Path, destination: Path) -> None:
     """Merge shared-images by file, never skip the whole directory.
 
@@ -1241,13 +1249,9 @@ def accept(workspace: Path, output: Path, task_id: str, route: dict[str, Any],
         ]
         # Acceptance runs the same verifier twice. Each run performs one
         # differential; the repetition belongs here, not inside the verifier.
-        # The first Agent run may write through a bind; restore the seal before
-        # the second run, then require the same Pass2Fail on the restored
-        # package. This tests bind recovery, not that dirt is safe.
-        extract_pristine_binds(accept_profile, accept_profile / "environment")
+        # _harbor_run_fresh() restores the sealed writable binds before and
+        # after every Harbor invocation, so the second run starts clean.
         for attempt in (1, 2):
-            if attempt == 2:
-                extract_pristine_binds(accept_profile, accept_profile / "environment")
             run = harbor_run(
                 accept_profile, jobs, f"{name}-accept-{attempt}", timeout,
                 agent="claude-code", model=model, credentials=credentials,

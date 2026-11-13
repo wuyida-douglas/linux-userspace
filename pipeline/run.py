@@ -322,7 +322,7 @@ def run_one(task: Path, selection: dict[str, Any], results: Path, args: argparse
                 record["harbor"] = harbor_accept(
                     workspace, output / "harbor", task.name, route_value, args.verify_timeout,
                     published_root=args.published_root, model=args.model,
-                    credentials=credentials, accept_turns=getattr(args, "accept_turns", 3))
+                    credentials=credentials, accept_turns=getattr(args, "accept_turns", 1))
                 assert_frozen(workspace / "delivery", approved)
             record.update(status="passed" if record["harbor"]["status"] == "passed" else "failed",
                           failure_class=None if record["harbor"]["status"] == "passed" else "harbor_failed")
@@ -355,7 +355,10 @@ def run_one(task: Path, selection: dict[str, Any], results: Path, args: argparse
                                                  max_turns=args.route_turns, timeout=args.route_timeout,
                                                  network=ROOT / "config")
                 if record["route_agent"].get("status") != "completed":
-                    raise RuntimeError(f"routing agent did not complete: {record['route_agent'].get('status')}")
+                    turns = record["route_agent"].get("num_turns")
+                    raise RuntimeError(
+                        f"routing agent did not complete: {record['route_agent'].get('status')} "
+                        f"(turns={turns}, cap={args.route_turns})")
                 if not (workspace / "route.json").is_file():
                     record.update(status="failed", failure_class="route_decision_missing")
                     return record
@@ -449,7 +452,7 @@ def run_one(task: Path, selection: dict[str, Any], results: Path, args: argparse
             record["harbor"] = harbor_accept(
                 workspace, output / "harbor", task.name, route_value, args.verify_timeout,
                 published_root=args.published_root, model=args.model,
-                credentials=credentials, accept_turns=getattr(args, "accept_turns", 3))
+                credentials=credentials, accept_turns=getattr(args, "accept_turns", 1))
             assert_frozen(delivery, approved)
         passed = record["harbor"]["status"] == "passed"
         record.update(status="passed" if passed else "failed",
@@ -510,11 +513,14 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=18000)
     parser.add_argument("--max-turns", type=int, default=400)
     parser.add_argument("--route-timeout", type=int, default=1800)
-    parser.add_argument("--route-turns", type=int, default=60)
+    parser.add_argument("--route-turns", type=int,
+                        default=int(os.environ.get("PIPELINE_ROUTE_TURNS", "100")),
+                        help="routing agent turn cap; hard routes verify provenance and "
+                             "regularly needed 60+ turns")
     parser.add_argument("--review-timeout", type=int, default=5400)
     parser.add_argument("--review-turns", type=int, default=140)
     parser.add_argument("--verify-timeout", type=int, default=3600)
-    parser.add_argument("--accept-turns", type=int, default=8,
+    parser.add_argument("--accept-turns", type=int, default=1,
                         help="max agent turns in each of the two Harbor acceptance runs")
     parser.add_argument("--published-root", type=Path, default=reported_published_root(),
                         help="accepted-only Harbor bundle; never contains failed tasks")
