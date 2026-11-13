@@ -1383,6 +1383,16 @@ def main() -> int:
                      or child.get("last_status") in {"routing", "synthesizing", "reviewing", "harbor"})
                 and (pending_infrastructure or pending_review_incomplete or pending_interrupted_synthesis
                      or pending_restartable_synthesis))
+            if bounded_recovery and record.get("status") in {
+                    "routing", "synthesizing", "reviewing", "harbor"}:
+                # The record itself says the task is unfinished and no worker
+                # owns it: a restart (or a killed worker) interrupted it. That
+                # is not a bounded-recovery case -- park it and the queue
+                # silently drains to a handful of workers.
+                child.update(retry_reason=None, recovery_requested=False,
+                             bounded_recovery_launched=False)
+                candidates.append(task)
+                continue
             if bounded_recovery and child.get("bounded_recovery_launched") is True \
                     and record.get("status") in {"failed", "error"}:
                 child["retry_reason"] = "manual_recovery_required"
