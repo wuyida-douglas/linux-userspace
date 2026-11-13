@@ -37,7 +37,7 @@ from .common import ROOT, read_jsonl, timestamp, write_json
 MAX_CONCURRENCY = 80
 MAX_BATCH = 100000
 RETRY_STATUSES = {"failed", "error", "timeout"}
-ACCEPTABLE_STATUSES = {"passed", "rejected"}
+ACCEPTABLE_STATUSES = {"passed", "rejected", "skipped"}
 
 
 def load_json(path: Path, default: Any = None) -> Any:
@@ -313,7 +313,11 @@ def _housekeeping_loop(stop, results_root: Path, interval_sec: int = 3 * 3600) -
         min_free = float(os.environ.get("PIPELINE_BUILD_CACHE_PRUNE_MIN_FREE_GB", "1500"))
     except ValueError:
         min_free = 1500.0
-    while not stop.wait(interval_sec):
+    # First sweep shortly after start (networks and stale volumes are already
+    # there from the previous run), then on the regular interval.
+    delay = 300
+    while not stop.wait(delay):
+        delay = interval_sec
         try:
             prune_unused_volumes()
             prune_temp_leftovers(24)

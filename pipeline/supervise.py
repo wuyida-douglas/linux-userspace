@@ -1770,7 +1770,7 @@ def main() -> int:
             # passing record, and (AUTO_RETRY_FAILED is off) never relaunch a
             # task that is already failed or errored: failure is terminal.
             _record = load(worker_results / task / "result.json", {})
-            if _record.get("status") == "passed":
+            if _record.get("status") in {"passed", "skipped"}:
                 completed.add(task)
                 continue
             if _record.get("status") in {"failed", "error"} and FAILURES_TERMINAL:
