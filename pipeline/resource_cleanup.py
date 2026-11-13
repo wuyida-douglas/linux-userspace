@@ -362,36 +362,53 @@ def prune_unused_volumes(dry_run: bool = False) -> dict[str, Any]:
 
 def prune_idle_volumes(results_root: Path, min_age_hours: float = 2.0,
                        dry_run: bool = False) -> dict[str, Any]:
-    """Remove Compose volumes this batch left behind under its results root.
+    """Remove Compose volumes this batch left behind.
 
-    ``volume prune`` only drops anonymous volumes; every named volume a trial
-    declared (``dbdata``, ``hub-state``, ``target-work``) survives a killed
-    trial and keeps its data on disk forever. Remove those whose Compose
-    project directory is under the batch results root and that are idle.
+    ``volume prune`` only drops anonymous volumes; named volumes a trial
+    declared (``dbdata``, ``hub-state``, ``target-work``) survive a killed
+    trial. Compose does not always write the project working directory label,
+    so attribute twice: by that label when present, and otherwise by the
+    volume being dangling (no container references it) and older than the
+    cutoff -- a volume created moments ago by a live Compose start is never
+    dangling long enough to be swept.
     """
     docker = docker_path()
     if not docker:
         return {"skipped": "docker not found"}
+    root = results_root.resolve()
+    selected: set[str] = set()
     listing = _run([docker, "volume", "ls", "--format",
                     '{{.Name}}\t{{.Label "com.docker.compose.project.working_dir"}}'],
                    timeout=120)
     if listing.returncode:
         return {"error": listing.stderr[-500:]}
-    root = results_root.resolve()
-    claimed = []
     for line in listing.stdout.splitlines():
         parts = line.split("\t")
-        if len(parts) < 2 or not _under(parts[1], root):
+        if len(parts) >= 2 and _under(parts[1], root):
+            selected.add(parts[0])
+    dangling = _run([docker, "volume", "ls", "-q", "--filter", "dangling=true"], timeout=120)
+    if dangling.returncode == 0:
+        selected.update(name for name in dangling.stdout.split() if name)
+    cutoff = time.time() - min_age_hours * 3600
+    dead = []
+    for name in sorted(selected):
+        detail = _run([docker, "volume", "inspect", "--format", "{{.CreatedAt}}", name],
+                      timeout=60)
+        if detail.returncode:
             continue
-        claimed.append(parts[0])
+        try:
+            made = time.mktime(time.strptime(detail.stdout.strip()[:19], "%Y-%m-%dT%H:%M:%S"))
+        except ValueError:
+            continue
+        if made <= cutoff:
+            dead.append(name)
     if dry_run:
-        return {"volumes": claimed}
-    removed = []
-    for name in claimed:
-        result = _run([docker, "volume", "rm", name], timeout=60)
-        if result.returncode == 0:
-            removed.append(name)
-    return {"volumes": len(claimed), "removed": len(removed)}
+        return {"volumes": len(dead)}
+    removed = 0
+    for name in dead:
+        if _run([docker, "volume", "rm", name], timeout=60).returncode == 0:
+            removed += 1
+    return {"volumes": len(dead), "removed": removed}
 
 
 def prune_stale_images(min_age_hours: float = 12.0,

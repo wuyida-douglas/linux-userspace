@@ -124,7 +124,7 @@ if __name__ == "__main__":
     unittest.main()
 
 class SweepTests(unittest.TestCase):
-    def test_only_volumes_under_the_results_root_are_removed(self):
+    def test_idle_volumes_are_attributed_by_label_or_dangling_age(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "results"
             root.mkdir()
@@ -138,17 +138,27 @@ class SweepTests(unittest.TestCase):
 
                 class Result:
                     returncode = 0
-                    stdout = listing if argv[2] == "ls" else ""
+                    stdout = ""
                     stderr = ""
+
+                if argv[1] == "volume" and argv[2] == "ls" and "dangling=true" in argv:
+                    Result.stdout = "anon\n"
+                elif argv[1] == "volume" and argv[2] == "ls":
+                    Result.stdout = listing
+                elif argv[1] == "volume" and argv[2] == "inspect":
+                    # dbdata and anon are old; hub is not selected at all.
+                    Result.stdout = "2020-01-01T00:00:00Z"
+                elif argv[1] == "volume" and argv[2] == "rm":
+                    Result.stdout = argv[3]
                 return Result()
 
             with patch.object(resource_cleanup, "_run", side_effect=fake_run), \
                     patch.object(resource_cleanup, "docker_path", return_value="/usr/bin/docker"):
                 report = resource_cleanup.prune_idle_volumes(root)
-            self.assertEqual(report["volumes"], 1)
-            self.assertEqual(report["removed"], 1)
-            self.assertTrue(any("dbdata" in call for call in calls))
-            self.assertFalse(any("hub" in " ".join(call) for call in calls))
+            self.assertEqual(report["volumes"], 2)
+            self.assertEqual(report["removed"], 2)
+            removed = [call[3] for call in calls if call[1:3] == ["volume", "rm"]]
+            self.assertEqual(sorted(removed), ["anon", "dbdata"])
 
     def test_stale_image_sweep_keeps_protected_and_recent_images(self):
         with tempfile.TemporaryDirectory() as directory:
