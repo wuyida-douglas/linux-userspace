@@ -943,17 +943,38 @@ def _harbor_run_fresh(profile: Path, jobs: Path, name: str, timeout: int,
         raise RuntimeError(f"Harbor did not produce a job result: {output[-4000:]}")
     result = json.loads(report_path.read_text(encoding="utf-8"))
     stats = result.get("stats", {})
-    if cp.returncode or stats.get("n_errored_trials") or stats.get("n_completed_trials") != 1:
-        raise RuntimeError(f"Harbor trial failed; see {jobs / name}: {output[-4000:]}")
     trials = [path for path in (jobs / name).glob("*/result.json") if path.is_file()]
-    if len(trials) != 1:
-        raise ValueError("expected one Harbor trial")
-    trial = json.loads(trials[0].read_text(encoding="utf-8"))
-    if trial.get("exception_info") is not None:
-        raise RuntimeError(f"Harbor trial exception: {trial['exception_info']}")
-    reward = (trial.get("verifier_result") or {}).get("rewards", {}).get("reward")
-    if not isinstance(reward, (int, float)) or isinstance(reward, bool):
-        raise ValueError("missing Harbor numeric reward")
+    # Acceptance pre-places the reference submission, so the agent turn is
+    # incidental: a one-turn agent commonly exits with max-turns (exit 1) even
+    # though the verifier already produced a definitive reward. Prefer that
+    # reward over the agent's exit status; only fail when grading is missing.
+    reward = None
+    if len(trials) == 1:
+        try:
+            trial = json.loads(trials[0].read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            trial = {}
+        value = (trial.get("verifier_result") or {}).get("rewards", {}).get("reward")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            reward = float(value)
+        if reward is not None and (cp.returncode or stats.get("n_errored_trials")
+                                   or trial.get("exception_info") is not None):
+            (jobs / f"{name}-agent-warning.log").write_text(
+                json.dumps({"agent_exception": trial.get("exception_info"),
+                            "stats": stats, "returncode": cp.returncode},
+                           ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    if reward is None:
+        if cp.returncode or stats.get("n_errored_trials") or stats.get("n_completed_trials") != 1:
+            raise RuntimeError(f"Harbor trial failed; see {jobs / name}: {output[-4000:]}")
+        if len(trials) != 1:
+            raise ValueError("expected one Harbor trial")
+        trial = json.loads(trials[0].read_text(encoding="utf-8"))
+        if trial.get("exception_info") is not None:
+            raise RuntimeError(f"Harbor trial exception: {trial['exception_info']}")
+        value = (trial.get("verifier_result") or {}).get("rewards", {}).get("reward")
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ValueError("missing Harbor numeric reward")
+        reward = float(value)
     return {"status": "passed" if float(reward) == 1.0 else "failed",
             "reward": float(reward), "result": str(report_path), "agent": agent}
 
