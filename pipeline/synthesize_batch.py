@@ -306,7 +306,8 @@ def _housekeeping_loop(stop, results_root: Path, interval_sec: int = 30 * 60) ->
     i.e. layers no running task can still need.
     """
     from .resource_cleanup import (data_disk_free_gb, prune_build_cache,
-                                   prune_idle_networks, prune_temp_leftovers,
+                                   prune_idle_networks, prune_idle_volumes,
+                                   prune_stale_images, prune_temp_leftovers,
                                    prune_unused_volumes)
     until = os.environ.get("PIPELINE_BUILD_CACHE_PRUNE_UNTIL", "6h")
     try:
@@ -329,6 +330,13 @@ def _housekeeping_loop(stop, results_root: Path, interval_sec: int = 30 * 60) ->
             # Dead Compose networks fragment docker's address pools and make
             # every IPAM allocation walk them under a host-wide lock.
             prune_idle_networks(results_root)
+        except Exception:
+            pass
+        try:
+            # Named volumes survive a killed trial; agents also build probe
+            # images under tags no task declares, so sweep old unused images.
+            prune_idle_volumes(results_root)
+            prune_stale_images(float(os.environ.get("PIPELINE_IMAGE_GC_HOURS", "12")))
         except Exception:
             pass
         try:

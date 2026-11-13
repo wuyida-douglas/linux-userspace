@@ -122,3 +122,59 @@ class ResourceCleanupTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class SweepTests(unittest.TestCase):
+    def test_only_volumes_under_the_results_root_are_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "results"
+            root.mkdir()
+            listing = (f"dbdata\t{root}/task/harbor/acc/environment\n"
+                       f"hub\t/somewhere/else\n"
+                       f"anon\t\n")
+            calls = []
+
+            def fake_run(argv, timeout=0):
+                calls.append(argv)
+
+                class Result:
+                    returncode = 0
+                    stdout = listing if argv[2] == "ls" else ""
+                    stderr = ""
+                return Result()
+
+            with patch.object(resource_cleanup, "_run", side_effect=fake_run), \
+                    patch.object(resource_cleanup, "docker_path", return_value="/usr/bin/docker"):
+                report = resource_cleanup.prune_idle_volumes(root)
+            self.assertEqual(report["volumes"], 1)
+            self.assertEqual(report["removed"], 1)
+            self.assertTrue(any("dbdata" in call for call in calls))
+            self.assertFalse(any("hub" in " ".join(call) for call in calls))
+
+    def test_stale_image_sweep_keeps_protected_and_recent_images(self):
+        with tempfile.TemporaryDirectory() as directory:
+            old = "2020-01-01 00:00:00 +0000 UTC"
+            listing = (f"sha256:a\tlinux-userspace-agent:22.04\t{old}\n"
+                       f"sha256:b\tdemo-main:1\t{old}\n"
+                       f"sha256:c\tdemo-fresh:1\t2099-01-01 00:00:00 +0000 UTC\n")
+            removed = []
+
+            def fake_run(argv, timeout=0):
+                class Result:
+                    returncode = 0
+                    stdout = ""
+                    stderr = ""
+
+                if argv[1] == "images":
+                    Result.stdout = listing
+                elif argv[1] == "image" and argv[2] == "rm":
+                    removed.extend(argv[3:])
+                    Result.stdout = "deleted\n"
+                return Result()
+
+            with patch.object(resource_cleanup, "_run", side_effect=fake_run), \
+                    patch.object(resource_cleanup, "docker_path", return_value="/usr/bin/docker"):
+                report = resource_cleanup.prune_stale_images(min_age_hours=12)
+            self.assertEqual(report["images"], 1)
+            self.assertIn("sha256:b", removed)
+            self.assertNotIn("sha256:a", removed)
+            self.assertNotIn("sha256:c", removed)

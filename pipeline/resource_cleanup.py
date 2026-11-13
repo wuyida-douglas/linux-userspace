@@ -28,6 +28,7 @@ import argparse
 import json
 import os
 import shutil
+import time
 import subprocess
 import sys
 from pathlib import Path
@@ -357,6 +358,83 @@ def prune_unused_volumes(dry_run: bool = False) -> dict[str, Any]:
     result = _run(argv, timeout=1800)
     return {"returncode": result.returncode,
             "output": (result.stdout + result.stderr)[-2000:]}
+
+
+def prune_idle_volumes(results_root: Path, min_age_hours: float = 2.0,
+                       dry_run: bool = False) -> dict[str, Any]:
+    """Remove Compose volumes this batch left behind under its results root.
+
+    ``volume prune`` only drops anonymous volumes; every named volume a trial
+    declared (``dbdata``, ``hub-state``, ``target-work``) survives a killed
+    trial and keeps its data on disk forever. Remove those whose Compose
+    project directory is under the batch results root and that are idle.
+    """
+    docker = docker_path()
+    if not docker:
+        return {"skipped": "docker not found"}
+    listing = _run([docker, "volume", "ls", "--format",
+                    '{{.Name}}\t{{.Label "com.docker.compose.project.working_dir"}}'],
+                   timeout=120)
+    if listing.returncode:
+        return {"error": listing.stderr[-500:]}
+    root = results_root.resolve()
+    claimed = []
+    for line in listing.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2 or not _under(parts[1], root):
+            continue
+        claimed.append(parts[0])
+    if dry_run:
+        return {"volumes": claimed}
+    removed = []
+    for name in claimed:
+        result = _run([docker, "volume", "rm", name], timeout=60)
+        if result.returncode == 0:
+            removed.append(name)
+    return {"volumes": len(claimed), "removed": len(removed)}
+
+
+def prune_stale_images(min_age_hours: float = 12.0,
+                       dry_run: bool = False) -> dict[str, Any]:
+    """Remove images nothing references and that are older than the cutoff.
+
+    Synthesis agents build ad-hoc probe and test images under arbitrary tags
+    (``tfprobe``, ``lsantest``); per-task cleanup can only remove the refs a
+    task declares. An image older than the cutoff that no container uses is
+    residue, while shared runtime images are protected and re-loadable from
+    the batch's shared-runtime archives.
+    """
+    docker = docker_path()
+    if not docker:
+        return {"skipped": "docker not found"}
+    listing = _run([docker, "images", "--format",
+                    '{{.ID}}\t{{.Repository}}:{{.Tag}}\t{{.CreatedAt}}'], timeout=120)
+    if listing.returncode:
+        return {"error": listing.stderr[-500:]}
+    cutoff = time.time() - min_age_hours * 3600
+    stale = []
+    for line in listing.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        image_id, ref, created = parts[0], parts[1], parts[2]
+        if ref.startswith(PROTECTED_IMAGE_PREFIXES):
+            continue
+        try:
+            made = time.mktime(time.strptime(created[:19], "%Y-%m-%d %H:%M:%S"))
+        except ValueError:
+            continue
+        if made > cutoff:
+            continue
+        stale.append(image_id)
+    stale = sorted(set(stale))
+    if dry_run:
+        return {"images": len(stale)}
+    removed = 0
+    for start in range(0, len(stale), 40):
+        result = _run([docker, "image", "rm", *stale[start:start + 40]], timeout=1800)
+        removed += len([line for line in result.stdout.splitlines() if line.strip()])
+    return {"images": len(stale), "removed": removed}
 
 
 def prune_temp_leftovers(older_than_hours: int = 24, dry_run: bool = False) -> dict[str, Any]:

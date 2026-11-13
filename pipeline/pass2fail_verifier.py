@@ -385,8 +385,13 @@ class Differential:
         if getattr(self, "_root_helper_state", None) is not None:
             return self._root_helper_state or None
         name = f"{getattr(self, 'project', 'pass2fail')}-root-helper"
+        # Attribute the helper to this task so per-task cleanup can remove it
+        # after a verifier crash instead of leaving it running forever.
+        owner = (getattr(self, "task_dir", None) or getattr(self, "work", None)
+                 or getattr(self, "log_dir", ""))
         result = bounded_run([
             self.docker, "run", "-d", "--rm", "--name", name, "--network", "none",
+            "--label", f"com.docker.compose.project.working_dir={owner}",
             "--entrypoint", "sleep", "-v", f"{self.runner}:{self.runner}",
             self._helper_image(), "86400",
         ], timeout=180)
