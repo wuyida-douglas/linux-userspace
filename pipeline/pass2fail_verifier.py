@@ -672,10 +672,10 @@ sys.exit(result["returncode"])
             # daemon load it fails intermittently for the same image that
             # passed a moment earlier. Retry a couple of times before calling
             # the target unhealthy.
-            for _ in range(2):
+            for _ in range(4):
                 if not record["health"]["returncode"]:
                     break
-                time.sleep(5)
+                time.sleep(10)
                 if self.contract["branch"] == "FILE-POV":
                     record["health"] = self.compose(
                         project, "exec", "-T", "client", *self._health_argv(),
