@@ -132,10 +132,65 @@ def _remove_networks(docker: str, output: Path, dry_run: bool,
         return {"networks_error": snapshot["error"]}
     root = output.resolve()
     names = [name for name, working_dir in snapshot["networks"] if _under(working_dir, root)]
+    failed: list[str] = []
     if names and not dry_run:
-        for name in names:
-            _run([docker, "network", "rm", name], timeout=120)
-    return {"networks": len(names)}
+        # One call for the whole set: per-network calls cost a daemon round
+        # trip each and used to be silently dropped when a trial had just
+        # stopped its last container. Keep the failures in the report.
+        for start in range(0, len(names), 40):
+            batch = names[start:start + 40]
+            result = _run([docker, "network", "rm", *batch], timeout=300)
+            if result.returncode:
+                failed.extend(line.strip() for line in result.stderr.splitlines() if line.strip())
+    return {"networks": len(names), "networks_failed": failed[:20]}
+
+
+def prune_idle_networks(results_root: Path, min_age_hours: float = 2.0) -> dict[str, Any]:
+    """Remove Compose networks this batch left behind with no containers.
+
+    Trials that are killed or that fail to run ``down`` leave their project
+    networks attached to nothing. Docker keeps every network's subnet
+    reserved, so a long batch ends up with hundreds of dead networks; the
+    IPAM bulk inspect then walks all of them under a host-wide lock and every
+    Compose start queues behind it (measured: 892 networks -> 11s per start).
+    """
+    docker = docker_path()
+    if not docker:
+        return {"skipped": "docker not found"}
+    listed = _run([docker, "network", "ls", "-q"], timeout=60)
+    ids = [item for item in listed.stdout.splitlines() if item.strip()]
+    if not ids:
+        return {"networks": 0}
+    inspected = _run([docker, "network", "inspect", *ids, "--format",
+                      '{{.Name}}\t{{index .Labels "com.docker.compose.project.working_dir"}}\t'
+                      '{{len .Containers}}\t{{.Created}}'], timeout=600)
+    if inspected.returncode:
+        return {"error": inspected.stderr[-500:]}
+    root = results_root.resolve()
+    cutoff = time.time() - min_age_hours * 3600
+    dead = []
+    for line in inspected.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        name, working_dir, containers, created = parts[0], parts[1], parts[2], parts[3]
+        if name in ("bridge", "host", "none") or not working_dir or not _under(working_dir, root):
+            continue
+        if containers not in ("", "0"):
+            continue
+        try:
+            made = time.mktime(time.strptime(created[:19], "%Y-%m-%dT%H:%M:%S"))
+        except ValueError:
+            continue
+        if made > cutoff:
+            continue
+        dead.append(name)
+    removed = 0
+    for start in range(0, len(dead), 40):
+        batch = dead[start:start + 40]
+        result = _run([docker, "network", "rm", *batch], timeout=600)
+        removed += len([line for line in result.stdout.splitlines() if line.strip()])
+    return {"networks": len(dead), "removed": removed}
 
 
 def _remove_images(docker: str, refs: list[str], dry_run: bool) -> dict[str, Any]:
@@ -340,6 +395,9 @@ def main() -> int:
     parser.add_argument("--prune-cache", action="store_true",
                         help="also prune build cache older than --prune-until (run when idle)")
     parser.add_argument("--prune-until", default="1h")
+    parser.add_argument("--prune-networks", action="store_true",
+                        help="remove idle Compose networks under --results (safe while running)")
+    parser.add_argument("--network-min-age-hours", type=float, default=2.0)
     args = parser.parse_args()
     results = args.results.resolve()
     wanted = set(args.only or [])
@@ -373,6 +431,8 @@ def main() -> int:
         total["volumes"] = prune_unused_volumes(dry_run=args.dry_run)
     if args.prune_cache:
         total["build_cache"] = prune_build_cache(args.prune_until, dry_run=args.dry_run)
+    if args.prune_networks:
+        total["idle_networks"] = prune_idle_networks(results, args.network_min_age_hours)
     print(json.dumps(total, ensure_ascii=False))
     return 0
 

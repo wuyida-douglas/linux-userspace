@@ -289,11 +289,15 @@ def receipt_for(results: Path, wave: list[str], batch_number: int) -> Path:
     return path
 
 
-def _housekeeping_loop(stop, interval_sec: int = 3 * 3600) -> None:
+def _housekeeping_loop(stop, results_root: Path, interval_sec: int = 3 * 3600) -> None:
     """Periodic cleanup while the supervisor keeps the queue full.
 
-    Anonymous volumes and old pip/build unpack directories are reclaimed every
-    cycle; that costs nothing. Build cache is bounded too, because every task
+    Anonymous volumes, old pip/build unpack directories and dead Compose
+    networks are reclaimed every cycle. The network sweep matters most: a
+    leaked network keeps its subnet reserved, and the IPAM bulk inspect walks
+    every network under a host-wide lock on each Compose start (892 networks
+    once cost 11s per start, which queued every acceptance behind it).
+    Build cache is bounded too, because every task
     builds its own images once and the cache otherwise grows ~130GB/h until the
     disk is full. The cache prune holds the containerd content-store lock for
     minutes, so it runs only when the data disk drops below
@@ -302,7 +306,8 @@ def _housekeeping_loop(stop, interval_sec: int = 3 * 3600) -> None:
     i.e. layers no running task can still need.
     """
     from .resource_cleanup import (data_disk_free_gb, prune_build_cache,
-                                   prune_temp_leftovers, prune_unused_volumes)
+                                   prune_idle_networks, prune_temp_leftovers,
+                                   prune_unused_volumes)
     until = os.environ.get("PIPELINE_BUILD_CACHE_PRUNE_UNTIL", "6h")
     try:
         min_free = float(os.environ.get("PIPELINE_BUILD_CACHE_PRUNE_MIN_FREE_GB", "1500"))
@@ -312,6 +317,12 @@ def _housekeeping_loop(stop, interval_sec: int = 3 * 3600) -> None:
         try:
             prune_unused_volumes()
             prune_temp_leftovers(24)
+        except Exception:
+            pass
+        try:
+            # Dead Compose networks fragment docker's address pools and make
+            # every IPAM allocation walk them under a host-wide lock.
+            prune_idle_networks(results_root)
         except Exception:
             pass
         try:
@@ -348,7 +359,7 @@ def run_wave(args: argparse.Namespace, wave: list[str], number: int,
     log_path.parent.mkdir(parents=True, exist_ok=True)
     import threading
     stop = threading.Event()
-    housekeeping = threading.Thread(target=_housekeeping_loop, args=(stop,), daemon=True)
+    housekeeping = threading.Thread(target=_housekeeping_loop, args=(stop, args.results), daemon=True)
     housekeeping.start()
     with log_path.open("a", encoding="utf-8") as log:
         log.write(f"\n[{timestamp()}] wave {number}: {len(wave)} task(s)\n")

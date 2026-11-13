@@ -606,8 +606,8 @@ def main() -> int:
             except ValueError:
                 continue
     server = Server((args.host, args.port), make_handler(results, fresh, since))
-    print(f"progress dashboard: http://{args.host}:{args.port}/  "
-          f"(results={results})", flush=True)
+    print(f"progress dashboard: http://localhost:{args.port}/  "
+          f"(listening on {args.host}; results={results})", flush=True)
     server.serve_forever()
     return 0
 
