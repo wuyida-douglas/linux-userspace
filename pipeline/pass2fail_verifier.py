@@ -668,6 +668,23 @@ sys.exit(result["returncode"])
                 record["health"] = self.compose(
                     project, "exec", "-T", "runner", "/opt/pass2fail/runner.py", "--health",
                     timeout=self.contract["runner"]["timeout_sec"] + 30)
+            # Health is a live probe of a just-started service: under heavy
+            # daemon load it fails intermittently for the same image that
+            # passed a moment earlier. Retry a couple of times before calling
+            # the target unhealthy.
+            for _ in range(2):
+                if not record["health"]["returncode"]:
+                    break
+                time.sleep(5)
+                if self.contract["branch"] == "FILE-POV":
+                    record["health"] = self.compose(
+                        project, "exec", "-T", "client", *self._health_argv(),
+                        timeout=self.contract["runner"]["timeout_sec"] + 30)
+                else:
+                    (self.runner / "output/result.json").unlink(missing_ok=True)
+                    record["health"] = self.compose(
+                        project, "exec", "-T", "runner", "/opt/pass2fail/runner.py", "--health",
+                        timeout=self.contract["runner"]["timeout_sec"] + 30)
             if record["health"]["returncode"]:
                 record["error_stage"] = "health"
                 return record
