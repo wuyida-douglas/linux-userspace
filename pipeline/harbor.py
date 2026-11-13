@@ -858,8 +858,8 @@ def harbor_run(profile: Path, jobs: Path, name: str, timeout: int, *,
                max_turns: int | None = None,
                agent_version: str | None = None) -> dict[str, Any]:
     # The caller's --verify-timeout bounds the verifier, but Harbor also has
-    # to export/load images, run the reference agent and drive two Compose
-    # phases per attempt. Under a loaded Docker daemon a single attempt can
+    # to export/load images, run the reference agent and drive one Compose
+    # verification per attempt. Under a loaded Docker daemon a single attempt can
     # legitimately take 20+ minutes, and a 30-minute wall clock then kills
     # otherwise healthy acceptances. Keep a floor so the outer process
     # timeout never becomes the reason a verified task is discarded.
@@ -1187,6 +1187,15 @@ def accept(workspace: Path, output: Path, task_id: str, route: dict[str, Any],
     # Load a frozen runtime, not a mutable tag that a previous Harbor cleanup
     # may have removed. Task and verifier use the same archive throughout.
     cached_runtime = output.parent.parent / "shared-runtime"
+    if not cached_runtime.is_dir() and published_root is not None:
+        # Re-saving a frozen runtime image yields an equivalent archive with a
+        # different digest (docker save output depends on the image store's
+        # state), and publishing then refuses to mix it with the copy every
+        # earlier task shipped. Seed the batch cache from the published
+        # archives so every task carries byte-identical shared images.
+        published_shared = published_root / "shared-images"
+        if published_shared.is_dir():
+            shutil.copytree(published_shared, cached_runtime)
     if cached_runtime.is_dir() and not (output / "bundle/shared-images").exists():
         shutil.copytree(cached_runtime, output / "bundle/shared-images")
         load_archives(output / "bundle/shared-images")
@@ -1233,10 +1242,11 @@ def accept(workspace: Path, output: Path, task_id: str, route: dict[str, Any],
             {"type": "bind", "source": str(reference_dir),
              "target": "/opt/reference", "read_only": True},
         ]
-        # Start from the sealed writable binds. The first Agent run may
-        # write through a bind; restore the seal before the second run, then
-        # require the same Pass2Fail on the restored package. This tests that
-        # the bind design can recover from a dirty run, not that dirt is safe.
+        # Acceptance runs the same verifier twice. Each run performs one
+        # differential; the repetition belongs here, not inside the verifier.
+        # The first Agent run may write through a bind; restore the seal before
+        # the second run, then require the same Pass2Fail on the restored
+        # package. This tests bind recovery, not that dirt is safe.
         extract_pristine_binds(accept_profile, accept_profile / "environment")
         for attempt in (1, 2):
             if attempt == 2:
