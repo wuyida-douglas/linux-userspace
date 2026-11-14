@@ -28,6 +28,7 @@ import argparse
 import json
 import os
 import shutil
+import stat
 import time
 import subprocess
 import sys
@@ -52,6 +53,43 @@ def docker_path() -> str | None:
 
 def _run(argv: list[str], timeout: int = DOCKER_TIMEOUT) -> subprocess.CompletedProcess:
     return subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=timeout)
+
+
+# The device node is host-wide. A task container that runs as root with the
+# host /dev mounted (agents do this while probing) occasionally leaves it at
+# 0644, and every non-root writer then fails with EACCES: Harbor's
+# subprocess.Popen dies on os.open('/dev/null'), and eight acceptances were
+# lost in four minutes before anyone noticed. Only the mode is restored, and
+# only when it is wrong.
+DEV_NULL = "/dev/null"
+DEV_NULL_MODE = 0o666
+_REPAIR_IMAGES = ("linux-userspace-nullfix:latest", "redis:7-alpine",
+                  "caddy:2-alpine", "python:3.11-alpine")
+
+
+def ensure_dev_null_writable() -> dict[str, Any]:
+    """Restore /dev/null's 0666 mode when a task has flipped it."""
+    try:
+        current = os.stat(DEV_NULL).st_mode
+    except OSError as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    if stat.S_IMODE(current) & DEV_NULL_MODE == DEV_NULL_MODE:
+        return {"mode": oct(stat.S_IMODE(current))}
+    docker = docker_path()
+    if not docker:
+        return {"skipped": "docker not found", "mode": oct(stat.S_IMODE(current))}
+    for image in _REPAIR_IMAGES:
+        if _run([docker, "image", "inspect", image], timeout=60).returncode:
+            continue
+        result = _run([docker, "run", "--rm", "--network", "none", "--user", "0:0",
+                       "-v", f"{DEV_NULL}:/host-dev-null", image,
+                       "chmod", f"{DEV_NULL_MODE:o}", "/host-dev-null"], timeout=120)
+        try:
+            repaired = oct(stat.S_IMODE(os.stat(DEV_NULL).st_mode))
+        except OSError:
+            repaired = "?"
+        return {"mode": repaired, "image": image, "returncode": result.returncode}
+    return {"skipped": "no repair image available", "mode": oct(stat.S_IMODE(current))}
 
 
 def _task_images(output: Path) -> list[str]:

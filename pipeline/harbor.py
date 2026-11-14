@@ -20,6 +20,7 @@ from .common import export_task_id, sha256 as digest_file
 from .common import timestamp, write_json
 from .pristine_binds import create_pristine_binds_tar, extract_pristine_binds
 from .docker_cli import docker_argv
+from .resource_cleanup import ensure_dev_null_writable
 from .runtime_images import AGENT_IMAGE
 from .task_contract import load_task, validate_route
 
@@ -871,6 +872,13 @@ def harbor_run(profile: Path, jobs: Path, name: str, timeout: int, *,
     # otherwise healthy acceptances. Keep a floor so the outer process
     # timeout never becomes the reason a verified task is discarded.
     timeout = max(int(timeout), 5400)
+    # Harbor opens /dev/null for every subprocess it starts. A task container
+    # that ran as root with the host /dev mounted can leave the device at 0644,
+    # and the acceptance then dies with PermissionError before grading.
+    try:
+        ensure_dev_null_writable()
+    except Exception:
+        pass
     # Run each Harbor invocation in a separate process so module-level and
     # host-side subprocess state from a previous trial cannot leak into this
     # one. The verifier class itself is generic and identical for every task.

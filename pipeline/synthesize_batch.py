@@ -305,10 +305,11 @@ def _housekeeping_loop(stop, results_root: Path, interval_sec: int = 30 * 60) ->
     entries idle longer than ``PIPELINE_BUILD_CACHE_PRUNE_UNTIL`` (default 6h),
     i.e. layers no running task can still need.
     """
-    from .resource_cleanup import (data_disk_free_gb, prune_build_cache,
-                                   prune_idle_networks, prune_idle_volumes,
-                                   prune_probe_containers, prune_stale_images,
-                                   prune_temp_leftovers, prune_unused_volumes)
+    from .resource_cleanup import (data_disk_free_gb, ensure_dev_null_writable,
+                                   prune_build_cache, prune_idle_networks,
+                                   prune_idle_volumes, prune_probe_containers,
+                                   prune_stale_images, prune_temp_leftovers,
+                                   prune_unused_volumes)
     until = os.environ.get("PIPELINE_BUILD_CACHE_PRUNE_UNTIL", "6h")
     try:
         min_free = float(os.environ.get("PIPELINE_BUILD_CACHE_PRUNE_MIN_FREE_GB", "1500"))
@@ -322,6 +323,9 @@ def _housekeeping_loop(stop, results_root: Path, interval_sec: int = 30 * 60) ->
     while not stop.wait(delay):
         delay = interval_sec
         try:
+            # A task container can flip /dev/null to 0644; every subprocess
+            # spawn in the workers then fails, so repair it on sight.
+            ensure_dev_null_writable()
             prune_unused_volumes()
             prune_temp_leftovers(24)
         except Exception:
