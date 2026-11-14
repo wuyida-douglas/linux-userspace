@@ -1683,8 +1683,17 @@ def main() -> int:
                 retry_reason = "review_incomplete"
             if (record.get("status") == "routing" and not route_file.is_file()
                     and not worker_alive(child.get("pid"))):
-                # A nonterminal route has no accept/reject verdict to retry.
-                # Regardless of a stale migration marker, it remains work.
+                # A nonterminal route has no accept/reject verdict: the worker
+                # was interrupted before the route decided anything. Park it
+                # only after one relaunch, otherwise a supervisor restart
+                # silently abandons every task that was mid-route (162 of 500
+                # in batch-02 part-000). A second death inside the same chunk
+                # is still parked so a genuinely broken task cannot spin.
+                if child.get("route_restart_count", 0) < 1:
+                    children[task].update(route_restart_count=1, retry_reason=None)
+                    completed.discard(task)
+                    candidates.append(task)
+                    continue
                 children[task].update(retry_reason="manual_recovery_required")
                 completed.add(task)
                 continue
