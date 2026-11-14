@@ -192,6 +192,25 @@ class Differential:
             env={**COMPOSE_ENV, "PIPELINE_IPAM_ROLE": "harbor",
                  "PIPELINE_IPAM_WORK_DIR": str(self.log_dir / "ipam")})
 
+    def _health_budget(self) -> float:
+        """Seconds to keep probing a target before calling it unhealthy.
+
+        The contract's own budget describes an idle machine. With 140 tasks
+        compiling Rust on 255 cores, services legitimately take longer than
+        that to answer, and a startup that is merely slow must not be graded
+        as an infrastructure failure: 16 of 17 verifier errors in one twenty
+        minute window were health timeouts under such load.
+        """
+        try:
+            declared = float(self.contract["runner"]["health_timeout_sec"])
+        except (KeyError, TypeError, ValueError):
+            declared = 300.0
+        try:
+            grace = float(os.environ.get("PIPELINE_HEALTH_GRACE_SEC", "300"))
+        except ValueError:
+            grace = 300.0
+        return declared + max(0.0, grace)
+
     def _probe_detail(self) -> dict[str, Any]:
         """Snapshot the runner's own result file after a failed health probe.
 
@@ -716,7 +735,7 @@ sys.exit(result["returncode"])
                 # Keep probing until the runner's own health budget is spent:
                 # services such as Jenkins need a minute or two after the Compose
                 # healthcheck already reports healthy.
-                health_deadline = time.monotonic() + self.contract["runner"]["health_timeout_sec"]
+                health_deadline = time.monotonic() + self._health_budget()
                 while record["health"]["returncode"] and time.monotonic() < health_deadline:
                     time.sleep(10)
                     if self.contract["branch"] == "FILE-POV":
@@ -760,7 +779,7 @@ sys.exit(result["returncode"])
                 # The patched service was just restarted; under load it can
                 # answer late exactly like a fresh target, so retry within the
                 # same health budget instead of failing the trial.
-                patched_deadline = time.monotonic() + self.contract["runner"]["health_timeout_sec"]
+                patched_deadline = time.monotonic() + self._health_budget()
                 while record["patched_health"]["returncode"] and time.monotonic() < patched_deadline:
                     time.sleep(10)
                     record["patched_health"] = self.compose(
