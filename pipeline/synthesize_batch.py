@@ -387,6 +387,22 @@ def run_wave(args: argparse.Namespace, wave: list[str], number: int,
     return 0
 
 
+def with_downloaded_input(sample: Path, tasks: list[str]) -> tuple[list[str], list[str]]:
+    """Split tasks into those whose input was downloaded and the rest.
+
+    A task without ``tasks/<id>/input/manifest.json`` never got its source
+    snapshot; running it can only fail at the input step, so skip it instead.
+    """
+    tasks_root = sample / "tasks"
+    if not tasks_root.is_dir():
+        return list(tasks), []
+    ready, missing = [], []
+    for task in tasks:
+        (ready if (tasks_root / task / "input/manifest.json").is_file()
+         else missing).append(task)
+    return ready, missing
+
+
 def run_round(args: argparse.Namespace, tasks: list[str], label: str,
               batch_number: int, published_root: Path | None) -> None:
     if not tasks:
@@ -530,6 +546,13 @@ def main() -> int:
         mode_label = "all"
     if not target:
         raise SystemExit("no tasks selected")
+    target, missing_input = with_downloaded_input(args.sample, target)
+    if missing_input:
+        print(f"skipping {len(missing_input)} task(s) without downloaded input: "
+              f"{' '.join(missing_input[:5])}{' ...' if len(missing_input) > 5 else ''}",
+              flush=True)
+    if not target:
+        raise SystemExit("no task has downloaded input")
     if args.published_root is None:
         from .run import reported_published_root
         args.published_root = reported_published_root()

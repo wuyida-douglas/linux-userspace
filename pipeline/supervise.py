@@ -1305,22 +1305,13 @@ def main() -> int:
             if child.get("terminal_observation_only"):
                 completed.add(task)
                 continue
-            download_error = next((entry for entry in
-                                   load(args.sample / "download-report.json", {}).get("tasks", [])
-                                   if entry.get("task_id") == task and entry.get("status") == "error"), None)
-            if (download_error is not None
-                    and not (args.sample / "tasks" / task / "input/manifest.json").is_file()
+            sample_tasks = args.sample / "tasks"
+            if (sample_tasks.is_dir()
+                    and not (sample_tasks / task / "input").is_dir()
                     and not (args.results / task / "workspace/delivery").is_dir()
                     and not worker_alive(child.get("pid"))):
-                missing = load(args.results / task / "result.json", {})
-                if missing.get("failure_class") != "input_unavailable":
-                    download = download_error
-                    atomic_json(args.results / task / "result.json", {
-                        "task_id": task, "instance_id": row["instance_id"],
-                        "status": "error", "failure_class": "input_unavailable",
-                        "error": download.get("error", "input manifest is missing"),
-                        "finished_at": timestamp()})
-                children.setdefault(task, {})["final_status"] = "error"
+                # The sample never downloaded this task's input. Skip it; it is
+                # not a pipeline failure and must not produce a result record.
                 completed.add(task)
                 continue
             synthesis = load(args.results / task / "synthesis/result.json", {})
