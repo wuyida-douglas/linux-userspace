@@ -209,6 +209,19 @@ class Differential:
             record["output"] = str(record["output"])[-2000:]
         return record
 
+    def _target_state(self, project: str) -> dict[str, Any]:
+        """Capture the target container state when it refuses a health probe.
+
+        The probe result alone says "connection refused"; the container's own
+        status and log tail say whether the service never started, crashed, or
+        is up but unreachable from the runner.
+        """
+        return {
+            "ps": self.compose(project, "ps", "-a", timeout=60),
+            "logs": self.compose(project, "logs", "--no-color", "--tail", "40",
+                                 "client", timeout=120),
+        }
+
     def upload_private(self, project: str) -> dict[str, Any]:
         """Install root-owned target-only material in the private control copy.
 
@@ -717,6 +730,7 @@ sys.exit(result["returncode"])
                             timeout=self.contract["runner"]["timeout_sec"] + 30)
                 if record["health"]["returncode"]:
                     record["health_detail"] = self._probe_detail()
+                    record["target_state"] = self._target_state(project)
                     record["error_stage"] = "health"
                     return record
             if name == "fixed":
@@ -754,6 +768,7 @@ sys.exit(result["returncode"])
                         timeout=self.contract["runner"]["timeout_sec"] + 30)
                 if record["patched_health"]["returncode"]:
                     record["patched_health_detail"] = self._probe_detail()
+                    record["target_state"] = self._target_state(project)
                     record["error_stage"] = "patched_health"
                     return record
             if self.contract["branch"] == "FILE-POV":
