@@ -338,7 +338,11 @@ def _housekeeping_loop(stop, results_root: Path, interval_sec: int = 30 * 60) ->
             # /tmp that per-task cleanup cannot attribute.
             prune_idle_volumes(results_root)
             prune_stale_images(float(os.environ.get("PIPELINE_IMAGE_GC_HOURS", "12")))
-            prune_probe_containers(results_root)
+            # Liveness now comes from the worker argv, so an old probe of a
+            # finished task is collected after two hours instead of waiting
+            # for the batch-end sweep. Hundreds of them otherwise keep running
+            # (and holding memory) for the whole batch.
+            prune_probe_containers(results_root, min_age_hours=2.0)
         except Exception:
             pass
         try:

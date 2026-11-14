@@ -372,6 +372,36 @@ def fix_workspace_ownership(workspace: Path, images: list[str] | None = None) ->
             "output": (result.stdout + result.stderr)[-500:]}
 
 
+def _live_task_ids() -> set[str]:
+    """Return the task ids a ``pipeline.run --only`` worker currently owns.
+
+    A finished task keeps its result directory forever, so "the directory
+    exists" cannot mean "the task is live": agent probe containers labelled
+    with a completed task were therefore never pruned. The worker argv is the
+    only authoritative liveness signal here.
+    """
+    live: set[str] = set()
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        return live
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            args = (entry / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        text = b" ".join(args).decode(errors="replace")
+        if "pipeline.run" not in text:
+            continue
+        decoded = [part.decode(errors="replace") for part in args]
+        for index, part in enumerate(decoded):
+            if part == "--only" and index + 1 < len(decoded):
+                live.add(decoded[index + 1])
+    return live
+
+
 def prune_probe_containers(results_root: Path, min_age_hours: float = 4.0,
                            dry_run: bool = False) -> dict[str, Any]:
     """Remove agent probe stacks that per-task cleanup can never attribute.
@@ -392,16 +422,25 @@ def prune_probe_containers(results_root: Path, min_age_hours: float = 4.0,
         return {"error": listed.stderr[-500:]}
     root = results_root.resolve()
     cutoff = time.time() - min_age_hours * 3600
+    live = _live_task_ids()
     dead = []
     for line in listed.stdout.splitlines():
         parts = line.split("\t")
         if len(parts) < 4:
             continue
         container, working_dir, label, created = parts[0], parts[1], parts[2], parts[3]
+        if label and label in live:
+            continue
         if working_dir and _under(working_dir, root):
-            continue
-        if label and (root / label).is_dir():
-            continue
+            # The probe belongs to a task nobody owns any more; its result
+            # directory alone is not evidence of a running worker.
+            try:
+                relative = Path(working_dir).resolve().relative_to(root)
+                owner = relative.parts[0] if relative.parts else ""
+            except (OSError, ValueError):
+                owner = ""
+            if not owner or owner in live:
+                continue
         try:
             made = time.mktime(time.strptime(created[:19], "%Y-%m-%d %H:%M:%S"))
         except ValueError:
