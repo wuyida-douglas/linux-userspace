@@ -7,6 +7,7 @@ This module is copied into each self-contained verifier beside its Docker CLI.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import ipaddress
 import json
 import os
@@ -19,9 +20,12 @@ from typing import Any
 
 import yaml
 
+# Pools must be disjoint per docker daemon: two daemons on one host cannot
+# hand out the same subnet. A sharded batch sets these two variables per
+# coordinator (see scripts/start_dual.sh).
 POOLS = {
-    "factory": ipaddress.ip_network("10.80.0.0/12"),
-    "harbor": ipaddress.ip_network("10.112.0.0/12"),
+    "factory": ipaddress.ip_network(os.environ.get("PIPELINE_IPAM_FACTORY_POOL", "10.80.0.0/12")),
+    "harbor": ipaddress.ip_network(os.environ.get("PIPELINE_IPAM_HARBOR_POOL", "10.112.0.0/12")),
 }
 LEASE_GRACE_SEC = 24 * 3600
 LEASE_STALE_SEC = int(os.environ.get("PIPELINE_IPAM_STALE_SEC", "3600"))
@@ -30,7 +34,12 @@ LEASE_MISSING_GRACE_SEC = int(os.environ.get("PIPELINE_IPAM_MISSING_GRACE_SEC", 
 
 def state_dir() -> Path:
     configured = os.environ.get("PIPELINE_IPAM_STATE", "").strip()
-    path = Path(configured) if configured else Path(f"/tmp/linux-userspace-ipam-{os.getuid()}")
+    if configured:
+        path = Path(configured)
+    else:
+        daemon = os.environ.get("DOCKER_HOST", "").strip()
+        tag = "" if not daemon else "-" + hashlib.sha256(daemon.encode()).hexdigest()[:8]
+        path = Path(f"/tmp/linux-userspace-ipam-{os.getuid()}{tag}")
     path.mkdir(parents=True, exist_ok=True)
     return path
 

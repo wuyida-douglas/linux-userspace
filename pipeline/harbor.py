@@ -20,7 +20,7 @@ from .common import export_task_id, sha256 as digest_file
 from .common import timestamp, write_json
 from .pristine_binds import create_pristine_binds_tar, extract_pristine_binds
 from .docker_cli import docker_argv
-from .runtime_images import AGENT_IMAGE, VERIFIER_IMAGE
+from .runtime_images import AGENT_IMAGE
 from .task_contract import load_task, validate_route
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -44,11 +44,11 @@ visibility_mode = "separate-private-verifier"
 
 [verifier]
 topology = "compose_public"
+# Separate mode with no [verifier.environment]: Harbor starts the verifier
+# environment from [environment].docker_image, i.e. the shared agent image.
+# Our verifier executes in the Harbor host process, so a second image buys
+# nothing.
 environment_mode = "separate"
-
-[verifier.environment]
-docker_image = "{verifier_image}"
-network_mode = "public"
 
 [environment]
 docker_image = "{agent_image}"
@@ -632,7 +632,6 @@ def export(delivery: Path, destination: Path, task_id: str, route: dict[str, Any
         # Runtime preparation is explicit (pipeline.runtime_images). Export
         # never builds a replacement for an image that was already reviewed.
         inspect_image(AGENT_IMAGE)
-        inspect_image(VERIFIER_IMAGE)
     validate_route(contract, route, agent_image)
     public = read_public_compose(delivery, contract)
     profile = destination / "harbor-runtime-profile"
@@ -641,8 +640,8 @@ def export(delivery: Path, destination: Path, task_id: str, route: dict[str, Any
     (profile / "task.toml").write_text(TASK_TOML.format(
         submission=contract["submission_mode"], task_id=task_id,
         branch=contract["branch"], host_type=contract.get("host_type") or "none",
-        interaction=contract["interaction"], agent_image=agent_image,
-        verifier_image=VERIFIER_IMAGE), encoding="utf-8")
+        interaction=contract["interaction"], agent_image=agent_image),
+        encoding="utf-8")
     copy_environment(delivery, profile, public, contract)
     create_pristine_binds_tar(profile)
     target = target_contract(public, contract)
@@ -708,9 +707,7 @@ def export(delivery: Path, destination: Path, task_id: str, route: dict[str, Any
         bundle_root.mkdir(parents=True, exist_ok=True)
         runtime = bundle_root / "shared-images"
         runtime.mkdir(exist_ok=True)
-        runtime_images = ((VERIFIER_IMAGE, "verifier.tar.gz"),)
-        if agent_image == AGENT_IMAGE:
-            runtime_images = ((agent_image, "agent.tar.gz"),) + runtime_images
+        runtime_images = ((agent_image, "agent.tar.gz"),) if agent_image == AGENT_IMAGE else ()
         for image, name in runtime_images:
             archive = runtime / name
             if archive.exists():
@@ -731,7 +728,7 @@ def export(delivery: Path, destination: Path, task_id: str, route: dict[str, Any
     by_image = {item["image"]: item for item in archives}
     shared_records: dict[str, dict[str, Any]] = {}
     if bundle_root is not None:
-        for name in ("agent", "verifier"):
+        for name in ("agent",):
             manifest = runtime / f"{name}.tar.manifest.json"
             if manifest.is_file():
                 shared_records[name] = json.loads(
@@ -779,9 +776,6 @@ def export(delivery: Path, destination: Path, task_id: str, route: dict[str, Any
     if runner_image and runner_image not in {agent_image, target_image} and runner_image in by_image:
         record = by_image[runner_image]
         lock.append(lock_entry("runner", runner_image, "images/" + record["file"], record))
-    lock.append(lock_entry("verifier", VERIFIER_IMAGE,
-                           "../shared-images/verifier.tar.gz",
-                           shared_records.get("verifier")))
     write_json(destination / "image-lock.json", {
         "schema_version": 1, "task": task_id, "images": lock})
 
