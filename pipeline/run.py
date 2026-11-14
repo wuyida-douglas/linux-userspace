@@ -18,6 +18,7 @@ from typing import Any
 
 from . import agent
 from .common import ROOT, inventory, load_env, read_jsonl, timestamp, write_json
+from .resource_cleanup import fix_workspace_ownership
 from .contract_build import build_task_contract
 from .package_volumes import package_delivery_volumes
 from .prompts import REVIEW, ROUTE, branch_prompt
@@ -34,6 +35,14 @@ def load_json(path: Path) -> dict[str, Any]:
 BRANCHES = {"SVC-EXPLOIT", "FILE-EXPLOIT", "FILE-POV"}
 HOST_TYPES = {"native_service", "real_host", "synthetic_host"}
 DOCKER = threading.Lock()
+
+
+
+def _workspace_images(workspace: Path) -> list[str]:
+    """Image refs this task built, for the workspace-chown helper container."""
+    value = load_json(workspace / "delivery/task.json")
+    images = value.get("images") if isinstance(value, dict) else None
+    return [ref for ref in (images or {}).values() if isinstance(ref, str) and ref]
 
 
 def review(workspace: Path) -> dict[str, Any]:
@@ -385,6 +394,9 @@ def run_one(task: Path, selection: dict[str, Any], results: Path, args: argparse
         if record["synthesis_agent"].get("status") != "completed":
             record.update(status="failed", failure_class="synthesis_incomplete")
             return record
+        # Agents mount the workspace into root containers; a root-owned build
+        # artefact makes every later read fail with EACCES.
+        fix_workspace_ownership(workspace, _workspace_images(workspace))
         failure_path = workspace / "failure.json"
         if not failure_path.is_file():
             # Historical agents sometimes wrote the bounded failure record
@@ -451,6 +463,7 @@ def run_one(task: Path, selection: dict[str, Any], results: Path, args: argparse
             record.update(status="failed", failure_class="review_rejected")
             return record
         record["status"] = "harbor"
+        fix_workspace_ownership(workspace, _workspace_images(workspace))
         approved = frozen_inventory(delivery)
         write_json(output / "result.json", record)
         with DOCKER:

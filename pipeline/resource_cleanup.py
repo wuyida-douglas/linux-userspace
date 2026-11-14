@@ -342,6 +342,36 @@ def prune_build_cache(until: str = "1h", dry_run: bool = False) -> dict[str, Any
             "output": (result.stdout + result.stderr)[-2000:]}
 
 
+def fix_workspace_ownership(workspace: Path, images: list[str] | None = None) -> dict[str, Any]:
+    """Return host-written workspace files to the worker uid.
+
+    Synthesis agents mount the workspace into containers they run as root, so
+    build artefacts such as ``bits.Plo`` end up owned by root and every later
+    pipeline read fails with EACCES. A throwaway root container (no host sudo)
+    chowns the tree back before review, export and cleanup touch it.
+    """
+    docker = docker_path()
+    if not docker:
+        return {"skipped": "docker not found"}
+    if not workspace.is_dir():
+        return {"skipped": "workspace missing"}
+    uid, gid = os.getuid(), os.getgid()
+    candidates = list(images or []) + ["linux-userspace-agent:22.04", "busybox", "alpine"]
+    image = ""
+    for candidate in candidates:
+        result = _run([docker, "image", "inspect", candidate], timeout=60)
+        if result.returncode == 0:
+            image = candidate
+            break
+    if not image:
+        return {"skipped": "no image available for chown"}
+    result = _run([docker, "run", "--rm", "--network", "none",
+                   "-v", f"{workspace}:/w", image,
+                   "chown", "-R", f"{uid}:{gid}", "/w"], timeout=900)
+    return {"image": image, "returncode": result.returncode,
+            "output": (result.stdout + result.stderr)[-500:]}
+
+
 def prune_probe_containers(results_root: Path, min_age_hours: float = 4.0,
                            dry_run: bool = False) -> dict[str, Any]:
     """Remove agent probe stacks that per-task cleanup can never attribute.
