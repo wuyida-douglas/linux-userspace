@@ -29,8 +29,12 @@ cd "$REPO"
 [ -f "$TASKS_FILE" ] || { echo "tasks file missing: $TASKS_FILE" >&2; exit 1; }
 SPLIT_DIR="$RESULTS/chunks"
 mkdir -p "$SPLIT_DIR"
-rm -f "$SPLIT_DIR"/part-*
-split -d -a 3 -l "$CHUNK" "$TASKS_FILE" "$SPLIT_DIR/part-"
+# Splitting is destructive for a recovery run: a restart after a crash must
+# keep the part files (and any interrupted tasks appended to them) instead of
+# rebuilding them from the task file.
+if [ -z "$(ls -A "$SPLIT_DIR" 2>/dev/null)" ]; then
+  split -d -a 3 -l "$CHUNK" "$TASKS_FILE" "$SPLIT_DIR/part-"
+fi
 echo "chunks: $(ls "$SPLIT_DIR"/part-* | wc -l) x <=$CHUNK tasks"
 
 wait_for_coordinators() {
@@ -38,8 +42,16 @@ wait_for_coordinators() {
   local pa="pipeline[.]synthesize_batch .*--results ([^ ]*/)?$RESULTS-a( |$)"
   local pb="pipeline[.]synthesize_batch .*--results ([^ ]*/)?$RESULTS-b( |$)"
   local waited=0
+  # Never redirect pgrep to /dev/null: when a task container leaves /dev/null
+  # at 0644 the redirection itself fails, pgrep never runs, and the whole chunk
+  # is declared finished while 145 workers are still running. That started a
+  # full sweep over a live batch on 2026-11-14. Command substitution cannot
+  # fail that way.
+  alive() {
+    [ -n "$(pgrep -f "$1" 2>&1 || true)" ]
+  }
   # They are backgrounded by start_dual.sh; wait until both have exec'd.
-  while ! { pgrep -f "$pa" >/dev/null && pgrep -f "$pb" >/dev/null; }; do
+  while ! { alive "$pa" && alive "$pb"; }; do
     waited=$((waited + 2))
     if [ "$waited" -ge 180 ]; then
       echo "coordinators did not appear within 180s" >&2
@@ -47,8 +59,22 @@ wait_for_coordinators() {
     fi
     sleep 2
   done
-  while pgrep -f "$pa" >/dev/null || pgrep -f "$pb" >/dev/null; do
+  while alive "$pa" || alive "$pb"; do
     sleep 60
+  done
+  # A supervisor can exit while its workers still run. A sweep at that moment
+  # deletes their containers and images, so wait for the workers too.
+  local worker_pa="pipeline[.]run .*--results ([^ ]*/)?$RESULTS-a( |$)"
+  local worker_pb="pipeline[.]run .*--results ([^ ]*/)?$RESULTS-b( |$)"
+  local guard=0
+  while alive "$worker_pa" || alive "$worker_pb"; do
+    guard=$((guard + 1))
+    if [ "$guard" -ge 20 ]; then
+      echo "[$round] workers still running after 10 minutes" >&2
+      return 2
+    fi
+    echo "[$round] waiting for live workers before the sweep"
+    sleep 30
   done
 }
 
