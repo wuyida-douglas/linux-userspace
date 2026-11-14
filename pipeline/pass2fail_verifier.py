@@ -412,8 +412,12 @@ class Differential:
             archive = archives / f"{len(list(archives.iterdir())):03d}"
             os.rename(previous, archive)
         (self.runner / "run").mkdir(mode=0o755)
-        # Host preparation is outside the container's capability boundary.
-        self._root_chown([self.runner / "run", self.runner / "output"], uid, gid)
+        # Recursive on purpose: the previous phase's evidence file was chowned
+        # back to the host uid by _restore_runner_mounts, and a stale
+        # output/result.json owned by the host made the runner uid fail its
+        # next write with EACCES (the leading cause of patched_health errors).
+        self._root_chown([self.runner / "run", self.runner / "output"], uid, gid,
+                         recursive=True)
 
     def _restore_runner_mounts(self) -> None:
         """Restore host evidence ownership before any cleanup or later phase."""
