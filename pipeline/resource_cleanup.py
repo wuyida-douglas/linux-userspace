@@ -342,6 +342,51 @@ def prune_build_cache(until: str = "1h", dry_run: bool = False) -> dict[str, Any
             "output": (result.stdout + result.stderr)[-2000:]}
 
 
+def prune_probe_containers(results_root: Path, min_age_hours: float = 4.0,
+                           dry_run: bool = False) -> dict[str, Any]:
+    """Remove agent probe stacks that per-task cleanup can never attribute.
+
+    Agents test with ``docker compose`` under ``/tmp`` or ``docker run`` with a
+    made-up ``pipeline.task`` label; those containers match neither a task
+    directory nor a real task id, so they live until the batch ends. Only
+    containers older than the cutoff are touched, and never one whose compose
+    working directory is under the batch results root (a live task).
+    """
+    docker = docker_path()
+    if not docker:
+        return {"skipped": "docker not found"}
+    listed = _run([docker, "ps", "-a", "--format",
+                   '{{.ID}}\t{{.Label "com.docker.compose.project.working_dir"}}\t'
+                   '{{.Label "pipeline.task"}}\t{{.CreatedAt}}'], timeout=120)
+    if listed.returncode:
+        return {"error": listed.stderr[-500:]}
+    root = results_root.resolve()
+    cutoff = time.time() - min_age_hours * 3600
+    dead = []
+    for line in listed.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        container, working_dir, label, created = parts[0], parts[1], parts[2], parts[3]
+        if working_dir and _under(working_dir, root):
+            continue
+        if label and (root / label).is_dir():
+            continue
+        try:
+            made = time.mktime(time.strptime(created[:19], "%Y-%m-%d %H:%M:%S"))
+        except ValueError:
+            continue
+        if made <= cutoff:
+            dead.append(container)
+    if dry_run or not dead:
+        return {"containers": len(dead)}
+    removed = 0
+    for start in range(0, len(dead), 40):
+        result = _run([docker, "rm", "--force", *dead[start:start + 40]], timeout=600)
+        removed += len([line for line in result.stdout.splitlines() if line.strip()])
+    return {"containers": len(dead), "removed": removed}
+
+
 def prune_all_containers(dry_run: bool = False) -> dict[str, Any]:
     """Remove every container once the batch has no live worker.
 
