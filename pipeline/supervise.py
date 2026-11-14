@@ -1848,7 +1848,7 @@ def main() -> int:
             resume_harbor = child_state.get("retry_reason") in {
                 "harbor_infrastructure", "review_infrastructure", "carry_harbor"}
             carry_plan = load(args.results / task / "carry-recovery.json", {}) \
-                if child_state.get("retry_reason", "").startswith("carry_") else {}
+                if str(child_state.get("retry_reason") or "").startswith("carry_") else {}
             worker_results = (args.retry_results if child_state.get("retry_reason") == "bounded_recovery"
                               and args.retry_results is not None else args.results)
             if task in shared_recovery_tasks:
