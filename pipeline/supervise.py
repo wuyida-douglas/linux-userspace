@@ -117,6 +117,13 @@ def claim_task(task: str, owner: str) -> bool:
             return True
         except FileExistsError:
             data = load(path, {})
+            # A "done" marker records this owner for auditing, but the task
+            # belongs to the peer that already finished it. Without this check
+            # the marker reads as a live claim by the same owner and the task
+            # is relaunched: daemon A re-ran 70 tasks daemon B had already
+            # accepted, including ones already published.
+            if isinstance(data, dict) and data.get("done") is True:
+                return False
             if isinstance(data, dict) and data.get("owner") == owner:
                 return True
             if isinstance(data, dict) and _supervise_alive(data.get("pid")):
