@@ -619,15 +619,25 @@ def main() -> int:
         # live worker the cache is dead weight, and this is the only window
         # where pruning cannot collide with an acceptance on the daemon.
         if not args.no_prune_cache:
-            from .resource_cleanup import (prune_build_cache, prune_temp_leftovers,
+            from .resource_cleanup import (prune_all_containers, prune_build_cache,
+                                           prune_stale_images, prune_temp_leftovers,
                                            prune_unused_volumes)
+            # Agents leave probe containers and probe images under arbitrary
+            # names that per-task cleanup cannot attribute; with no worker left
+            # nothing references them, so clear them here.
+            containers = prune_all_containers()
+            images = prune_stale_images(0)
             pruned = prune_build_cache("1h")
             volumes = prune_unused_volumes()
             temp = prune_temp_leftovers(24)
+            summary["container_prune"] = containers
+            summary["image_prune"] = images
             summary["build_cache_prune"] = pruned
             summary["volume_prune"] = volumes
             summary["temp_prune"] = temp
             write_json(args.results / "synthesis-summary.json", summary)
+            print(f"containers pruned: {containers.get('removed', 0)}", flush=True)
+            print(f"images pruned: {images.get('removed', 0)}", flush=True)
             print(f"build cache pruned: {pruned.get('returncode', pruned)}", flush=True)
             print(f"volumes pruned: {volumes.get('returncode', volumes)}", flush=True)
             print(f"temp leftovers removed: {len(temp.get('removed', []))}", flush=True)

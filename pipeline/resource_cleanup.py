@@ -342,6 +342,27 @@ def prune_build_cache(until: str = "1h", dry_run: bool = False) -> dict[str, Any
             "output": (result.stdout + result.stderr)[-2000:]}
 
 
+def prune_all_containers(dry_run: bool = False) -> dict[str, Any]:
+    """Remove every container once the batch has no live worker.
+
+    Synthesis agents create ad-hoc probe containers under arbitrary names and
+    often without the labels per-task cleanup matches on; at batch end nothing
+    references them, so clear the board.
+    """
+    docker = docker_path()
+    if not docker:
+        return {"skipped": "docker not found"}
+    listed = _run([docker, "ps", "-aq"], timeout=120)
+    ids = [item for item in listed.stdout.split() if item]
+    if dry_run or not ids:
+        return {"containers": len(ids)}
+    removed = 0
+    for start in range(0, len(ids), 40):
+        result = _run([docker, "rm", "--force", *ids[start:start + 40]], timeout=600)
+        removed += len([line for line in result.stdout.splitlines() if line.strip()])
+    return {"containers": len(ids), "removed": removed}
+
+
 def prune_unused_volumes(dry_run: bool = False) -> dict[str, Any]:
     """Remove anonymous volumes left by killed Compose trials.
 
