@@ -68,6 +68,74 @@ def load(path: Path, default):
         return default
 
 
+def _claim_dir() -> Path | None:
+    value = os.environ.get("PIPELINE_CLAIM_DIR", "").strip()
+    return Path(value) if value else None
+
+
+def _supervise_alive(pid: object) -> bool:
+    try:
+        root = Path(f"/proc/{int(pid)}")
+        raw = (root / "cmdline").read_bytes().split(b"\0")
+        return b"pipeline.supervise" in b" ".join(raw)
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _peer_terminal(task: str) -> bool:
+    """True when a peer results directory already holds a terminal record."""
+    for entry in os.environ.get("PIPELINE_PEER_RESULTS", "").split(":"):
+        entry = entry.strip()
+        if not entry:
+            continue
+        record = load(Path(entry) / task / "result.json", {})
+        if isinstance(record, dict) and record.get("status") in {
+                "passed", "failed", "error", "rejected", "timeout", "skipped"}:
+            return True
+    return False
+
+
+def claim_task(task: str, owner: str) -> bool:
+    """Claim a task for this supervisor so two daemons never run it twice.
+
+    With ``PIPELINE_CLAIM_DIR`` set, several coordinators may consume the same
+    task list; the first one to create ``<task>.json`` owns the task. A claim
+    whose supervisor died is stolen, unless a peer results directory already
+    holds a terminal record for that task.
+    """
+    directory = _claim_dir()
+    if directory is None:
+        return True
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{task}.json"
+    for _ in range(2):
+        try:
+            handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            os.write(handle, json.dumps({"owner": owner, "pid": os.getpid(),
+                                         "at": time.time()}).encode())
+            os.close(handle)
+            return True
+        except FileExistsError:
+            data = load(path, {})
+            if isinstance(data, dict) and data.get("owner") == owner:
+                return True
+            if isinstance(data, dict) and _supervise_alive(data.get("pid")):
+                return False
+            if _peer_terminal(task):
+                try:
+                    path.write_text(json.dumps({"owner": owner, "pid": os.getpid(),
+                                                "done": True, "at": time.time()}) + "\n",
+                                    encoding="utf-8")
+                except OSError:
+                    pass
+                return False
+            try:
+                path.unlink()
+            except OSError:
+                return False
+    return False
+
+
 def worker_alive(pid: object, task: str | None = None) -> bool:
     """True only while this exact pid is still this task's ``pipeline.run``.
 
@@ -1769,8 +1837,13 @@ def main() -> int:
         # behind every never-started route in the sample. Stable ordering among
         # repairs and new candidates is preserved; the shared cap is unchanged.
         prioritize_candidates(candidates, children, selected)
+        owner = str(args.results.resolve())
         while candidates and len(active) + external_running < args.concurrency:
             task = candidates.pop(0)
+            if not claim_task(task, owner):
+                # Another daemon owns this task (shared queue) or a peer already
+                # finished it; leave it to them instead of running it twice.
+                continue
             child_state = children.setdefault(task, {})
             resume_harbor = child_state.get("retry_reason") in {
                 "harbor_infrastructure", "review_infrastructure", "carry_harbor"}

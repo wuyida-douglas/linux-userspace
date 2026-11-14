@@ -57,16 +57,20 @@ scripts/start_dual.sh samples/batch-02 results/batch-02 harbor_export/20261114-p
     samples/batch-02/fresh-todo.txt 40
 ```
 
-脚本做三件事：
+脚本启动两个 coordinator，**读同一份任务清单**，靠 `PIPELINE_CLAIM_DIR` 里的
+claim 文件抢题（`<task>.json`，先创建者获得），因此分配是**动态的**：
 
-1. 把任务清单**轮转切成 `dual-a.txt` / `dual-b.txt`**（两半题量与题型分布接近）；
-2. 启动 coordinator A：默认 socket、`results/batch-02-a`、发布到 `<root>_1`、并发 40；
-3. 启动 coordinator B：`DOCKER_HOST=unix:///run/docker2.sock`、专用 IPAM 池、
-   `results/batch-02-b`、发布到 `<root>_2`、并发 40。
+- coordinator A：默认 socket、`results/batch-02-a`、发布到 `<root>_1`、并发 40；
+- coordinator B：`DOCKER_HOST=unix:///run/docker2.sock`、专用 IPAM 池、
+  `results/batch-02-b`、发布到 `<root>_2`、并发 40；
+- 谁快谁就多抢——A 做完自己的会继续从共享清单里领 B 还没领的题，反之亦然；
+- claim 的拥有者 supervisor 退出后，另一个可以接手，但前提是对端 results 里
+  没有该题的终态记录（`PIPELINE_PEER_RESULTS`），不会重复运行已完成的题。
 
 ## 4. 收尾与合并
 
 - 两个 `results` 目录独立，监控分别看（`scripts/monitor_tick.py --results results/batch-02-a`）；
+- claim 文件在 `<results-root>-claims/`，批次结束后可以整个删掉；
 - 两批都结束后，把 `<root>_2` 的题目录并入 `<root>_1`（同名不冲突，任务互斥），
   再用 `scripts/refresh_exported_verifier.py` 统一刷新 verifier；
 - 发布合并前确认两边 `shared-images/agent.tar.gz` 字节一致（同一镜像归档，

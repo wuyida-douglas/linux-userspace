@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import json
 import os
 import tempfile
@@ -1097,3 +1098,35 @@ class BoundedRecoveryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClaimTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        os.environ["PIPELINE_CLAIM_DIR"] = str(Path(self.tmp) / "claims")
+        self.addCleanup(os.environ.pop, "PIPELINE_CLAIM_DIR", None)
+        self.addCleanup(os.environ.pop, "PIPELINE_PEER_RESULTS", None)
+
+    def test_claim_is_exclusive_between_live_supervisors(self):
+        self.assertTrue(supervise.claim_task("linux-1", "owner-a"))
+        with unittest.mock.patch.object(supervise, "_supervise_alive", return_value=True):
+            self.assertFalse(supervise.claim_task("linux-1", "owner-b"))
+        self.assertTrue(supervise.claim_task("linux-1", "owner-a"))
+
+    def test_stale_claim_is_stolen_without_peer_terminal(self):
+        self.assertTrue(supervise.claim_task("linux-2", "owner-a"))
+        self.assertTrue(supervise.claim_task("linux-2", "owner-b"))
+
+    def test_peer_terminal_blocks_the_steal(self):
+        self.assertTrue(supervise.claim_task("linux-3", "owner-a"))
+        peer = Path(self.tmp) / "results-b" / "linux-3"
+        peer.mkdir(parents=True)
+        (peer / "result.json").write_text('{"status": "passed"}')
+        os.environ["PIPELINE_PEER_RESULTS"] = str(Path(self.tmp) / "results-b")
+        self.assertFalse(supervise.claim_task("linux-3", "owner-b"))
+
+    def test_claim_dir_unset_allows_everything(self):
+        os.environ.pop("PIPELINE_CLAIM_DIR", None)
+        self.assertTrue(supervise.claim_task("linux-4", "owner-a"))
+        self.assertTrue(supervise.claim_task("linux-4", "owner-b"))
