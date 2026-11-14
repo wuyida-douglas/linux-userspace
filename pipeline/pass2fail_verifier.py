@@ -721,6 +721,15 @@ sys.exit(result["returncode"])
                 record["patched_health"] = self.compose(
                     project, "exec", "-T", *health_command,
                     timeout=self.contract["runner"]["timeout_sec"] + 30)
+                # The patched service was just restarted; under load it can
+                # answer late exactly like a fresh target, so retry within the
+                # same health budget instead of failing the trial.
+                patched_deadline = time.monotonic() + self.contract["runner"]["health_timeout_sec"]
+                while record["patched_health"]["returncode"] and time.monotonic() < patched_deadline:
+                    time.sleep(10)
+                    record["patched_health"] = self.compose(
+                        project, "exec", "-T", *health_command,
+                        timeout=self.contract["runner"]["timeout_sec"] + 30)
                 if record["patched_health"]["returncode"]:
                     record["error_stage"] = "patched_health"
                     return record

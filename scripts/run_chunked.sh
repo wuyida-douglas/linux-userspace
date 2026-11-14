@@ -22,6 +22,7 @@ PUBLISHED=${3:?}
 TASKS_FILE=${4:-$SAMPLE/fresh-todo.txt}
 CHUNK=${5:-500}
 CONCURRENCY=${6:-70}
+START_PART=${7:-}
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$REPO"
 
@@ -33,8 +34,9 @@ split -d -a 3 -l "$CHUNK" "$TASKS_FILE" "$SPLIT_DIR/part-"
 echo "chunks: $(ls "$SPLIT_DIR"/part-* | wc -l) x <=$CHUNK tasks"
 
 wait_for_coordinators() {
-  local pa="pipeline[.]synthesize_batch .*--results $REPO/$RESULTS-a"
-  local pb="pipeline[.]synthesize_batch .*--results $REPO/$RESULTS-b"
+  # --results is passed relative to the repository root.
+  local pa="pipeline[.]synthesize_batch .*--results ([^ ]*/)?$RESULTS-a( |$)"
+  local pb="pipeline[.]synthesize_batch .*--results ([^ ]*/)?$RESULTS-b( |$)"
   local waited=0
   # They are backgrounded by start_dual.sh; wait until both have exec'd.
   while ! { pgrep -f "$pa" >/dev/null && pgrep -f "$pb" >/dev/null; }; do
@@ -64,6 +66,10 @@ clean_daemon() {
 
 for part in "$SPLIT_DIR"/part-*; do
   round=$(basename "$part")
+  if [ -n "$START_PART" ] && [ "$round" \< "$START_PART" ]; then
+    echo "skip $round (before $START_PART)"
+    continue
+  fi
   echo "=== $round ($(wc -l < "$part") tasks, $CONCURRENCY per daemon) ==="
   rm -rf "$RESULTS-claims"
   scripts/start_dual.sh "$SAMPLE" "$RESULTS" "$PUBLISHED" "$part" "$CONCURRENCY"
