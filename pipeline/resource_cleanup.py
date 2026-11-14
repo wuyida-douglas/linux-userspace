@@ -561,6 +561,10 @@ def main() -> int:
     parser.add_argument("--prune-until", default="1h")
     parser.add_argument("--prune-networks", action="store_true",
                         help="remove idle Compose networks under --results (safe while running)")
+    parser.add_argument("--batch-end", action="store_true",
+                        help="full sweep for a stopped batch: all containers, every unused "
+                             "image, build cache, volumes and old temp dirs")
+    parser.add_argument("--batch-end-cache-until", default="1h")
     parser.add_argument("--network-min-age-hours", type=float, default=2.0)
     args = parser.parse_args()
     results = args.results.resolve()
@@ -597,6 +601,13 @@ def main() -> int:
         total["build_cache"] = prune_build_cache(args.prune_until, dry_run=args.dry_run)
     if args.prune_networks:
         total["idle_networks"] = prune_idle_networks(results, args.network_min_age_hours)
+    if args.batch_end:
+        total["containers"] = prune_all_containers(dry_run=args.dry_run)
+        total["images"] = prune_stale_images(0, dry_run=args.dry_run)
+        total["build_cache"] = prune_build_cache(args.batch_end_cache_until,
+                                                 dry_run=args.dry_run)
+        total["volumes"] = prune_unused_volumes(dry_run=args.dry_run)
+        total["temp"] = len(prune_temp_leftovers(24, dry_run=args.dry_run).get("removed", []))
     print(json.dumps(total, ensure_ascii=False))
     return 0
 
