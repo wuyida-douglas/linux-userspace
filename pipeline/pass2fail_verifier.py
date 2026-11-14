@@ -192,6 +192,23 @@ class Differential:
             env={**COMPOSE_ENV, "PIPELINE_IPAM_ROLE": "harbor",
                  "PIPELINE_IPAM_WORK_DIR": str(self.log_dir / "ipam")})
 
+    def _probe_detail(self) -> dict[str, Any]:
+        """Snapshot the runner's own result file after a failed health probe.
+
+        runner.py prints nothing on stdout and records the probe command, its
+        exit status and its output in ``/output/result.json``. Without this
+        snapshot a failed probe looks identical to a broken ``compose exec``,
+        which is what made the earlier health failures hard to attribute.
+        """
+        path = self.runner / "output/result.json"
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            return {"error": f"{type(exc).__name__}: {exc}"}
+        if isinstance(record, dict) and "output" in record:
+            record["output"] = str(record["output"])[-2000:]
+        return record
+
     def upload_private(self, project: str) -> dict[str, Any]:
         """Install root-owned target-only material in the private control copy.
 
@@ -699,6 +716,7 @@ sys.exit(result["returncode"])
                             project, "exec", "-T", "runner", "/opt/pass2fail/runner.py", "--health",
                             timeout=self.contract["runner"]["timeout_sec"] + 30)
                 if record["health"]["returncode"]:
+                    record["health_detail"] = self._probe_detail()
                     record["error_stage"] = "health"
                     return record
             if name == "fixed":
@@ -735,6 +753,7 @@ sys.exit(result["returncode"])
                         project, "exec", "-T", *health_command,
                         timeout=self.contract["runner"]["timeout_sec"] + 30)
                 if record["patched_health"]["returncode"]:
+                    record["patched_health_detail"] = self._probe_detail()
                     record["error_stage"] = "patched_health"
                     return record
             if self.contract["branch"] == "FILE-POV":
