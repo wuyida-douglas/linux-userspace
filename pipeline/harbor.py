@@ -810,6 +810,16 @@ def load_archives(directory: Path) -> None:
         path = directory / record["file"]
         if digest_file(path) != record["sha256"]:
             raise ValueError(f"archive digest mismatch: {path}")
+        # The archive digest is verified above, and an image ID is a content
+        # hash: when the daemon already holds exactly this image there is
+        # nothing to import. Skipping the load avoids re-unpacking multi-GB
+        # layers for every task on a healthy daemon.
+        try:
+            present = inspect_image(record["image"])["image_id"] == record["image_id"]
+        except Exception:
+            present = False
+        if present:
+            continue
         cp = subprocess.run(docker_argv(["docker", "load", "-i", str(path)]),
                             capture_output=True, text=True, timeout=1800)
         if cp.returncode:
