@@ -33,7 +33,19 @@ split -d -a 3 -l "$CHUNK" "$TASKS_FILE" "$SPLIT_DIR/part-"
 echo "chunks: $(ls "$SPLIT_DIR"/part-* | wc -l) x <=$CHUNK tasks"
 
 wait_for_coordinators() {
-  while pgrep -f "pipeline[.]synthesize_batch .*--results $REPO/$RESULTS-[ab]( |$)" >/dev/null; do
+  local pa="pipeline[.]synthesize_batch .*--results $REPO/$RESULTS-a"
+  local pb="pipeline[.]synthesize_batch .*--results $REPO/$RESULTS-b"
+  local waited=0
+  # They are backgrounded by start_dual.sh; wait until both have exec'd.
+  while ! { pgrep -f "$pa" >/dev/null && pgrep -f "$pb" >/dev/null; }; do
+    waited=$((waited + 2))
+    if [ "$waited" -ge 180 ]; then
+      echo "coordinators did not appear within 180s" >&2
+      return 1
+    fi
+    sleep 2
+  done
+  while pgrep -f "$pa" >/dev/null || pgrep -f "$pb" >/dev/null; do
     sleep 60
   done
 }
