@@ -802,18 +802,17 @@ def load_archives(directory: Path) -> None:
         raise ValueError(f"image archives and manifest differ: {directory}")
     for record in records:
         path = directory / record["file"]
-        if digest_file(path) != record["sha256"]:
-            raise ValueError(f"archive digest mismatch: {path}")
-        # The archive digest is verified above, and an image ID is a content
-        # hash: when the daemon already holds exactly this image there is
-        # nothing to import. Skipping the load avoids re-unpacking multi-GB
-        # layers for every task on a healthy daemon.
+        # An image ID is a content hash: when the daemon already holds exactly
+        # this image there is nothing to import and nothing to hash. Only a
+        # missing image pays the digest check and the unpack.
         try:
             present = inspect_image(record["image"])["image_id"] == record["image_id"]
         except Exception:
             present = False
         if present:
             continue
+        if digest_file(path) != record["sha256"]:
+            raise ValueError(f"archive digest mismatch: {path}")
         cp = subprocess.run(docker_argv(["docker", "load", "-i", str(path)]),
                             capture_output=True, text=True, timeout=1800)
         if cp.returncode:
@@ -1239,9 +1238,14 @@ def accept(workspace: Path, output: Path, task_id: str, route: dict[str, Any],
         published_shared = published_root / "shared-images"
         if published_shared.is_dir():
             shutil.copytree(published_shared, cached_runtime)
-    if cached_runtime.is_dir() and not (output / "bundle/shared-images").exists():
-        shutil.copytree(cached_runtime, output / "bundle/shared-images")
-        load_archives(output / "bundle/shared-images")
+    if cached_runtime.is_dir():
+        shared = output / "bundle/shared-images"
+        if not shared.exists():
+            shutil.copytree(cached_runtime, shared)
+        # The daemon may have lost the images since the bundle was created
+        # (per-task cleanup, a batch-end prune). load_archives inspects first
+        # and only unpacks what is actually missing.
+        load_archives(shared)
     result = {"schema_version": 3, "stage": "harbor", "status": "in_progress",
               "task_id": task_id, "export_task_id": delivery_id,
               "manifest": None, "acceptance_runs": []}
