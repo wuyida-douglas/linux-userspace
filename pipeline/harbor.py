@@ -791,6 +791,10 @@ def export(delivery: Path, destination: Path, task_id: str, route: dict[str, Any
 
 
 def load_archives(directory: Path) -> None:
+    if not directory.is_dir() or not any(directory.glob("*.tar.gz")):
+        # A task that builds its own agent image ships nothing in
+        # shared-images; there is simply nothing to load.
+        return
     manifest_path = directory / "manifest.json"
     individual = sorted(directory.glob("*.manifest.json"))
     if individual:

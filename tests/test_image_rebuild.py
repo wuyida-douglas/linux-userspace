@@ -137,3 +137,13 @@ class SharedManifestTests(unittest.TestCase):
                                                         encoding="utf-8")
             harbor.merge_shared_images(source, destination)
             self.assertFalse((destination / "agent.manifest.json").exists())
+
+
+class LoadArchivesTests(unittest.TestCase):
+    def test_empty_shared_directory_is_a_noop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            harbor.load_archives(Path(directory))
+
+    def test_missing_directory_is_a_noop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            harbor.load_archives(Path(directory) / "does-not-exist")
