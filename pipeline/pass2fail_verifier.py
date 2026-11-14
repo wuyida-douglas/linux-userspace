@@ -657,39 +657,46 @@ sys.exit(result["returncode"])
             if record["private_upload"]["returncode"]:
                 record["error_stage"] = "private_upload"
                 return record
-            if self.contract["branch"] == "FILE-POV":
-                record["health"] = self.compose(
-                    project, "exec", "-T", "client", *self._health_argv(),
-                    timeout=self.contract["runner"]["timeout_sec"] + 30)
-            else:
-                # A health probe may have left a root-owned result after an
-                # earlier uid transition. Each probe must create fresh evidence.
-                (self.runner / "output/result.json").unlink(missing_ok=True)
-                record["health"] = self.compose(
-                    project, "exec", "-T", "runner", "/opt/pass2fail/runner.py", "--health",
-                    timeout=self.contract["runner"]["timeout_sec"] + 30)
-            # Health is a live probe of a just-started service: under heavy
-            # daemon load it fails intermittently for the same image that
-            # passed a moment earlier. Retry a couple of times before calling
-            # the target unhealthy.
-            # Keep probing until the runner's own health budget is spent:
-            # services such as Jenkins need a minute or two after the Compose
-            # healthcheck already reports healthy.
-            health_deadline = time.monotonic() + self.contract["runner"]["health_timeout_sec"]
-            while record["health"]["returncode"] and time.monotonic() < health_deadline:
-                time.sleep(10)
+            # Only the vulnerable phase probes health here. The fixed phase
+            # applies the official solution and restarts the service, and
+            # patched_health already verifies the result; probing the
+            # unpatched fixed container first costs a full retry budget
+            # under load and cannot change the failure attribution
+            # (health and patched_health both map to target_unhealthy).
+            if name == "vulnerable":
                 if self.contract["branch"] == "FILE-POV":
                     record["health"] = self.compose(
                         project, "exec", "-T", "client", *self._health_argv(),
                         timeout=self.contract["runner"]["timeout_sec"] + 30)
                 else:
+                    # A health probe may have left a root-owned result after an
+                    # earlier uid transition. Each probe must create fresh evidence.
                     (self.runner / "output/result.json").unlink(missing_ok=True)
                     record["health"] = self.compose(
                         project, "exec", "-T", "runner", "/opt/pass2fail/runner.py", "--health",
                         timeout=self.contract["runner"]["timeout_sec"] + 30)
-            if record["health"]["returncode"]:
-                record["error_stage"] = "health"
-                return record
+                # Health is a live probe of a just-started service: under heavy
+                # daemon load it fails intermittently for the same image that
+                # passed a moment earlier. Retry a couple of times before calling
+                # the target unhealthy.
+                # Keep probing until the runner's own health budget is spent:
+                # services such as Jenkins need a minute or two after the Compose
+                # healthcheck already reports healthy.
+                health_deadline = time.monotonic() + self.contract["runner"]["health_timeout_sec"]
+                while record["health"]["returncode"] and time.monotonic() < health_deadline:
+                    time.sleep(10)
+                    if self.contract["branch"] == "FILE-POV":
+                        record["health"] = self.compose(
+                            project, "exec", "-T", "client", *self._health_argv(),
+                            timeout=self.contract["runner"]["timeout_sec"] + 30)
+                    else:
+                        (self.runner / "output/result.json").unlink(missing_ok=True)
+                        record["health"] = self.compose(
+                            project, "exec", "-T", "runner", "/opt/pass2fail/runner.py", "--health",
+                            timeout=self.contract["runner"]["timeout_sec"] + 30)
+                if record["health"]["returncode"]:
+                    record["error_stage"] = "health"
+                    return record
             if name == "fixed":
                 solution = self.upload_private(project)
                 record["solution_upload"] = solution
