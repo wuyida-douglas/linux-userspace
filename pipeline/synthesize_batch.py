@@ -636,7 +636,7 @@ def main() -> int:
             # names that per-task cleanup cannot attribute; with no worker left
             # nothing references them, so clear them here.
             containers = prune_all_containers()
-            images = prune_stale_images(0)
+            images = prune_stale_images(0, keep_error_tasks=args.results)
             pruned = prune_build_cache("1h")
             volumes = prune_unused_volumes()
             temp = prune_temp_leftovers(24)

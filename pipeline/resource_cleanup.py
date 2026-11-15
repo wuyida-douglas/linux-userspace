@@ -607,8 +607,29 @@ def prune_idle_volumes(results_root: Path, min_age_hours: float = 0.5,
     return {"volumes": len(dead), "removed": removed}
 
 
+def _error_task_names(results_root: Path | None) -> set[str]:
+    """Task ids whose last record is a pipeline failure.
+
+    Their images (including ``<task>-base``) are the only reproducible copy a
+    retry has: the delivery often carries no Dockerfile, so deleting them
+    turns every re-run into ``image ... is missing`` / ``failed to rebuild``.
+    """
+    if results_root is None or not results_root.is_dir():
+        return set()
+    names = set()
+    for path in results_root.glob("*/result.json"):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if record.get("status") == "error":
+            names.add(path.parent.name)
+    return names
+
+
 def prune_stale_images(min_age_hours: float = 12.0,
-                       dry_run: bool = False) -> dict[str, Any]:
+                       dry_run: bool = False,
+                       keep_error_tasks: Path | None = None) -> dict[str, Any]:
     """Remove images nothing references and that are older than the cutoff.
 
     Synthesis agents build ad-hoc probe and test images under arbitrary tags
@@ -625,6 +646,7 @@ def prune_stale_images(min_age_hours: float = 12.0,
     if listing.returncode:
         return {"error": listing.stderr[-500:]}
     cutoff = time.time() - min_age_hours * 3600
+    keep = _error_task_names(keep_error_tasks)
     stale = []
     for line in listing.stdout.splitlines():
         parts = line.split("\t")
@@ -632,6 +654,8 @@ def prune_stale_images(min_age_hours: float = 12.0,
             continue
         image_id, ref, created = parts[0], parts[1], parts[2]
         if ref.startswith(PROTECTED_IMAGE_PREFIXES):
+            continue
+        if keep and any(task in ref for task in keep):
             continue
         try:
             made = time.mktime(time.strptime(created[:19], "%Y-%m-%d %H:%M:%S"))
@@ -733,7 +757,8 @@ def main() -> int:
         total["idle_networks"] = prune_idle_networks(results, args.network_min_age_hours)
     if args.batch_end:
         total["containers"] = prune_all_containers(dry_run=args.dry_run)
-        total["images"] = prune_stale_images(0, dry_run=args.dry_run)
+        total["images"] = prune_stale_images(0, dry_run=args.dry_run,
+                                           keep_error_tasks=results)
         total["build_cache"] = prune_build_cache(args.batch_end_cache_until,
                                                  dry_run=args.dry_run)
         total["volumes"] = prune_unused_volumes(dry_run=args.dry_run)
