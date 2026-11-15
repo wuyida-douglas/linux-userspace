@@ -54,7 +54,13 @@ COMPOSE_ENV = {
     key: value for key, value in os.environ.items()
     if key in {"PATH", "HOME", "DOCKER_HOST", "DOCKER_CONFIG", "DOCKER_CONTEXT",
                "PASS2FAIL_DOCKER", "TMPDIR", "PIPELINE_IPAM_ROLE", "PIPELINE_IPAM_STATE",
-               "PIPELINE_IPAM_WORK_DIR", "PIPELINE_IPAM_DISABLE"}
+               "PIPELINE_IPAM_WORK_DIR", "PIPELINE_IPAM_DISABLE",
+               # The per-daemon pools must survive this whitelist. Without
+               # them the second daemon allocates subnets from the first
+               # daemon's ranges, the host routes that range into the other
+               # bridge, and every runner-to-target request times out: daemon
+               # B accepted 4 of 305 SVC tasks and passed FILE-POV normally.
+               "PIPELINE_IPAM_FACTORY_POOL", "PIPELINE_IPAM_HARBOR_POOL"}
 }
 
 
