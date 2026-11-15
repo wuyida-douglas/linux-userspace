@@ -380,6 +380,18 @@ def prune_build_cache(until: str = "1h", dry_run: bool = False) -> dict[str, Any
             "output": (result.stdout + result.stderr)[-2000:]}
 
 
+def _has_foreign_owner(root: Path, uid: int) -> bool:
+    """True when any entry under ``root`` belongs to another uid."""
+    for directory, dirs, files in os.walk(root):
+        for name in dirs + files:
+            try:
+                if os.lstat(os.path.join(directory, name)).st_uid != uid:
+                    return True
+            except OSError:
+                continue
+    return False
+
+
 def fix_workspace_ownership(workspace: Path, images: list[str] | None = None) -> dict[str, Any]:
     """Return host-written workspace files to the worker uid.
 
@@ -403,9 +415,20 @@ def fix_workspace_ownership(workspace: Path, images: list[str] | None = None) ->
             break
     if not image:
         return {"skipped": "no image available for chown"}
-    result = _run([docker, "run", "--rm", "--network", "none",
-                   "-v", f"{workspace}:/w", image,
-                   "chown", "-R", f"{uid}:{gid}", "/w"], timeout=900)
+    # Most tasks never write a root-owned file, and a `docker run` against a
+    # daemon carrying ~2,000 containers can take minutes. Walking the tree on
+    # the host costs about a second and skips the container entirely; under
+    # load 58 tasks failed here on a 900s timeout for a chown that was not
+    # needed. A timeout is also no longer fatal: the later phases report a
+    # real permission error if one exists.
+    if not _has_foreign_owner(workspace, uid):
+        return {"skipped": "workspace already owned by the worker"}
+    try:
+        result = _run([docker, "run", "--rm", "--network", "none",
+                       "-v", f"{workspace}:/w", image,
+                       "chown", "-R", f"{uid}:{gid}", "/w"], timeout=1800)
+    except subprocess.TimeoutExpired:
+        return {"image": image, "error": "chown container timed out"}
     return {"image": image, "returncode": result.returncode,
             "output": (result.stdout + result.stderr)[-500:]}
 
